@@ -1,0 +1,18 @@
+[package]
+name = "pek-rcode"
+version = "0.1.0"
+edition = "2024"
+description = "Pek.RCode：DH.NCode(XCode ORM) 的 Rust 实现——Model.xml 数据建模、多数据库方言、对象实体增删改查与代码生成，服务 C# 项目向 Rust 的渐进迁移"
+authors = ["PeiKeSmart"]
+license = "MIT"
+
+[dependencies]
+chrono = "0.4.45"
+roxmltree = "0.21.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rust_decimal = "1.43.0"
+thiserror = "2.0.21"
+
+[profile.release]
+lto = "thin"
+strip = true

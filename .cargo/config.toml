@@ -1,0 +1,15 @@
+# cargo 镜像配置（仅对 Pek.RCode 工程生效，不影响其它项目）
+# 直连 crates.io 缓慢或超时（NU1301 / spurious network error）时启用 rsproxy 国内镜像。
+# 如所在网络无法访问 rsproxy.cn，可删除本文件改用公司内网镜像或直连。
+
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true

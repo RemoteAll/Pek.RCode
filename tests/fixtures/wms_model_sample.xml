@@ -1,0 +1,233 @@
+<?xml version="1.0" encoding="utf-8"?>
+<EntityModel xmlns:xs="http://www.w3.org/2001/XMLSchema-instance" xs:schemaLocation="https://newlifex.com https://newlifex.com/Model202509.xsd" Version="11.7.2023.0327" Document="https://newlifex.com/xcode/model" ModelVersion="2.0.2026.130" xmlns="https://newlifex.com/Model202509.xsd">
+  <Option>
+    <!--类名模板。其中{name}替换为Table.Name，如{name}Model/I{name}Dto等-->
+    <ClassNameTemplate />
+    <!--显示名模板。其中{displayName}替换为Table.DisplayName-->
+    <DisplayNameTemplate />
+    <!--基类。可能包含基类和接口，其中{name}替换为Table.Name-->
+    <BaseClass>CubeEntityBase</BaseClass>
+    <!--命名空间-->
+    <Namespace>HlktechIoT.Entity</Namespace>
+    <!--引用命名空间-->
+    <ExtendNameSpace />
+    <!--输出目录-->
+    <Output>.\</Output>
+    <!--是否使用中文文件名。默认false-->
+    <ChineseFileName>True</ChineseFileName>
+    <!--用于生成Copy函数的参数类型。例如{name}或I{name}-->
+    <ModelNameForCopy />
+    <!--带有索引器。实现IModel接口-->
+    <HasIModel>False</HasIModel>
+    <!--可为null上下文。生成String?等-->
+    <Nullable>True</Nullable>
+    <!--数据库连接名-->
+    <ConnName>DH</ConnName>
+    <!--模型类模版。设置后生成模型类，用于接口数据传输，例如{name}Model-->
+    <ModelClass>{name}Model</ModelClass>
+    <!--模型类输出目录。默认当前目录的Models子目录-->
+    <ModelsOutput>.\Models\</ModelsOutput>
+    <!--模型接口模版。设置后生成模型接口，用于约束模型类和实体类，例如I{name}-->
+    <ModelInterface>I{name}</ModelInterface>
+    <!--模型接口输出目录。默认当前目录的Interfaces子目录-->
+    <InterfacesOutput>.\Interfaces\</InterfacesOutput>
+    <!--用户实体转为模型类的模型类。例如{name}或{name}DTO-->
+    <ModelNameForToModel />
+    <!--命名格式。Default/Upper/Lower/Underline-->
+    <NameFormat>Default</NameFormat>
+    <!--魔方区域显示名-->
+    <DisplayName />
+    <!--魔方控制器输出目录-->
+    <CubeOutput />
+  </Option>
+  <Tables>
+    <Table Name="JiLiYu" TableName="DH_JiLiYu" Description="激励语" IgnoreNameCase="False">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="Content" DataType="String" RawType="text" Length="0" Description="激励语内容" />
+        <Column Name="CreateUser" DataType="String" Description="创建者" />
+        <Column Name="CreateUserID" DataType="Int32" Description="创建者" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+        <Column Name="CreateIP" DataType="String" Description="创建地址" />
+        <Column Name="UpdateUser" DataType="String" Description="更新者" />
+        <Column Name="UpdateUserID" DataType="Int32" Description="更新者" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间" />
+        <Column Name="UpdateIP" DataType="String" Description="更新地址" />
+      </Columns>
+    </Table>
+    <Table Name="VerifyCode" TableName="DH_VerifyCode" Description="验证码" IgnoreNameCase="False">
+      <Columns>
+        <Column Name="Key" DataType="String" PrimaryKey="True" Description="验证码唯一键" />
+        <Column Name="Code" DataType="String" Description="验证码" />
+        <Column Name="EndTime" DataType="DateTime" Description="过期时间" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+      </Columns>
+    </Table>
+    <Table Name="SingleArticle" TableName="DH_SingleArticle" Description="单页文章" IgnoreNameCase="False">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="Name" DataType="String" Master="True" Length="200" Description="文章标题" />
+        <Column Name="Content" DataType="String" RawType="text" Length="0" Description="内容" />
+        <Column Name="FileUrl" DataType="String" Length="100" Description="上传的文件" />
+        <Column Name="Sort" DataType="Int32" Description="文章排序" />
+        <Column Name="Code" DataType="String" Nullable="False" Description="调用别名。不可重复" />
+        <Column Name="Md5" DataType="String" Description="Md5" />
+        <Column Name="Ex1" DataType="String" Description="扩展字段1" />
+        <Column Name="CreateUser" DataType="String" Description="创建者" />
+        <Column Name="CreateUserID" DataType="Int32" Description="创建者" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+        <Column Name="CreateIP" DataType="String" Description="创建地址" />
+        <Column Name="UpdateUser" DataType="String" Description="更新者" />
+        <Column Name="UpdateUserID" DataType="Int32" Description="更新者" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间" />
+        <Column Name="UpdateIP" DataType="String" Description="更新地址" />
+      </Columns>
+      <Indexes>
+        <Index Columns="Code" Unique="True" />
+      </Indexes>
+    </Table>
+    <Table Name="HardwareDevices" TableName="DH_HardwareDevices" Description="硬件设备" IgnoreNameCase="False">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="Mac" DataType="String" Master="True" Nullable="False" Description="设备Mac地址" />
+        <Column Name="Code" DataType="String" Description="设备号" />
+        <Column Name="HType" DataType="Int16" Description="设备类型。0为扫码枪" Type="Dto.HardwareType" />
+        <Column Name="DeviceModel" DataType="String" Nullable="False" Description="设备型号" />
+        <Column Name="Remark" DataType="String" Description="备注" />
+        <Column Name="BindUserID" DataType="Int32" Description="绑定用户ID" />
+        <Column Name="BindUserRealName" DataType="String" Description="绑定用户姓名。冗余字段" />
+        <Column Name="BindUser" DataType="String" Description="绑定用户名" />
+        <Column Name="Status" DataType="Int32" Description="设备所在工序。1为打单，2为领料，3为生产，4为生产审核，5为出货/入库，6为人为结束，7为取消订单，8为设置，9为打包" Type="Dto.HardwareStatus" />
+        <Column Name="CreateUser" DataType="String" Description="创建者" />
+        <Column Name="CreateUserID" DataType="Int32" Description="创建者" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+        <Column Name="CreateIP" DataType="String" Description="创建地址" />
+        <Column Name="UpdateUser" DataType="String" Description="更新者" />
+        <Column Name="UpdateUserID" DataType="Int32" Description="更新者" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间" />
+        <Column Name="UpdateIP" DataType="String" Description="更新地址" />
+      </Columns>
+      <Indexes>
+        <Index Columns="Mac" Unique="True" />
+        <Index Columns="Status" />
+      </Indexes>
+    </Table>
+    <Table Name="WmsOrder" TableName="DH_WmsOrder" Description="出货订单" IgnoreNameCase="False" MaxCacheCount="0">
+      <Columns>
+        <Column Name="Id" DataType="Int64" PrimaryKey="True" Description="编号" />
+        <Column Name="OrderId" DataType="String" Master="True" Nullable="False" Description="ERP订单编号" />
+        <Column Name="OrderingID" DataType="Int32" Description="打单人" />
+        <Column Name="OrderingTime" DataType="DateTime" DataScale="timeShard:yy" Description="打单时间" />
+        <Column Name="PickingID" DataType="Int32" Description="领料人" />
+        <Column Name="PickingTime" DataType="DateTime" Description="领料时间" />
+        <Column Name="ProductionID" DataType="Int32" Description="生产人" />
+        <Column Name="ProductionTime" DataType="DateTime" Description="生产时间" />
+        <Column Name="AuditingID" DataType="Int32" Description="审核人" />
+        <Column Name="AuditingTime" DataType="DateTime" Description="审核时间" />
+        <Column Name="PackID" DataType="Int32" Description="出货人" />
+        <Column Name="PackTime" DataType="DateTime" Description="出货时间" />
+        <Column Name="ShippingID" DataType="Int32" Description="打包人" />
+        <Column Name="ShippingTime" DataType="DateTime" Description="打包时间" />
+        <Column Name="CancelID" DataType="Int32" Description="取消人" />
+        <Column Name="CancelTime" DataType="DateTime" Description="取消时间" />
+        <Column Name="IsDuplicate" DataType="Boolean" Description="重复打单" />
+        <Column Name="Status" DataType="Int16" DefaultValue="0" Description="状态。0为正常，1为取消" />
+        <Column Name="IsEnd" DataType="Boolean" Description="结束完成" />
+        <Column Name="HasRemark" DataType="Boolean" Description="是否有备注" />
+        <Column Name="Remark" DataType="String" Length="512" Description="备注" />
+        <Column Name="RemarkTime" DataType="DateTime" Description="备注时间" />
+      </Columns>
+      <Indexes>
+        <Index Columns="OrderId" Unique="True" />
+        <Index Columns="OrderingID" />
+        <Index Columns="PickingID" />
+        <Index Columns="ProductionID" />
+        <Index Columns="AuditingID" />
+        <Index Columns="PackID" />
+        <Index Columns="PackTime" />
+        <Index Columns="OrderingTime" />
+        <Index Columns="IsDuplicate" />
+        <Index Columns="IsEnd" />
+        <Index Columns="Status" />
+        <Index Columns="HasRemark" />
+      </Indexes>
+    </Table>
+    <Table Name="TaxCode" TableName="DH_TaxCode" Description="税收编码" IgnoreNameCase="False">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="ItemName" DataType="String" Master="True" Length="200" Nullable="False" Description="项目名称" />
+        <Column Name="CategoryShortName" DataType="String" Length="100" Description="商品和服务分类简称" />
+        <Column Name="TaxCategoryCode" DataType="String" Nullable="False" Description="商品和服务税收分类编码" />
+        <Column Name="UnitPrice" DataType="Decimal" Description="单价" />
+        <Column Name="TaxIncludedFlag" DataType="Int32" Description="含税标志。0不含税，1含税" />
+        <Column Name="SpecificationModel" DataType="String" Length="200" Nullable="False" Description="规格型号" />
+        <Column Name="TaxRate" DataType="Decimal" Description="税率/征收率" />
+        <Column Name="Unit" DataType="String" Description="单位" />
+        <Column Name="ShortCode" DataType="String" Description="简码" />
+        <Column Name="UsePreferentialPolicy" DataType="Boolean" Description="是否使用优惠政策" />
+        <Column Name="PreferentialPolicyType" DataType="String" Length="100" Description="优惠政策类型" />
+        <Column Name="ItemCategoryName" DataType="String" Length="200" Description="项目分类名称" />
+        <Column Name="ItemCategoryCode" DataType="String" Description="项目分类编码" />
+        <Column Name="Remark" DataType="String" Length="255" Description="备注" />
+        <Column Name="CreateUser" DataType="String" Description="创建者" />
+        <Column Name="CreateUserID" DataType="Int32" Description="创建者" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+        <Column Name="CreateIP" DataType="String" Description="创建地址" />
+        <Column Name="UpdateUser" DataType="String" Description="更新者" />
+        <Column Name="UpdateUserID" DataType="Int32" Description="更新者" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间" />
+        <Column Name="UpdateIP" DataType="String" Description="更新地址" />
+      </Columns>
+      <Indexes>
+        <Index Columns="TaxCategoryCode" />
+        <Index Columns="ItemCategoryCode" />
+        <Index Columns="SpecificationModel" Unique="True" />
+        <Index Columns="ShortCode" />
+      </Indexes>
+    </Table>
+    <Table Name="ProductionQualityFeedback" TableName="DH_ProductionQualityFeedback" Description="生产品质反馈表" IgnoreNameCase="False">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="Name" DataType="String" Master="True" Length="100" Description="反馈标题" />
+        <Column Name="Content" DataType="String" Length="0" Description="反馈内容" RowType="text" />
+        <Column Name="DType" DataType="Int32" Description="反馈类型 0待分配 1软件 2硬件" />
+        <Column Name="PicPath" DataType="String" Length="0" Description="图片。多个图片用,分隔" RowType="text" />
+        <Column Name="VideoPath" DataType="String" Length="0" Description="视频。多个视频用,分隔" RowType="text" />
+        <Column Name="FilePath" DataType="String" Length="0" Description="文件。多个文件用,分隔" RowType="text" />
+        <Column Name="Status" DataType="Int16" Description="状态。0为待处理，1为处理中，2为已处理，3为不予处理 4已完结 5草稿" />
+        <Column Name="ProductTypeId" DataType="Int32" Description="产品型号编号" />
+        <Column Name="OrderId" DataType="String" Description="订单编号" />
+        <Column Name="TotalQty" DataType="Int32" Description="总数量" />
+        <Column Name="DefectiveQty" DataType="Int32" Description="不良数量" />
+        <Column Name="DefectiveRate" DataType="Double" Description="不良率" />
+        <Column Name="AppScens" DataType="String" Length="0" Description="应用场景" RowType="text" />
+        <Column Name="CustomerName" DataType="String" Length="200" Description="客户名称" />
+        <Column Name="SupplierName" DataType="String" Length="200" Description="供应商名称" />
+        <Column Name="MaterialNo" DataType="String" Description="物料编号" />
+        <Column Name="UserId" DataType="Int32" Description="技术支持用户ID" />
+        <Column Name="AssignStatus" DataType="Int32" Description="指派状态 0未指派 1已指派" />
+        <Column Name="AddType" DataType="Int32" Description="提交类型 0、销售提交 1、供应商提交 2、IQC提交" />
+        <Column Name="AISummary" DataType="String" Length="0" Description="AI总结" RowType="text" />
+        <Column Name="AIAssign" DataType="String" Length="0" Description="AI指派" RowType="text" />
+        <Column Name="CreateUser" DataType="String" Description="创建者" />
+        <Column Name="CreateUserID" DataType="Int32" Description="创建者" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+        <Column Name="CreateIP" DataType="String" Description="创建地址" />
+        <Column Name="UpdateUser" DataType="String" Description="更新者" />
+        <Column Name="UpdateUserID" DataType="Int32" Description="更新者" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间" />
+        <Column Name="UpdateIP" DataType="String" Description="更新地址" />
+      </Columns>
+      <Indexes>
+        <Index Columns="Name" />
+        <Index Columns="ProductTypeId" />
+        <Index Columns="OrderId" />
+        <Index Columns="Status" />
+        <Index Columns="DType" />
+        <Index Columns="CustomerName" />
+        <Index Columns="MaterialNo" />
+        <Index Columns="UserId" />
+      </Indexes>
+    </Table>
+  </Tables>
+</EntityModel>
