@@ -72,6 +72,11 @@
 //! - 所有查询/写入均使用参数绑定；列名、表名经方言引用转义
 //! - `sync_schema` 只做增量补齐（建表/加列），不修改、不删除已有对象
 
+#[cfg(all(feature = "tls-native", feature = "tls-rustls"))]
+compile_error!(
+    "特性 `tls-native` 与 `tls-rustls` 互斥：rustls 后端请用 `--no-default-features --features tls-rustls`"
+);
+
 pub mod async_dal;
 pub mod batch;
 pub mod cache;

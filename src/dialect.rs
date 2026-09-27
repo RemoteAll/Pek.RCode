@@ -878,6 +878,60 @@ impl DatabaseKind {
             }
         }
     }
+
+    /// 按指定分页风格拼装（仅 SQL Server 的 [`PageStyle::RowNumber`] 与默认不同，其余库忽略风格）。
+    /// <param name="sql">不含排序与分页的查询</param>
+    /// <param name="order_sql">完整 `ORDER BY ...`（可空）</param>
+    /// <param name="offset">跳过行数</param>
+    /// <param name="size">每页行数</param>
+    /// <param name="style">分页风格</param>
+    /// <returns>分页 SQL</returns>
+    pub fn apply_paging_with_style(
+        &self,
+        sql: &str,
+        order_sql: &str,
+        offset: usize,
+        size: usize,
+        style: PageStyle,
+    ) -> String {
+        if *self == DatabaseKind::SqlServer && style == PageStyle::RowNumber {
+            return sqlserver_row_number_paging(sql, order_sql, offset, size);
+        }
+        self.apply_paging(sql, order_sql, offset, size)
+    }
+}
+
+/// 分页风格（仅 SQL Server 区分；对应 C# `MSPageSplit`（2005/2008）与 2012+ 两套算法）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PageStyle {
+    /// SQL Server 2012 及以上：`OFFSET n ROWS FETCH NEXT m ROWS ONLY`（DH.NCode 现行默认）
+    #[default]
+    OffsetFetch,
+    /// SQL Server 2005/2008：`ROW_NUMBER() OVER(...)` 双层包装（对齐 `MSPageSplit.RowNumber`）
+    RowNumber,
+}
+
+/// SQL Server 2005/2008 的 `ROW_NUMBER()` 分页（对齐 C# `MSPageSplit.RowNumber`）：
+///
+/// ```sql
+/// SELECT * FROM (
+///   SELECT *, row_number() over(Order By {排序}) as rowNumber FROM ({原查询}) AS XCode_T0
+/// ) AS XCode_T1 WHERE rowNumber BETWEEN {offset+1} And {offset+size}
+/// ```
+///
+/// 无排序时 `OVER(Order By (SELECT NULL))` 兜底（语法合法，不保证顺序，与调用方的主键兜底策略配合）。
+fn sqlserver_row_number_paging(sql: &str, order_sql: &str, offset: usize, size: usize) -> String {
+    let order_expr = order_sql.strip_prefix("ORDER BY ").unwrap_or(order_sql).trim();
+    let order_expr = if order_expr.is_empty() {
+        "(SELECT NULL)"
+    } else {
+        order_expr
+    };
+    let start = offset + 1;
+    let end = offset + size;
+    format!(
+        "SELECT * FROM (SELECT *, row_number() over(Order By {order_expr}) as rowNumber FROM ({sql}) AS XCode_T0) AS XCode_T1 WHERE rowNumber BETWEEN {start} And {end}"
+    )
 }
 
 /// Oracle 自增序列名（与 XCode 约定一致：`SEQ_{表名}`）。
@@ -1170,6 +1224,40 @@ mod tests {
             DatabaseKind::Oracle.apply_paging(base, "ORDER BY \"Id\"", 20, 10),
             "SELECT * FROM (SELECT T0.*, ROWNUM AS rowNumber FROM (SELECT * FROM \"T\" ORDER BY \"Id\") T0) \
              WHERE rowNumber > 20 AND rowNumber <= 30"
+        );
+    }
+
+    #[test]
+    fn sqlserver_row_number_paging_matches_mspagesplit() {
+        // SQL Server 2005/2008：ROW_NUMBER 双层包装（对齐 MSPageSplit.RowNumber）
+        let base = "SELECT * FROM [DH_Order] WHERE ([Status] = @p0)";
+        let sql = DatabaseKind::SqlServer.apply_paging_with_style(
+            base,
+            "ORDER BY [Id] DESC",
+            20,
+            10,
+            PageStyle::RowNumber,
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT *, row_number() over(Order By [Id] DESC) as rowNumber FROM (SELECT * FROM [DH_Order] WHERE ([Status] = @p0)) AS XCode_T0) AS XCode_T1 WHERE rowNumber BETWEEN 21 And 30"
+        );
+
+        // 无排序：OVER 子句给合法兜底，保证语法可用
+        let sql = DatabaseKind::SqlServer.apply_paging_with_style(base, "", 0, 5, PageStyle::RowNumber);
+        assert!(sql.contains("row_number() over(Order By (SELECT NULL)) as rowNumber"), "{sql}");
+        assert!(sql.contains("rowNumber BETWEEN 1 And 5"), "{sql}");
+
+        // 其它库忽略风格（与默认分页一致）
+        assert_eq!(
+            DatabaseKind::Sqlite.apply_paging_with_style(
+                "SELECT * FROM T",
+                "ORDER BY \"Id\"",
+                5,
+                5,
+                PageStyle::RowNumber,
+            ),
+            DatabaseKind::Sqlite.apply_paging("SELECT * FROM T", "ORDER BY \"Id\"", 5, 5)
         );
     }
 

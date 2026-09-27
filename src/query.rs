@@ -3,7 +3,7 @@
 //! 条件以结构化方式收集，渲染时按目标数据库方言生成占位符与参数序列，
 //! 全程参数绑定，不拼接字面量。
 
-use crate::dialect::DatabaseKind;
+use crate::dialect::{DatabaseKind, PageStyle};
 use crate::value::DbValue;
 
 /// 比较运算符。
@@ -264,6 +264,8 @@ pub struct Query {
     pub page_index: usize,
     /// 每页条数
     pub page_size: usize,
+    /// 分页风格（仅 SQL Server 生效：默认 2012+ `OFFSET..FETCH`，2005/2008 可切 `ROW_NUMBER`）
+    pub page_style: PageStyle,
 }
 
 impl Query {
@@ -303,6 +305,14 @@ impl Query {
     /// 仅取前 N 条。
     pub fn take(mut self, n: usize) -> Self {
         self.limit = Some(n);
+        self
+    }
+
+    /// 设置分页风格（仅 SQL Server 生效；连接 SQL Server 2005/2008 时用 [`PageStyle::RowNumber`]）。
+    /// <param name="style">分页风格</param>
+    /// <returns>查询描述</returns>
+    pub fn page_style(mut self, style: PageStyle) -> Self {
+        self.page_style = style;
         self
     }
 }

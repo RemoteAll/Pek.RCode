@@ -16,13 +16,14 @@
 //! - 时间使用原生 `timestamp/timestamptz/date` 类型；7 位小数秒按 PostgreSQL 微秒精度四舍五入
 //! - 表结构探测走 `information_schema`（与 XCode 反向工程一致）
 //!
-//! TLS 说明（native-tls 后端）：
+//! TLS 说明（缺省 tls-native 后端；`--no-default-features --features tls-rustls` 可换 rustls 后端）：
 //! - `SslMode=Disable/Allow`：明文连接
 //! - `SslMode=Prefer`（缺省）：先尝试 TLS，服务器不支持时回退明文（对齐 Npgsql）
 //! - `SslMode=Require`：强制 TLS，只加密不校验证书
 //! - `SslMode=VerifyCA`：校验证书链、不校验主机名；`SslMode=VerifyFull`：全量校验
 //! - 根证书可用 `Root Certificate`/`SslCa` 指定（PEM/DER）
-//! - 客户端证书（`SSL Certificate`/`SSL Key`，PEM）暂不支持（native-tls 仅支持 PKCS#12），会返回明确错误
+//! - 客户端证书（`SSL Certificate`/`SSL Key`，PEM）需 rustls 后端；缺省 native-tls 后端仅支持 PKCS#12，
+//!   会返回明确错误；rustls 后端下 `VerifyCA` 与 `VerifyFull` 均校验证书链与主机名
 
 use std::time::Duration;
 
@@ -52,17 +53,10 @@ impl PostgresSession {
         let config = build_config(&settings);
 
         let client = if settings.ssl_mode == PgSslMode::Disable {
-            config.connect(NoTls)
+            config.connect(NoTls).map_err(|e| connect_error(&settings, e))?
         } else {
-            let connector = build_tls_connector(&settings)?;
-            config.connect(postgres_native_tls::MakeTlsConnector::new(connector))
-        }
-        .map_err(|e| {
-            Error::Db(format!(
-                "连接 PostgreSQL 失败（{}:{}）：{e}",
-                settings.host, settings.port
-            ))
-        })?;
+            connect_with_tls(&config, &settings)?
+        };
 
         Ok(Self { client })
     }
@@ -115,6 +109,12 @@ struct PostgresSettings {
     ssl_mode: PgSslMode,
     /// 根证书路径（Root Certificate/SslCa，PEM/DER）
     ssl_root_cert: Option<String>,
+    /// 客户端证书链路径（PEM；仅 tls-rustls 后端，`SSL Certificate`）
+    #[cfg(feature = "tls-rustls")]
+    ssl_client_cert: Option<String>,
+    /// 客户端私钥路径（PEM；仅 tls-rustls 后端，`SSL Key`）
+    #[cfg(feature = "tls-rustls")]
+    ssl_client_key: Option<String>,
 }
 
 /// 解析连接串为设置结构（与 XCode 的键名兼容）。
@@ -132,14 +132,20 @@ fn parse_settings(cs: &ConnectionString) -> Result<PostgresSettings> {
             other => return Err(Error::Model(format!("无效的 SslMode \"{other}\""))),
         },
     };
-    // 客户端证书（PEM）当前后端不支持（native-tls 仅 PKCS#12），明确报错而非静默忽略
+    // 客户端证书：rustls 后端支持 PEM；native-tls 仅 PKCS#12，明确报错而非静默忽略
+    #[cfg(feature = "tls-rustls")]
+    let (ssl_client_cert, ssl_client_key) = (
+        cs.get("ssl certificate").or(cs.get("sslcert")).map(str::to_string),
+        cs.get("ssl key").or(cs.get("sslkey")).map(str::to_string),
+    );
+    #[cfg(not(feature = "tls-rustls"))]
     if cs.get("ssl certificate").is_some()
         || cs.get("sslcert").is_some()
         || cs.get("ssl key").is_some()
         || cs.get("sslkey").is_some()
     {
         return Err(Error::Unsupported(
-            "PostgreSQL 客户端证书（SSL Certificate/SSL Key）暂不支持：native-tls 仅支持 PKCS#12 客户端标识"
+            "PostgreSQL 客户端证书（SSL Certificate/SSL Key）需 rustls 后端：请用 --no-default-features --features tls-rustls 构建"
                 .into(),
         ));
     }
@@ -207,6 +213,10 @@ fn parse_settings(cs: &ConnectionString) -> Result<PostgresSettings> {
         connect_timeout,
         ssl_mode,
         ssl_root_cert,
+        #[cfg(feature = "tls-rustls")]
+        ssl_client_cert,
+        #[cfg(feature = "tls-rustls")]
+        ssl_client_key,
     })
 }
 
@@ -230,7 +240,42 @@ fn build_config(settings: &PostgresSettings) -> PgConfig {
     config
 }
 
+/// 统一的连接错误信息。
+fn connect_error(settings: &PostgresSettings, e: postgres::Error) -> Error {
+    Error::Db(format!(
+        "连接 PostgreSQL 失败（{}:{}）：{e}",
+        settings.host, settings.port
+    ))
+}
+
+/// 建立 TLS 连接（缺省 native-tls 后端）。
+#[cfg(feature = "tls-native")]
+fn connect_with_tls(config: &PgConfig, settings: &PostgresSettings) -> Result<Client> {
+    let connector = build_tls_connector(settings)?;
+    config
+        .connect(postgres_native_tls::MakeTlsConnector::new(connector))
+        .map_err(|e| connect_error(settings, e))
+}
+
+/// 建立 TLS 连接（rustls 后端：支持 PEM 根证书与客户端证书）。
+#[cfg(all(not(feature = "tls-native"), feature = "tls-rustls"))]
+fn connect_with_tls(config: &PgConfig, settings: &PostgresSettings) -> Result<Client> {
+    let tls = build_rustls_config(settings)?;
+    config
+        .connect(postgres_rustls::MakeRustlsConnect::new(tls))
+        .map_err(|e| connect_error(settings, e))
+}
+
+/// 未启用 TLS 后端：需要 TLS 的连接直接报错。
+#[cfg(all(not(feature = "tls-native"), not(feature = "tls-rustls")))]
+fn connect_with_tls(_config: &PgConfig, _settings: &PostgresSettings) -> Result<Client> {
+    Err(Error::Unsupported(
+        "未启用 TLS 后端：请启用 tls-native（缺省）或 tls-rustls 特性".into(),
+    ))
+}
+
 /// 构建 native-tls 连接器（校验开关按 SslMode 映射）。
+#[cfg(feature = "tls-native")]
 fn build_tls_connector(settings: &PostgresSettings) -> Result<native_tls::TlsConnector> {
     let mut builder = native_tls::TlsConnector::builder();
     match settings.ssl_mode {
@@ -258,6 +303,151 @@ fn build_tls_connector(settings: &PostgresSettings) -> Result<native_tls::TlsCon
     builder
         .build()
         .map_err(|e| Error::Db(format!("构建 TLS 连接器失败：{e}")))
+}
+
+/// 构建 rustls 客户端配置。
+///
+/// - `Prefer`/`Require`：跳过证书链与主机名校验（只加密，对齐 native-tls 的 danger 模式）；
+/// - `VerifyCA`/`VerifyFull`：校验证书链与主机名（rustls 不区分两者）；
+/// - 根证书缺失时使用 `webpki-roots`（Mozilla 根证书集）。
+#[cfg(feature = "tls-rustls")]
+fn build_rustls_config(settings: &PostgresSettings) -> Result<rustls::ClientConfig> {
+    // 显式指定 aws-lc-rs 提供者：依赖图中可能同时存在 ring（多提供者时 rustls 无法自动选择）
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Db(format!("初始化 rustls 协议版本失败：{e}")))?;
+    let builder = match settings.ssl_mode {
+        PgSslMode::Prefer | PgSslMode::Require => builder
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(
+                rustls_tls::NoVerification::new(),
+            )),
+        PgSslMode::VerifyCa | PgSslMode::VerifyFull => {
+            let mut roots = rustls::RootCertStore::empty();
+            match &settings.ssl_root_cert {
+                Some(path) => {
+                    for cert in load_pem_certs(path)? {
+                        roots.add(cert).map_err(|e| {
+                            Error::Model(format!("根证书不受信任（{path}）：{e}"))
+                        })?;
+                    }
+                }
+                None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+            }
+            builder.with_root_certificates(roots)
+        }
+        PgSslMode::Disable => unreachable!("Disable 不构建 TLS 配置"),
+    };
+
+    match (&settings.ssl_client_cert, &settings.ssl_client_key) {
+        (Some(cert), Some(key)) => builder
+            .with_client_auth_cert(load_pem_certs(cert)?, load_pem_key(key)?)
+            .map_err(|e| Error::Model(format!("客户端证书与私钥不匹配：{e}"))),
+        (None, None) => Ok(builder.with_no_client_auth()),
+        _ => Err(Error::Model(
+            "客户端证书需同时提供 SSL Certificate 与 SSL Key".into(),
+        )),
+    }
+}
+
+/// 读取 PEM 证书链（空文件回退为 DER 单证书）。
+#[cfg(feature = "tls-rustls")]
+fn load_pem_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let bytes = std::fs::read(path).map_err(|e| Error::Model(format!("读取证书失败（{path}）：{e}")))?;
+    let mut certs = rustls_pemfile::certs(&mut bytes.as_slice())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::Model(format!("解析 PEM 证书失败（{path}）：{e}")))?;
+    if certs.is_empty() {
+        certs.push(rustls::pki_types::CertificateDer::from(bytes));
+    }
+    Ok(certs)
+}
+
+/// 读取 PEM/DER 私钥。
+#[cfg(feature = "tls-rustls")]
+fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let bytes = std::fs::read(path).map_err(|e| Error::Model(format!("读取私钥失败（{path}）：{e}")))?;
+    if let Some(key) = rustls_pemfile::private_key(&mut bytes.as_slice())
+        .map_err(|e| Error::Model(format!("解析 PEM 私钥失败（{path}）：{e}")))?
+    {
+        return Ok(key);
+    }
+    rustls::pki_types::PrivateKeyDer::try_from(bytes)
+        .map_err(|e| Error::Model(format!("解析私钥失败（{path}）：{e}")))
+}
+
+/// rustls 辅助：跳过证书校验的校验器（对齐 native-tls 的 danger 模式）。
+#[cfg(feature = "tls-rustls")]
+mod rustls_tls {
+    use std::sync::Arc;
+
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+
+    /// 跳过证书链与主机名校验（仅用于 Prefer/Require：只加密不校验）。
+    #[derive(Debug)]
+    pub struct NoVerification {
+        provider: Arc<CryptoProvider>,
+    }
+
+    impl NoVerification {
+        /// 使用 rustls 默认加密提供者（aws-lc-rs）。
+        pub fn new() -> Self {
+            Self {
+                provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            }
+        }
+    }
+
+    impl ServerCertVerifier for NoVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
 }
 
 /// PostgreSQL 参数：统一以**文本格式**传输。
@@ -512,14 +702,69 @@ mod tests {
         // 无效值报错
         let cs = ConnectionString::parse("Server=x;provider=postgresql;SslMode=Bogus");
         assert!(parse_settings(&cs).is_err());
-        // 客户端证书（PEM）明确不支持
+    }
+
+    /// 客户端证书按后端特性区分：rustls 接受 PEM，native-tls 明确报错。
+    #[test]
+    fn ssl_client_cert_by_backend() {
         let cs = ConnectionString::parse(
             "Server=x;provider=postgresql;SSL Certificate=c.pem;SSL Key=k.pem",
         );
-        let err = parse_settings(&cs).unwrap_err().to_string();
-        assert!(err.contains("客户端证书"), "{err}");
+        #[cfg(feature = "tls-rustls")]
+        {
+            let settings = parse_settings(&cs).unwrap();
+            assert_eq!(settings.ssl_client_cert.as_deref(), Some("c.pem"));
+            assert_eq!(settings.ssl_client_key.as_deref(), Some("k.pem"));
+        }
+        #[cfg(not(feature = "tls-rustls"))]
+        {
+            let err = parse_settings(&cs).unwrap_err().to_string();
+            assert!(err.contains("客户端证书"), "{err}");
+            assert!(err.contains("tls-rustls"), "{err}");
+        }
     }
 
+    /// rustls 后端：PEM 客户端证书与各 SslMode 的配置构建。
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn rustls_config_supports_pem_client_cert() {
+        let key_pair = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("rcode-pgtls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("client.pem");
+        let key_path = dir.join("client.key");
+        std::fs::write(&cert_path, key_pair.cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.key_pair.serialize_pem()).unwrap();
+
+        // Prefer：跳过校验 + 客户端证书
+        let cs = ConnectionString::parse(&format!(
+            "Server=x;provider=postgresql;SslMode=Prefer;SSL Certificate={};SSL Key={}",
+            cert_path.display(),
+            key_path.display()
+        ));
+        let settings = parse_settings(&cs).unwrap();
+        let config = build_rustls_config(&settings).unwrap();
+        assert!(config.client_auth_cert_resolver.has_certs());
+
+        // VerifyFull：自签证书作为根证书（真实校验链）
+        let cs = ConnectionString::parse(&format!(
+            "Server=x;provider=postgresql;SslMode=VerifyFull;Root Certificate={}",
+            cert_path.display()
+        ));
+        let settings = parse_settings(&cs).unwrap();
+        assert!(build_rustls_config(&settings).is_ok());
+
+        // 只给证书不给私钥：报错
+        let cs = ConnectionString::parse(&format!(
+            "Server=x;provider=postgresql;SSL Certificate={}",
+            cert_path.display()
+        ));
+        assert!(build_rustls_config(&parse_settings(&cs).unwrap()).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "tls-native")]
     #[test]
     fn tls_connector_rejects_missing_root_cert() {
         let cs = ConnectionString::parse(

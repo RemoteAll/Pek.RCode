@@ -293,7 +293,7 @@ pub fn select_sql(kind: DatabaseKind, table: &TableMeta, query: &Query) -> (Stri
     // 分页优先于取前 N
     if paging {
         let offset = (query.page_index - 1) * query.page_size;
-        sql = kind.apply_paging(&sql, &order_sql, offset, query.page_size);
+        sql = kind.apply_paging_with_style(&sql, &order_sql, offset, query.page_size, query.page_style);
     } else if let Some(limit) = query.limit {
         sql = kind.apply_paging(&sql, &order_sql, 0, limit);
     } else if !order_sql.is_empty() {
@@ -464,6 +464,31 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT \"Status\", COUNT(*) AS Cnt FROM \"DH_Order\" ORDER BY \"Id\" LIMIT 5 OFFSET 0"
+        );
+    }
+
+    #[test]
+    fn sqlserver_row_number_style_paging() {
+        let t = table();
+
+        // 默认风格仍为 2012+ OFFSET..FETCH（与 DH.NCode 现行行为一致）
+        let q = Query::new().filter(Where::new().eq("Status", 1)).page(3, 10);
+        let (sql, _) = select_sql(DatabaseKind::SqlServer, &t, &q);
+        assert!(sql.contains("OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY"), "{sql}");
+
+        // 切换 MSPageSplit 的 ROW_NUMBER 风格（SQL Server 2005/2008）
+        let q = q.page_style(crate::dialect::PageStyle::RowNumber);
+        let (sql, _) = select_sql(DatabaseKind::SqlServer, &t, &q);
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT *, row_number() over(Order By [Id]) as rowNumber FROM (SELECT * FROM [DH_Order] WHERE ([Status] = @p0)) AS XCode_T0) AS XCode_T1 WHERE rowNumber BETWEEN 21 And 30"
+        );
+
+        // 其它库不受风格影响
+        let (sql, _) = select_sql(DatabaseKind::Sqlite, &t, &q);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"DH_Order\" WHERE (\"Status\" = ?) ORDER BY \"Id\" LIMIT 10 OFFSET 20"
         );
     }
 }

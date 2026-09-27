@@ -53,7 +53,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`） |
 
-测试：**212 项全部通过**（库单测 189 + 集成 16 + 文档测试 7；`--features duckdb` 全量 219 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 213 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控）；
+测试：**216 项全部通过**（库单测 193 + 集成 16 + 文档测试 7；`--features duckdb` 全量 223 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 217 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 216 项（rustls TLS 后端）；
 MySQL / PostgreSQL / SQL Server / Oracle 端到端用例在有真实库时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -120,6 +120,7 @@ cd G:\Code\Pek.Rust\Pek.RCode
 cargo test          # 默认测试（含 SQLite + 固件回归 + 对象实体端到端）
 cargo test --features duckdb   # 额外交付 DuckDB 内嵌引擎的完整用例
 cargo test --features redis    # 分布式缓存版本号（基于 Pek.RRedis；RCODE_REDIS 指向真实 Redis 时实机验证）
+cargo test --no-default-features --features tls-rustls   # rustls TLS 后端（PEM 客户端证书）
 cargo clippy        # 零警告
 ```
 
@@ -235,6 +236,7 @@ cargo test --test remote_e2e
 ```
 
 > TLS：MySQL/PostgreSQL 已内置 native-tls（缺省 Preferred/Prefer：能 TLS 就 TLS、服务器不支持回退明文；`Require/VerifyCA/VerifyFull` 强制校验，根证书分别用 `SslCa`/`Root Certificate`）；Oracle 支持 `Protocol=tcps`（TLS 由 OCI 客户端/钱包管理）；SQL Server 可自选 `Encrypt`，默认加密+信任自签证书。
+> TLS 后端可切换：`--no-default-features --features tls-rustls` 换用 rustls（**PEM 客户端证书**：MySQL `SslCert`/`SslKey`、PostgreSQL `SSL Certificate`/`SSL Key`；该后端下 `VerifyCA` 与 `VerifyFull` 均校验证书链与主机名，且与 `tls-native` 特性互斥）。
 > 依赖镜像：工程内 `.cargo/config.toml` 已配置 rsproxy。
 
 ### 其它数据库（DH.NCode 全量驱动）
@@ -393,7 +395,7 @@ Pek.RCode/
 
 **已完成（2026-09-27 补迁移批次）**：
 
-1. **TLS** ✅ MySQL/PostgreSQL 内置 native-tls（缺省 Preferred/Prefer 可回退；Required/Require/VerifyCA/VerifyFull 分级校验；根证书 `SslCa`/`CertificateFile`/`Root Certificate`）；Oracle 支持 `Protocol=tcps`
+1. **TLS** ✅ MySQL/PostgreSQL 内置 native-tls（缺省 Preferred/Prefer 可回退；Required/Require/VerifyCA/VerifyFull 分级校验；根证书 `SslCa`/`CertificateFile`/`Root Certificate`）；Oracle 支持 `Protocol=tcps`；**PEM 客户端证书** ✅ 新增 `tls-rustls` 后端（`--no-default-features --features tls-rustls`；MySQL `SslCert`/`SslKey`、PG `SSL Certificate`/`SSL Key` 生效）
 2. **连接池** ✅ `pool`（对齐 C# `ConnectionPool`：Min=CPU(2–8)/Max=1000/空闲 30s；`Pooling=false` 关闭；`pool_stats`/`clear_pool`）
 3. **多库反向工程与结构比对** ✅ `catalog` 覆盖除 MongoDB 外全部驱动（含索引/唯一约束）；`sync_schema` 为既存表补建缺失索引；新增 `diff_schema`（缺失/多余的表/列/索引 + 类型差异报告 + ALTER 脚本导出）
 4. **异步门面** ✅ `async_dal`（tokio `spawn_blocking` 统一包装全驱动的同步内核；`run`/`with_session` 可覆盖全部同步 API，含表/实体操作）
@@ -402,12 +404,11 @@ Pek.RCode/
 7. **DataSimulation** ✅ `simulation`（随机造数 + 分批事务 + TPS 统计）
 8. **基础库下沉** ✅ 时间文本格式/解析、MD5 摘要、文本文件读写（BOM 兼容）等基础方法下沉到 **DH.RustBase**（crate `dhrust` 0.1.4）；Pek.RCode 与 Pek.RRedis 均已 path 依赖复用（不再各自内联实现）
 9. **远程服务协议互通** ✅ `/Db/Query` 采用 NewLife **DbTable v3 二进制**（`dbtable` 模块：7 位压缩整数、大端浮点、Decimal 四元组、DateTime 刻度、`System.Byte[]`/`Guid`）；`DbService::query_packet` 输出报文、`DbClient::query_rowset` 自动识别二进制（C# `DbServer`）与 JSON（Rust 宿主）应答；黄金样本由**真实 C# NewLife.Core** 生成，编码**逐字节一致**、双向互读验证通过
+10. **MSPageSplit（可选能力）** ✅ `PageStyle::RowNumber`（`Query::page_style`）：SQL Server 2005/2008 的 `ROW_NUMBER()` 双层分页（对齐 `MSPageSplit.RowNumber`，含无排序兜底）；DH.NCode 现行默认仍为 2012+ `OFFSET..FETCH`，Rust 默认行为与其保持一致
 
-**尚未完成**：
+**边界确认（非待办）**：
 
-1. **TLS 收尾**：客户端证书（PEM）需 rustls 后端（当前 native-tls 仅支持 PKCS#12），MySQL/PG 暂无 PEM 客户端证书
-2. **MSPageSplit**：SQL Server 2005/2008 的 ROW_NUMBER 分页（当前统一 2012+ 的 `OFFSET..FETCH`）
-3. **跨语言产物边界（确认）**：`HtmlBuilder`（Razor 页面）与 CubeBuilder/CustomBuilder（C# 框架产物）由 C# 侧 XCodeTool 继续使用；`Model.xml` 双端共用不受影响，Rust 侧以实体/模型/接口/搜索生成为对等能力
+- `HtmlBuilder`（Razor 页面）与 CubeBuilder/CustomBuilder（C# 框架产物）由 C# 侧 XCodeTool 继续使用；`Model.xml` 双端共用不受影响，Rust 侧以实体/模型/接口/搜索生成为对等能力
 
 ---
 
