@@ -8,6 +8,8 @@ license = "MIT"
 
 [dependencies]
 chrono = "0.4.45"
+# DH 基础库（DH.RustBase）：时间文本格式/解析、MD5 摘要、文本文件读写等基础方法
+dhrust = { path = "../DH.RustBase" }
 # PostgreSQL 参数绑定直接依赖 postgres-types（与 postgres 主驱动共用同一版本）
 bytes = "1"
 # MySQL：native-tls 后端（SslMode=Required/VerifyCA/VerifyFull 真实建立 TLS）
@@ -22,8 +24,6 @@ postgres-types = "0.2"
 roxmltree = "0.21.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rust_decimal = { version = "1.43.0", features = ["db-tokio-postgres"] }
-# Membership 模块密码哈希：与 C# NewLife 的 MD5 扩展对齐（32 位小写十六进制）
-md-5 = "0.10"
 thiserror = "2.0.21"
 tiberius = { version = "0.13.0", features = ["chrono", "rust_decimal"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
@@ -39,6 +39,8 @@ mongodb = "3.9.1"
 serde_json = "1"
 ureq = "3.4.2"
 futures-util = "0.3.34"
+# Redis 集成：使用 Pek.RRedis（DH.NRedis 的 Rust 实现，与 C# 端字节级互通）
+pek-rredis = { path = "../Pek.RRedis", optional = true }
 
 [profile.release]
 lto = "thin"
@@ -46,3 +48,12 @@ strip = true
 
 [features]
 duckdb = ["dep:duckdb"]
+# Redis 集成（Pek.RRedis）：分布式缓存版本号跨进程失效
+redis = ["dep:pek-rredis"]
+
+[workspace]
+members = ["derive"]
+
+[dev-dependencies]
+# 派生宏（`#[derive(Entity)]`）：与主 crate 分离的 proc-macro 包
+pek-rcode-derive = { path = "derive" }

@@ -9,22 +9,14 @@
 //! 反射相关的实体行为（`EntityFactory`、`Meta.Cache` 全局缓存等）在 Rust 中省略，
 //! 由 `Dal::table(name)` 与显式传参取代，见迁移文档"机制差异"一节。
 
-use md5::{Digest, Md5};
-
 use crate::session::DbRow;
 use crate::value::DbValue;
 
 /// 计算字符串的 MD5（32 位小写十六进制），对齐 NewLife 的 `MD5()` 扩展。
-/// <param name="text">原文</param>
-/// <returns>32 位小写十六进制哈希</returns>
-pub fn md5_hex(text: &str) -> String {
-    let digest = Md5::digest(text.as_bytes());
-    let mut out = String::with_capacity(32);
-    for b in digest {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
+///
+/// 实现已下沉到 DH 基础库（`DH.RustBase` / crate `dhrust` 的 `sign` 模块），
+/// 此处转出以兼容既有调用方。
+pub use dhrust::sign::md5_hex;
 
 /// 对密码做 `times` 轮 MD5 哈希（对齐 C# 登录时的 `for (i < hashTimes) p = p.MD5()`）。
 /// <param name="password">原始密码</param>
@@ -97,9 +89,10 @@ pub fn verify_login(account: &str, enable: bool, stored: &str, input: &str, hash
 }
 
 /// 数据范围（角色的数据权限范围），对齐 DH.NCode `DataScopes`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DataScope {
     /// 默认。使用角色或上级默认值，仅用于菜单等覆盖场景（-1）。
+    #[default]
     Default = -1,
     /// 全部（0）。
     All = 0,
@@ -131,9 +124,10 @@ impl DataScope {
 }
 
 /// 性别，对齐 DH.NCode `SexKinds`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SexKinds {
     /// 未知（0）。
+    #[default]
     Unknown = 0,
     /// 男（1）。
     Male = 1,
@@ -142,9 +136,10 @@ pub enum SexKinds {
 }
 
 /// 菜单类型，对齐 DH.NCode `MenuTypes`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MenuTypes {
     /// 目录（1）。
+    #[default]
     Directory = 1,
     /// 菜单（2）。
     Menu = 2,
@@ -153,20 +148,22 @@ pub enum MenuTypes {
 }
 
 /// 角色类型，对齐 DH.NCode `RoleTypes`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RoleTypes {
     /// 系统（1）。
     System = 1,
     /// 普通（2）。
+    #[default]
     Normal = 2,
     /// 租户（3）。
     Tenant = 3,
 }
 
 /// 租户类型，对齐 DH.NCode `TenantTypes`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TenantTypes {
     /// 免费（1）。
+    #[default]
     Free = 1,
     /// 个人（2）。
     Personal = 2,
@@ -177,9 +174,10 @@ pub enum TenantTypes {
 }
 
 /// 部门类型，对齐 DH.NCode `DepartmentTypes`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DepartmentTypes {
     /// 公司（1）。
+    #[default]
     Company = 1,
     /// 部门（2）。
     Department = 2,
@@ -190,9 +188,10 @@ pub enum DepartmentTypes {
 }
 
 /// 参数种类，对齐 DH.NCode `ParameterKinds`（数值与 `DbType` 对应）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ParameterKinds {
     /// 普通（0）。
+    #[default]
     Normal = 0,
     /// 布尔（3）。
     Boolean = 3,
@@ -223,13 +222,6 @@ impl SexKinds {
         }
     }
 }
-
-impl Default for SexKinds {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
-
 impl MenuTypes {
     /// 从数值解析（未知值返回 None）。
     /// <param name="value">数值</param>
@@ -243,13 +235,6 @@ impl MenuTypes {
         }
     }
 }
-
-impl Default for MenuTypes {
-    fn default() -> Self {
-        Self::Directory
-    }
-}
-
 impl RoleTypes {
     /// 从数值解析（未知值返回 None）。
     /// <param name="value">数值</param>
@@ -263,13 +248,6 @@ impl RoleTypes {
         }
     }
 }
-
-impl Default for RoleTypes {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
 impl TenantTypes {
     /// 从数值解析（未知值返回 None）。
     /// <param name="value">数值</param>
@@ -284,13 +262,6 @@ impl TenantTypes {
         }
     }
 }
-
-impl Default for TenantTypes {
-    fn default() -> Self {
-        Self::Free
-    }
-}
-
 impl DepartmentTypes {
     /// 从数值解析（未知值返回 None）。
     /// <param name="value">数值</param>
@@ -305,13 +276,6 @@ impl DepartmentTypes {
         }
     }
 }
-
-impl Default for DepartmentTypes {
-    fn default() -> Self {
-        Self::Company
-    }
-}
-
 impl ParameterKinds {
     /// 从数值解析（未知值返回 None）。
     /// <param name="value">数值</param>
@@ -328,18 +292,6 @@ impl ParameterKinds {
             22 => Some(Self::Hash),
             _ => None,
         }
-    }
-}
-
-impl Default for ParameterKinds {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
-impl Default for DataScope {
-    fn default() -> Self {
-        Self::Default
     }
 }
 

@@ -144,7 +144,7 @@ fn run(opts: &Options) -> Result<(), String> {
         for (file_name, code) in outputs {
             let path = out_dir.join(&file_name);
 
-            match fs::read_to_string(&path) {
+            match dhrust::io::read_all_text(&path) {
                 Ok(existing) => {
                     if existing == code {
                         unchanged += 1;
@@ -158,7 +158,7 @@ fn run(opts: &Options) -> Result<(), String> {
                     if opts.dry_run {
                         println!("[将更新] {}", path.display());
                     } else {
-                        fs::write(&path, code)
+                        dhrust::io::write_all_text(&path, &code)
                             .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
                         println!("[更新] {}", path.display());
                     }
@@ -168,7 +168,7 @@ fn run(opts: &Options) -> Result<(), String> {
                     if opts.dry_run {
                         println!("[将生成] {}", path.display());
                     } else {
-                        fs::write(&path, code)
+                        dhrust::io::write_all_text(&path, &code)
                             .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
                         println!("[生成] {}", path.display());
                     }
@@ -225,7 +225,8 @@ fn run_reverse(opts: &Options, conn: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    fs::write(&out, model.to_xml()).map_err(|e| format!("写入 {} 失败：{e}", out.display()))?;
+    dhrust::io::write_all_text(&out, &model.to_xml())
+        .map_err(|e| format!("写入 {} 失败：{e}", out.display()))?;
     println!(
         "反向工程完成：{} 张表 → {}（{}）",
         model.tables.len(),

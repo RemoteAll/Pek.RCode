@@ -41,14 +41,18 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `http` / `rt` | — | 内部公共层：HTTP 驱动共用传输层、异步驱动共用 tokio 运行时 |
 | `sqlbuild` | `InsertBuilder` / `SelectBuilder` | ✅ INSERT/UPDATE/DELETE/SELECT/COUNT |
 | `query` | `WhereExpression` / `PageParameter` | ✅ 链式条件 + 分页/取前 N |
-| `dal` | `DAL` / 迁移 Migration | ✅ 连接串解析、结构同步（建表/补列）、实体表操作 |
-| `cache` | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | ✅ 整表实体缓存 + 单对象缓存（默认 60s 过期；写入自动失效） |
-| `reverse` | `DAL.GetTables`（反向工程） | ✅ 数据库 → `EntityModel` / `Model.xml`（SQLite 实测；`rcodegen --conn`） |
-| `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count` |
+| `dal` | `DAL` / 迁移 Migration | ✅ 连接串解析、结构同步（建表/补列/**补索引**）、结构比对 `diff_schema`（差异报告 + ALTER 导出）、实体表操作 |
+| `pool` | `ConnectionPool` | ✅ 会话连接池（按连接串共享；Min=CPU(2–8)/Max=1000/空闲 30s；`Pooling=false` 关闭） |
+| `async_dal` | `IAsyncDbSession` / `*Async` | ✅ 异步门面（tokio `spawn_blocking` 包装全驱动；`run`/`with_session` 覆盖全部同步 API） |
+| `catalog` | 各 `DbBase.OnGetTables` 元数据 | ✅ 全驱动目录读取（表/列/索引；MongoDB 除外；Access 走 ODBC 元数据） |
+| `cache` | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | ✅ 整表实体缓存 + 单对象缓存（默认 60s 过期；写入自动失效）；✅ Redis 版本号（feature `redis`，底层为 **Pek.RRedis** 自研客户端） |
+| `reverse` | `DAL.GetTables`（反向工程） | ✅ 数据库 → `EntityModel` / `Model.xml`（**全部驱动**、含索引/唯一约束；`rcodegen --conn`） |
+| `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count`；`AuditExt` 审计字段访问；`#[derive(Entity)]` 宏 |
+| `simulation` | `Common/DataSimulation` | ✅ 造数压测（随机整型/字符串/时间 + 分批事务 + TPS） |
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`） |
 
-测试：**177 项全部通过**（库单测 158 + 集成 15 + 文档测试 4；`--features duckdb` 另含 DuckDB 内嵌引擎全链路用例；
+测试：**202 项全部通过**（库单测 179 + 集成 16 + 文档测试 7；`--features duckdb` 另含 DuckDB 内嵌引擎全链路用例，`--features redis` 另含 Redis 版本号用例（`RCODE_REDIS` 门控）；
 MySQL / PostgreSQL / SQL Server / Oracle 端到端用例在有真实库时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -57,6 +61,7 @@ MySQL / PostgreSQL / SQL Server / Oracle 端到端用例在有真实库时自动
 DuckDB 在 `--features duckdb` 下用**内嵌真实引擎**跑通建序列/建表/增删改查/事务回滚全链路；
 **实体缓存 / 单对象缓存**（命中、失效、过期重载）与**反向工程**（建库 → 反向 → 逐列对比 roundtrip）均有行为用例；
 其余网络型数据库（ClickHouse/TDengine/InfluxDB/Hana/Firebird/ODBC 系列/MongoDB）提供值转换与语句翻译单测；
+Redis 版本号用例（`--features redis`）底层为 **Pek.RRedis** 自研客户端（与 C# 同一 Redis 实例、同一字节格式）；
 另可用环境变量 `RCODE_MODEL` 对完整生产 `Model.xml` 跑全量回归（见下文）。
 
 ### 与 DH.NCode 支持范围的对照
@@ -113,6 +118,7 @@ println!("共 {total} 条，本页 {} 条", page.len());
 cd G:\Code\Pek.Rust\Pek.RCode
 cargo test          # 默认测试（含 SQLite + 固件回归 + 对象实体端到端）
 cargo test --features duckdb   # 额外交付 DuckDB 内嵌引擎的完整用例
+cargo test --features redis    # 分布式缓存版本号（基于 Pek.RRedis；RCODE_REDIS 指向真实 Redis 时实机验证）
 cargo clippy        # 零警告
 ```
 
@@ -226,7 +232,7 @@ $env:RCODE_ORACLE   = "Server=127.0.0.1;Port=1521;ServiceName=xepdb1;Uid=rcode;P
 cargo test --test remote_e2e
 ```
 
-> TLS：MySQL/PostgreSQL 已内置 native-tls（缺省 Preferred/Prefer：能 TLS 就 TLS、服务器不支持回退明文；`Require/VerifyCA/VerifyFull` 强制校验，根证书分别用 `SslCa`/`Root Certificate`）；Oracle 暂为明文（TCPS 待接线）；SQL Server 可自选 `Encrypt`，默认加密+信任自签证书。
+> TLS：MySQL/PostgreSQL 已内置 native-tls（缺省 Preferred/Prefer：能 TLS 就 TLS、服务器不支持回退明文；`Require/VerifyCA/VerifyFull` 强制校验，根证书分别用 `SslCa`/`Root Certificate`）；Oracle 支持 `Protocol=tcps`（TLS 由 OCI 客户端/钱包管理）；SQL Server 可自选 `Encrypt`，默认加密+信任自签证书。
 > 依赖镜像：工程内 `.cargo/config.toml` 已配置 rsproxy。
 
 ### 其它数据库（DH.NCode 全量驱动）
@@ -379,19 +385,25 @@ Pek.RCode/
 
 ---
 
-## 六、未完成迁移项（按“完整功能迁移、可直接切换 C# 项目”标准）
+## 六、补迁移进度（按“完整功能迁移、可直接切换 C# 项目”标准）
 
-> 以下是 DH.NCode 已有、Rust 侧**尚未完成**的功能迁移（不是可选增强项）：
+**已完成（2026-09-27 补迁移批次）**：
 
-1. **连接池**：对应 C# `ConnectionPool`（Min=CPU 核数 2–8 / Max=1000 / 空闲 30s，按连接串共享）；Rust 目前每次 `open_session` 直接新建连接
-2. **异步 API**：对应 C# `IAsyncDbSession` 与 `DAL`/`Entity` 全量 `*Async`（SaveAsync/InsertAsync/FindAsync/QueryAsync/ExecuteAsync…）；Rust 目前为同步 API（异步驱动内部 block_on）
-3. **多库反向工程与结构比对**：反向工程目前仅 SQLite、且不读索引/唯一约束；`sync_schema` 只建表/补列（不为既存表补索引）；缺类型差异检测、ALTER 脚本导出、备份与在线库管理（对应 C# `DAL_DbOperate` / `MetaData`）
-4. **代码生成增强**：枚举类型、审计字段基类、`#[derive(Entity)]` 属性宏；C# XCodeTool 的 CubeBuilder/CustomBuilder 范围待确认
-5. **分布式缓存失效适配**：`VersionStore` 抽象已就绪但无 Redis 实现（对接 Pek.RRedis）；C# 用 Redis 版本号做跨进程失效
-6. **远程服务协议互通**：C# `DbServer`/`DbClient` 为 NewLife Packet 二进制，Rust 为 JSON 行集，两端不能直接互连
-7. **低优先级/待确认**：`MSPageSplit`（历史 SQLServer 分页）、`DataSimulation`（造数）、`HtmlBuilder`（Razor 页面生成）、Oracle TLS（TCPS）与客户端证书 PEM
+1. **TLS** ✅ MySQL/PostgreSQL 内置 native-tls（缺省 Preferred/Prefer 可回退；Required/Require/VerifyCA/VerifyFull 分级校验；根证书 `SslCa`/`CertificateFile`/`Root Certificate`）；Oracle 支持 `Protocol=tcps`
+2. **连接池** ✅ `pool`（对齐 C# `ConnectionPool`：Min=CPU(2–8)/Max=1000/空闲 30s；`Pooling=false` 关闭；`pool_stats`/`clear_pool`）
+3. **多库反向工程与结构比对** ✅ `catalog` 覆盖除 MongoDB 外全部驱动（含索引/唯一约束）；`sync_schema` 为既存表补建缺失索引；新增 `diff_schema`（缺失/多余的表/列/索引 + 类型差异报告 + ALTER 脚本导出）
+4. **异步门面** ✅ `async_dal`（tokio `spawn_blocking` 统一包装全驱动的同步内核；`run`/`with_session` 可覆盖全部同步 API，含表/实体操作）
+5. **代码生成增强** ✅ 枚举字段映射（membership 已知枚举 → 真实 Rust 枚举；未知枚举按整型并注明）；`AuditExt` 审计字段访问；`#[derive(Entity)]` 属性宏（crate `pek-rcode-derive`）
+6. **分布式缓存失效适配** ✅ `RedisVersionStore`（feature `redis`；底层为 **Pek.RRedis**（DH.NRedis 的 Rust 实现）自研客户端，连接串/键名与 C# 一致，跨语言可互相感知失效）
+7. **DataSimulation** ✅ `simulation`（随机造数 + 分批事务 + TPS 统计）
+8. **基础库下沉** ✅ 时间文本格式/解析、MD5 摘要、文本文件读写（BOM 兼容）等基础方法下沉到 **DH.RustBase**（crate `dhrust` 0.1.4）；Pek.RCode 与 Pek.RRedis 均已 path 依赖复用（不再各自内联实现）
 
-已完成补迁移：**TLS** ✅（MySQL/PostgreSQL native-tls：缺省 Preferred/Prefer 能 TLS 就 TLS、服务器不支持回退明文；Require/VerifyCA/VerifyFull 强制校验；根证书 `SslCa`/`CertificateFile`、`Root Certificate`；客户端证书 PEM 暂不支持并明确报错）。
+**尚未完成**：
+
+1. **远程服务协议互通**：C# `DbServer`/`DbClient` 的 `/Db/Query` 返回 DbTable 的 NewLife `Binary` 二进制编码；Rust 侧当前为 JSON 行集，两端查询接口不能直接互连（下一步：移植 DbTable 二进制编解码）
+2. **TLS 收尾**：客户端证书（PEM）需 rustls 后端（当前 native-tls 仅支持 PKCS#12），MySQL/PG 暂无 PEM 客户端证书
+3. **MSPageSplit**：SQL Server 2005/2008 的 ROW_NUMBER 分页（当前统一 2012+ 的 `OFFSET..FETCH`）
+4. **跨语言产物边界（确认）**：`HtmlBuilder`（Razor 页面）与 CubeBuilder/CustomBuilder（C# 框架产物）由 C# 侧 XCodeTool 继续使用；`Model.xml` 双端共用不受影响，Rust 侧以实体/模型/接口/搜索生成为对等能力
 
 ---
 

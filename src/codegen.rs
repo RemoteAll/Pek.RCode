@@ -66,10 +66,10 @@ pub fn generate(table: &TableMeta) -> String {
         if col.identity {
             tags.push("自增");
         }
-        if let Some(enum_type) = col.enum_type.as_deref() {
-            if known_enum(enum_type).is_some() {
-                tags.push("枚举");
-            }
+        if let Some(enum_type) = col.enum_type.as_deref()
+            && known_enum(enum_type).is_some()
+        {
+            tags.push("枚举");
         }
         let tag_text = if tags.is_empty() {
             String::new()
@@ -911,5 +911,49 @@ mod tests {
         apply_plugins(&mut model.tables, &plugins);
         assert_eq!(model.tables.len(), 2);
         assert_eq!(model.tables[1].name, "Extra");
+    }
+
+    #[test]
+    fn enum_columns_generate_membership_types() {
+        const ENUM_MODEL: &str = r#"<EntityModel><Tables><Table Name="User" TableName="DH_User">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            <Column Name="Sex" DataType="Int32" Type="SexKinds" />
+            <Column Name="Menu" DataType="Int32" Type="XCode.Membership.MenuTypes" Nullable="True" />
+            <Column Name="Custom" DataType="Int32" Type="My.CustomKind" />
+          </Columns>
+        </Table></Tables></EntityModel>"#;
+
+        let model = EntityModel::parse(ENUM_MODEL).unwrap();
+        let code = generate(&model.tables[0]);
+
+        // 已知成员枚举 → Rust 枚举类型（含 Option 与 i32 存取）
+        assert!(
+            code.contains("pub sex: pek_rcode::membership::SexKinds"),
+            "{code}"
+        );
+        assert!(
+            code.contains("pub menu: Option<pek_rcode::membership::MenuTypes>"),
+            "{code}"
+        );
+        assert!(
+            code.contains("self.sex as i32).into()"),
+            "{code}"
+        );
+        assert!(
+            code.contains("self.menu.map(|v| v as i32).into()"),
+            "{code}"
+        );
+        assert!(
+            code.contains("pek_rcode::membership::SexKinds::from_i32"),
+            "{code}"
+        );
+        assert!(
+            code.contains("unwrap_or(pek_rcode::membership::SexKinds::Unknown)"),
+            "{code}"
+        );
+        // 未知枚举 → 按整型生成并注明 C# 枚举
+        assert!(code.contains("pub custom: i32"), "{code}");
+        assert!(code.contains("对应 C# 枚举 My.CustomKind"), "{code}");
     }
 }

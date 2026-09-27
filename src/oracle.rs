@@ -109,12 +109,19 @@ fn parse_settings(cs: &ConnectionString) -> Result<OracleSettings> {
         .or(cs.get("database"))
         .or(cs.get("initial catalog"));
 
+    // 协议：tcp（缺省）/ tcps（TLS；证书与钱包由 Oracle 客户端管理，与 C# 行为一致）
+    let protocol = cs
+        .get("protocol")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "tcp".into());
+    let prefix = if protocol == "tcps" { "tcps://" } else { "//" };
+
     let connect_string = match cs.get("data source").or(cs.get("datasource")) {
         // 完整描述（DESCRIPTION=...) 或 EZConnect（host:port/service）原样透传
         Some(ds) if ds.contains('(') || ds.contains('=') || ds.contains('/') => ds.to_string(),
         // TNS 别名：有 ServiceName 时按 EZConnect 组装，否则按别名交给 OCI 解析
         Some(alias) => match service {
-            Some(service) => format!("//{alias}:{port}/{service}"),
+            Some(service) => format!("{prefix}{alias}:{port}/{service}"),
             None => alias.to_string(),
         },
         None => {
@@ -129,7 +136,7 @@ fn parse_settings(cs: &ConnectionString) -> Result<OracleSettings> {
                 let service = service.ok_or_else(|| {
                     Error::Model("Oracle 连接串缺少 ServiceName（或 Database）".into())
                 })?;
-                format!("//{server}:{port}/{service}")
+                format!("{prefix}{server}:{port}/{service}")
             }
         }
     };

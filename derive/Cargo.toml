@@ -1,0 +1,15 @@
+[package]
+name = "pek-rcode-derive"
+version = "0.1.0"
+edition = "2024"
+description = "Pek.RCode 派生宏：#[derive(Entity)]（对应 DH.NCode 的实体基类）"
+authors = ["PeiKeSmart"]
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

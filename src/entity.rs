@@ -228,3 +228,56 @@ fn pk_values_of(fields: &[(&'static str, DbValue)], pks: &[&'static str]) -> Res
         })
         .collect()
 }
+
+/// 审计字段便捷访问（对应 C# 实体基类的审计属性）。
+///
+/// 写入侧由拦截器负责（[`crate::interceptor`] 的 Time/User/Trace 三件套），
+/// 本 trait 提供读取侧的统一定位与类型转换（列名忽略大小写）。
+pub trait AuditExt: Entity {
+    /// 读取任意列的当前值。
+    /// <param name="column">列名（忽略大小写）</param>
+    /// <returns>列值；列不存在时为 None</returns>
+    fn field_value(&self, column: &str) -> Option<DbValue> {
+        self.to_fields()
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+            .map(|(_, value)| value)
+    }
+
+    /// 创建时间（`CreateTime`）。
+    fn create_time(&self) -> Option<chrono::NaiveDateTime> {
+        self.field_value("CreateTime").and_then(|v| v.as_datetime())
+    }
+
+    /// 更新时间（`UpdateTime`）。
+    fn update_time(&self) -> Option<chrono::NaiveDateTime> {
+        self.field_value("UpdateTime").and_then(|v| v.as_datetime())
+    }
+
+    /// 创建人（`CreateUser`）。
+    fn create_user(&self) -> Option<String> {
+        self.field_value("CreateUser").map(|v| v.to_text())
+    }
+
+    /// 创建人编号（`CreateUserID`）。
+    fn create_user_id(&self) -> Option<i32> {
+        self.field_value("CreateUserID").and_then(|v| v.as_i32())
+    }
+
+    /// 更新人（`UpdateUser`）。
+    fn update_user(&self) -> Option<String> {
+        self.field_value("UpdateUser").map(|v| v.to_text())
+    }
+
+    /// 更新人编号（`UpdateUserID`）。
+    fn update_user_id(&self) -> Option<i32> {
+        self.field_value("UpdateUserID").and_then(|v| v.as_i32())
+    }
+
+    /// 链路标识（`TraceId`）。
+    fn trace_id(&self) -> Option<String> {
+        self.field_value("TraceId").map(|v| v.to_text())
+    }
+}
+
+impl<T: Entity> AuditExt for T {}

@@ -108,6 +108,7 @@ pub mod reverse;
 pub mod session;
 pub mod shards;
 pub mod show_in;
+pub mod simulation;
 pub mod sqlbuild;
 pub mod sqlite;
 pub mod sql_template;

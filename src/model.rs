@@ -200,7 +200,7 @@ pub struct IndexMeta {
 impl EntityModel {
     /// 从文件路径加载。
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = dhrust::io::read_all_text(path)?;
         Self::parse(&text)
     }
 

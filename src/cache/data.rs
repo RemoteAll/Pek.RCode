@@ -30,7 +30,7 @@ impl DataCache {
         let path = path.into();
         let mut field_cache = BTreeMap::new();
 
-        if let Ok(text) = std::fs::read_to_string(&path)
+        if let Ok(text) = dhrust::io::read_all_text(&path)
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
             && let Some(map) = json.get("FieldCache").and_then(|v| v.as_object())
         {
@@ -108,7 +108,7 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, text)?;
+    dhrust::io::write_all_text(&tmp, text)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }

@@ -10,14 +10,14 @@ use std::fmt;
 use chrono::NaiveDateTime;
 use rust_decimal::Decimal;
 
-/// DateTime 的文本前缀格式（秒级）。
+/// 时间文本格式/解析等基础方法已下沉到 DH 基础库（`DH.RustBase` / crate `dhrust`
+/// 的 `times` 模块），此处转出以兼容既有调用方：
 ///
-/// 说明：C# XCode 写入的是 7 位小数秒（如 `2026-09-26 18:01:02.1230000`）；
-/// chrono 的 `%.Nf` 仅支持 3/6/9 位，因此小数部分由 [`format_datetime`] 手动拼接。
-pub const DATETIME_SECONDS_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
-
-/// 小数秒位数（与 C# XCode 保持一致）。
-pub const DATETIME_FRACTION_DIGITS: usize = 7;
+/// - [`format_datetime`]：7 位小数秒的 XCode 数据库格式（与 C# XCode 写入一致）；
+/// - [`parse_datetime`]：多格式容错解析（含 ISO 8601 与纯日期）。
+pub use dhrust::times::{
+    DATETIME_FRACTION_DIGITS, DATETIME_SECONDS_FORMAT, format_datetime, parse_datetime,
+};
 
 /// 数据库字段值。
 #[derive(Debug, Clone, PartialEq)]
@@ -176,47 +176,6 @@ impl fmt::Display for DbValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_text())
     }
-}
-
-/// 时间 → XCode 兼容文本（7 位小数秒，与 C# 写入格式一致）。
-pub fn format_datetime(value: &NaiveDateTime) -> String {
-    // chrono 不支持 %.7f，这里手动拼接 7 位小数秒
-    let nanos = value.and_utc().timestamp_subsec_nanos();
-    let fraction = nanos / 10u32.pow(9 - DATETIME_FRACTION_DIGITS as u32);
-    format!(
-        "{}.{fraction:0width$}",
-        value.format(DATETIME_SECONDS_FORMAT),
-        width = DATETIME_FRACTION_DIGITS
-    )
-}
-
-/// 文本 → 时间（兼容 C# 写入的多种格式，含无小数秒与纯日期）。
-pub fn parse_datetime(text: &str) -> Option<NaiveDateTime> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-
-    const FORMATS: [&str; 5] = [
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-    ];
-    for fmt in FORMATS {
-        if let Ok(v) = NaiveDateTime::parse_from_str(text, fmt) {
-            return Some(v);
-        }
-    }
-    // 带 Z / 时区偏移的 ISO8601（InfluxDB、ClickHouse 等常见输出）
-    if let Ok(v) = chrono::DateTime::parse_from_rfc3339(text) {
-        return Some(v.naive_utc());
-    }
-    // 纯日期需要补零点
-    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
 }
 
 macro_rules! impl_from {
