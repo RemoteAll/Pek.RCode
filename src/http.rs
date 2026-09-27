@@ -134,6 +134,45 @@ pub fn post_json(url: &str, body: &str, auth: Option<(&str, &str)>, timeout: Dur
     send_post(url, body, "application/json; charset=utf-8", auth, timeout)
 }
 
+/// 发送 HTTP 请求（POST JSON 体），返回响应体**原始字节**（用于二进制协议应答）。
+///
+/// <param name="accept_octet_stream">是否声明 `Accept: application/octet-stream`（C# DbServer 二进制应答）</param>
+/// <returns>响应体字节</returns>
+pub fn post_bytes(
+    url: &str,
+    body: &str,
+    accept_octet_stream: bool,
+    auth: Option<(&str, &str)>,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let agent = agent(timeout);
+    let mut request = agent
+        .post(url)
+        .header("Content-Type", "application/json; charset=utf-8");
+    if accept_octet_stream {
+        request = request.header("Accept", "application/octet-stream");
+    }
+
+    if let Some((user, password)) = auth {
+        let token = base64_encode(format!("{user}:{password}").as_bytes());
+        request = request.header("Authorization", &format!("Basic {token}"));
+    }
+
+    let mut response = request
+        .send(body)
+        .map_err(|e| Error::Db(format!("HTTP 请求失败：{e}")))?;
+    let status = response.status();
+    let bytes = response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| Error::Db(format!("读取 HTTP 响应失败：{e}")))?;
+    if !status.is_success() {
+        let text = String::from_utf8_lossy(&bytes);
+        return Err(Error::Db(format!("HTTP {}：{}", status.as_u16(), text.trim())));
+    }
+    Ok(bytes)
+}
+
 /// POST 请求的公共实现。
 fn send_post(
     url: &str,

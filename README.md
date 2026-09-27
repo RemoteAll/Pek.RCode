@@ -48,11 +48,12 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `cache` | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | ✅ 整表实体缓存 + 单对象缓存（默认 60s 过期；写入自动失效）；✅ Redis 版本号（feature `redis`，底层为 **Pek.RRedis** 自研客户端） |
 | `reverse` | `DAL.GetTables`（反向工程） | ✅ 数据库 → `EntityModel` / `Model.xml`（**全部驱动**、含索引/唯一约束；`rcodegen --conn`） |
 | `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count`；`AuditExt` 审计字段访问；`#[derive(Entity)]` 宏 |
+| `db_service` | `Services`（`DbServer` / `DbClient`） | ✅ 远程服务层 + HTTP 客户端；`/Db/Query` 为 **DbTable v3 二进制**（与 C# `DbClient` 双向互通，黄金样本逐字节验证） |
 | `simulation` | `Common/DataSimulation` | ✅ 造数压测（随机整型/字符串/时间 + 分批事务 + TPS） |
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`） |
 
-测试：**202 项全部通过**（库单测 179 + 集成 16 + 文档测试 7；`--features duckdb` 另含 DuckDB 内嵌引擎全链路用例，`--features redis` 另含 Redis 版本号用例（`RCODE_REDIS` 门控）；
+测试：**212 项全部通过**（库单测 189 + 集成 16 + 文档测试 7；`--features duckdb` 全量 219 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 213 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控）；
 MySQL / PostgreSQL / SQL Server / Oracle 端到端用例在有真实库时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -125,6 +126,7 @@ cargo clippy        # 零警告
 ### 测试数据与全量回归
 
 - `tests/fixtures/wms_model_sample.xml`：生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型），默认测试均基于它
+- `tests/fixtures/dbtable_v3_sample.bin`：DbTable v3 二进制**黄金样本**（由真实 C# NewLife.Core `DbTable.ToPacket()` 生成；Rust 编解码与之逐字节双向验证）
 - 需要验证**完整生产模型**（176 张表规模）时，用环境变量指向完整 `Model.xml`：
 
 ```powershell
@@ -369,12 +371,14 @@ Pek.RCode/
 │   ├── cache.rs      实体缓存 / 单对象缓存（对应 Meta.Cache / Meta.SingleCache）
 │   ├── reverse.rs    反向工程：数据库结构 → EntityModel / Model.xml（对应 DAL.GetTables）
 │   ├── entity.rs     Entity trait（对象实体的 CRUD/查询默认实现）
+│   ├── db_service.rs 远程服务层 + HTTP 客户端（DbServer/DbClient，DbTable v3 二进制互通）
 │   ├── codegen.rs    Model.xml → Rust 对象实体
 │   ├── bin/
 │   │   └── rcodegen.rs   实体生成命令行工具
 │   └── error.rs      统一错误
 └── tests/
     ├── fixtures/wms_model_sample.xml   生产模型快照固件（7 张表 / 8 种类型）
+    ├── fixtures/dbtable_v3_sample.bin  DbTable v3 二进制黄金样本（真实 C# NewLife.Core 生成）
     ├── entity_layer.rs                 对象实体端到端（insert/save/update/delete）
     ├── model_e2e.rs                    固件端到端（方言 DDL / SQLite CRUD / 代码生成）
     ├── mysql_e2e.rs                    MySQL 真实库端到端（RCODE_MYSQL 门控）
@@ -397,13 +401,13 @@ Pek.RCode/
 6. **分布式缓存失效适配** ✅ `RedisVersionStore`（feature `redis`；底层为 **Pek.RRedis**（DH.NRedis 的 Rust 实现）自研客户端，连接串/键名与 C# 一致，跨语言可互相感知失效）
 7. **DataSimulation** ✅ `simulation`（随机造数 + 分批事务 + TPS 统计）
 8. **基础库下沉** ✅ 时间文本格式/解析、MD5 摘要、文本文件读写（BOM 兼容）等基础方法下沉到 **DH.RustBase**（crate `dhrust` 0.1.4）；Pek.RCode 与 Pek.RRedis 均已 path 依赖复用（不再各自内联实现）
+9. **远程服务协议互通** ✅ `/Db/Query` 采用 NewLife **DbTable v3 二进制**（`dbtable` 模块：7 位压缩整数、大端浮点、Decimal 四元组、DateTime 刻度、`System.Byte[]`/`Guid`）；`DbService::query_packet` 输出报文、`DbClient::query_rowset` 自动识别二进制（C# `DbServer`）与 JSON（Rust 宿主）应答；黄金样本由**真实 C# NewLife.Core** 生成，编码**逐字节一致**、双向互读验证通过
 
 **尚未完成**：
 
-1. **远程服务协议互通**：C# `DbServer`/`DbClient` 的 `/Db/Query` 返回 DbTable 的 NewLife `Binary` 二进制编码；Rust 侧当前为 JSON 行集，两端查询接口不能直接互连（下一步：移植 DbTable 二进制编解码）
-2. **TLS 收尾**：客户端证书（PEM）需 rustls 后端（当前 native-tls 仅支持 PKCS#12），MySQL/PG 暂无 PEM 客户端证书
-3. **MSPageSplit**：SQL Server 2005/2008 的 ROW_NUMBER 分页（当前统一 2012+ 的 `OFFSET..FETCH`）
-4. **跨语言产物边界（确认）**：`HtmlBuilder`（Razor 页面）与 CubeBuilder/CustomBuilder（C# 框架产物）由 C# 侧 XCodeTool 继续使用；`Model.xml` 双端共用不受影响，Rust 侧以实体/模型/接口/搜索生成为对等能力
+1. **TLS 收尾**：客户端证书（PEM）需 rustls 后端（当前 native-tls 仅支持 PKCS#12），MySQL/PG 暂无 PEM 客户端证书
+2. **MSPageSplit**：SQL Server 2005/2008 的 ROW_NUMBER 分页（当前统一 2012+ 的 `OFFSET..FETCH`）
+3. **跨语言产物边界（确认）**：`HtmlBuilder`（Razor 页面）与 CubeBuilder/CustomBuilder（C# 框架产物）由 C# 侧 XCodeTool 继续使用；`Model.xml` 双端共用不受影响，Rust 侧以实体/模型/接口/搜索生成为对等能力
 
 ---
 

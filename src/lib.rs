@@ -82,6 +82,7 @@ pub mod common;
 pub mod dal;
 pub mod data_access;
 pub mod db_service;
+pub mod dbtable;
 pub mod dialect;
 pub mod dirty;
 #[cfg(feature = "duckdb")]

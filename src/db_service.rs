@@ -8,9 +8,12 @@
 //!   `POST Db/Login`、`POST Db/Query`、`POST Db/Execute`、`POST Db/InsertAndGetIdentity`、
 //!   `GET Db/QueryCount`、`GET Db/GetTables`；响应采用 NewLife 信封 `{code, data, msg}`。
 //!
-//! 与 C# 的差异（见迁移文档"机制差异"表）：
-//! - C# `Query` 返回 NewLife Packet 二进制结果集；Rust 版返回 JSON 行集
-//!   （[`rowset_to_json`]/[`rowset_from_json`]），两端不能直接混用查询接口；
+//! 与 C# 的协议互通：
+//! - `POST Db/Query` 的应答为 **DbTable v3 二进制**（[`crate::dbtable`]），与 C#
+//!   `DbController.Query` 的 `rs.ToPacket()` 一致：C# `DbClient.QueryAsync` 可直接解析，
+//!   Rust 侧用 [`DbClient::query_rowset`] 解析；
+//! - 其它接口（Login/Execute/InsertAndGetIdentity/QueryCount/GetTables）为 JSON 信封
+//!   `{code, data, msg}`（与 C# `ApiHelper.ProcessResponse` 兼容，无 `code` 时按原样返回）；
 //! - C# 的 `DbServer`/`DbController` 绑定 NewLife.Http/MVC；Rust 版提供不绑定框架的
 //!   [`DbService`]，路由参数到方法的映射由宿主完成；
 //! - Rust 服务端按参数字典的字母序绑定占位符（serde_json Map 语义），详见 [`DbService::query`]。
@@ -123,6 +126,24 @@ impl DbService {
         session.query(sql, &params)
     }
 
+    /// 执行 SQL 查询并返回 **DbTable v3 二进制报文**（对齐 C# `DbController.Query` 的 `rs.ToPacket()`）。
+    ///
+    /// 宿主应把结果作为 `application/octet-stream` 响应体返回给 `POST Db/Query`，
+    /// C# `DbClient.QueryAsync` 可直接解析；Rust 侧可用 [`DbClient::query_rowset`] 解析。
+    /// <param name="dal">数据访问层</param>
+    /// <param name="sql">SQL 语句</param>
+    /// <param name="parameters">参数字典</param>
+    /// <returns>DbTable 二进制报文</returns>
+    pub fn query_packet(
+        &self,
+        dal: &Dal,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<Vec<u8>> {
+        let set = self.query(dal, sql, parameters)?;
+        Ok(crate::dbtable::encode_rowset(&set))
+    }
+
     /// 执行 SQL 语句，返回受影响行数（对齐 `Execute`）。
     /// <param name="dal">数据访问层</param>
     /// <param name="sql">SQL 语句</param>
@@ -230,14 +251,40 @@ impl DbClient {
         })
     }
 
-    /// 执行 SQL 查询，返回 JSON 行集（对齐 `QueryAsync`；编码差异见模块文档）。
+    /// 执行 SQL 查询，返回结果集（自动识别二进制与 JSON 应答）。
+    ///
+    /// C# `DbServer` 的 `Db/Query` 返回 DbTable 二进制（[`crate::dbtable`]）；
+    /// Rust 宿主若返回 JSON 行集（`{columns, rows}`，可带 `{code,data,msg}` 信封）也同样支持。
+    /// <param name="sql">SQL 语句</param>
+    /// <param name="parameters">参数字典</param>
+    /// <returns>结果集</returns>
+    pub fn query_rowset(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<RowSet> {
+        let args = self.build_args(sql, parameters);
+        let bytes = http::post_bytes(
+            &self.url("Db/Query"),
+            &args.to_string(),
+            true,
+            None,
+            self.timeout,
+        )?;
+        if bytes.is_empty() {
+            return Ok(RowSet::new(Vec::new()));
+        }
+        if crate::dbtable::is_dbtable(&bytes) {
+            return crate::dbtable::decode_rowset(&bytes);
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let data = parse_envelope(&text)?;
+        rowset_from_json(&data)
+    }
+
+    /// 执行 SQL 查询，返回 JSON 行集（对 C# / Rust 两种服务端均可用）。
     /// <param name="sql">SQL 语句</param>
     /// <param name="parameters">参数字典</param>
     /// <returns>JSON 行集（`{columns, rows}`）</returns>
     pub fn query(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<Value> {
-        let args = self.build_args(sql, parameters);
-        let text = http::post_json(&self.url("Db/Query"), &args.to_string(), None, self.timeout)?;
-        parse_envelope(&text)
+        let set = self.query_rowset(sql, parameters)?;
+        Ok(rowset_to_json(&set))
     }
 
     /// 执行 SQL 语句，返回受影响行数（对齐 `ExecuteAsync`）。
@@ -653,5 +700,117 @@ mod tests {
         assert!(request.contains(r#""sql":"UPDATE X SET A=1""#));
         assert!(request.contains(r#""db":"Demo""#));
         assert!(request.contains(r#""token":"tk""#));
+    }
+
+    /// 启动固定应答的 mock HTTP 服务（可处理多个连接），返回端口与请求文本。
+    fn spawn_mock_response(
+        content_type: &'static str,
+        body: Vec<u8>,
+        times: usize,
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..times {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+
+                // 读取请求（头部 + Content-Length 声明的主体）
+                let mut data = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            data.extend_from_slice(&buf[..n]);
+                            if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&data[..pos]);
+                                let content_length = head
+                                    .lines()
+                                    .filter_map(|l| {
+                                        let lower = l.to_ascii_lowercase();
+                                        lower
+                                            .strip_prefix("content-length:")
+                                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                    })
+                                    .next()
+                                    .unwrap_or(0);
+                                if data.len() >= pos + 4 + content_length {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&data).to_string());
+
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                stream.write_all(&response).unwrap();
+                stream.flush().unwrap();
+            }
+            requests
+        });
+
+        (port, handle)
+    }
+
+    #[test]
+    fn db_client_query_parses_binary_dbtable_response() {
+        // 模拟 C# DbServer：/Db/Query 返回 DbTable 二进制（两列一次查询、再走一次 JSON 视图）
+        let mut set = RowSet::new(vec!["Id".into(), "Name".into(), "Score".into()]);
+        set.push(vec![
+            DbValue::Int(7),
+            DbValue::Text("张三".into()),
+            DbValue::Float(9.5),
+        ]);
+        let payload = crate::dbtable::encode_rowset(&set);
+        let (port, handle) = spawn_mock_response("application/octet-stream", payload, 2);
+
+        let client = DbClient::new(format!("http://127.0.0.1:{port}"), "Demo", Some("tk"));
+
+        // 二进制应答 → RowSet
+        let back = client.query_rowset("SELECT Id,Name,Score FROM T", None).unwrap();
+        assert_eq!(back.columns.as_ref(), set.columns.as_ref());
+        assert_eq!(back.rows[0].get(0), Some(&DbValue::Int(7)));
+        assert_eq!(back.rows[0].get(1), Some(&DbValue::Text("张三".into())));
+        assert_eq!(back.rows[0].get(2), Some(&DbValue::Float(9.5)));
+
+        // 同一接口的 JSON 视图同样可用（内部自动转 JSON 行集）
+        let json = client.query("SELECT Id,Name,Score FROM T", None).unwrap();
+        assert_eq!(json["columns"][0], "Id");
+        assert_eq!(json["rows"][0][1], "张三");
+
+        let requests = handle.join().unwrap();
+        assert!(requests[0].starts_with("POST /Db/Query"));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("accept: application/octet-stream"),
+            "应声明二进制 Accept：{}",
+            requests[0]
+        );
+    }
+
+    #[test]
+    fn db_client_query_falls_back_to_json_response() {
+        // 模拟 Rust 宿主：返回 JSON 行集
+        let body = br#"{"columns":["A"],"rows":[[1],[2]]}"#.to_vec();
+        let (port, _handle) = spawn_mock_response("application/json", body, 1);
+
+        let client = DbClient::new(format!("http://127.0.0.1:{port}"), "Demo", None);
+        let set = client.query_rowset("SELECT A", None).unwrap();
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.rows[0].get(0), Some(&DbValue::Int(1)));
+        assert_eq!(set.rows[1].get(0), Some(&DbValue::Int(2)));
     }
 }
