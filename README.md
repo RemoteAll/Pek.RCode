@@ -56,7 +56,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`） |
 
-测试：**237 项全部通过**（库单测 210 + 集成 17 + 文档测试 10；`--features duckdb` 全量 244 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 238 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 237 项（rustls TLS 后端）；
+测试：**238 项全部通过**（库单测 211 + 集成 17 + 文档测试 10；`--features duckdb` 全量 245 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 239 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 238 项（rustls TLS 后端），`--no-default-features` 全量 236 项（完全不含 TLS 依赖）；
 MySQL / PostgreSQL / SQL Server / Oracle / network 端到端用例在有真实库/服务时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
