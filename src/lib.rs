@@ -25,9 +25,9 @@
 //! | 数据库 | 方言（SQL 生成） | 驱动（执行） |
 //! |--------|------------------|--------------|
 //! | SQLite | ✅ | ✅（rusqlite，内嵌） |
-//! | MySQL | ✅ | ✅（mysql crate，纯 Rust；未启用 TLS，SslMode=None 可用） |
+//! | MySQL | ✅ | ✅（mysql crate，纯 Rust；native-tls：Preferred 缺省可回退、Required/VerifyCA/VerifyFull 强制） |
 //! | SQL Server | ✅ | ✅（tiberius，纯 Rust TDS；`Encrypt`/`TrustServerCertificate` 可配） |
-//! | PostgreSQL | ✅ | ✅（postgres crate；HighGo/KingBase/VastBase 同协议复用） |
+//! | PostgreSQL | ✅ | ✅（postgres crate；native-tls 同上；HighGo/KingBase/VastBase 同协议复用） |
 //! | Oracle | ✅ | ✅（oracle crate/OCI，运行时需 Instant Client；自增用序列 `SEQ_{表名}`） |
 //! | DuckDB | ✅ | ✅（duckdb crate 内嵌；`--features duckdb`，需 CMake 工具链） |
 //! | ClickHouse | ✅ | ✅（HTTP `:8123`，`TSVWithNamesAndTypes`） |
@@ -72,8 +72,10 @@
 //! - 所有查询/写入均使用参数绑定；列名、表名经方言引用转义
 //! - `sync_schema` 只做增量补齐（建表/加列），不修改、不删除已有对象
 
+pub mod async_dal;
 pub mod batch;
 pub mod cache;
+pub mod catalog;
 pub mod clickhouse;
 pub mod codegen;
 pub mod common;
@@ -99,6 +101,7 @@ pub mod mssql;
 pub mod mysql;
 pub mod odbc;
 pub mod oracle;
+pub mod pool;
 pub mod postgres;
 pub mod query;
 pub mod reverse;

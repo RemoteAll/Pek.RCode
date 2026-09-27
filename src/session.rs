@@ -119,7 +119,10 @@ impl DbRow {
 }
 
 /// 数据库会话：执行 SQL、管理事务。
-pub trait SqlSession {
+///
+/// 约束 `Send`：会话本身是独占使用的（`&mut self`），但连接池需要把空闲会话
+/// 保存在池中供任意线程领取，因此要求会话类型可在线程间移动（不要求 `Sync`）。
+pub trait SqlSession: Send {
     /// 数据库类型。
     fn kind(&self) -> DatabaseKind;
 
@@ -154,4 +157,12 @@ pub trait SqlSession {
 
     /// 现有表的列名列表。
     fn table_columns(&mut self, table: &str) -> Result<Vec<String>>;
+
+    /// 表结构目录（驱动内建通道，供反向工程/结构比对）。
+    ///
+    /// 默认返回 `Ok(None)`：由 [`crate::catalog`] 的通用 SQL 路径处理；
+    /// 仅无 SQL 型目录的驱动（如 ODBC 桥的 Access）实现本方法。
+    fn catalog_tables(&mut self) -> Result<Option<Vec<crate::catalog::TableInfo>>> {
+        Ok(None)
+    }
 }

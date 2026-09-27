@@ -16,8 +16,13 @@
 //! - 时间使用原生 `timestamp/timestamptz/date` 类型；7 位小数秒按 PostgreSQL 微秒精度四舍五入
 //! - 表结构探测走 `information_schema`（与 XCode 反向工程一致）
 //!
-//! TLS 说明：当前版本固定不启用 TLS；连接串要求 `SslMode=Require/VerifyCA/VerifyFull` 时
-//! 会明确报错。`SslMode=Disable/Prefer` 走明文连接（Prefer 在未启用 TLS 时等效于明文）。
+//! TLS 说明（native-tls 后端）：
+//! - `SslMode=Disable/Allow`：明文连接
+//! - `SslMode=Prefer`（缺省）：先尝试 TLS，服务器不支持时回退明文（对齐 Npgsql）
+//! - `SslMode=Require`：强制 TLS，只加密不校验证书
+//! - `SslMode=VerifyCA`：校验证书链、不校验主机名；`SslMode=VerifyFull`：全量校验
+//! - 根证书可用 `Root Certificate`/`SslCa` 指定（PEM/DER）
+//! - 客户端证书（`SSL Certificate`/`SSL Key`，PEM）暂不支持（native-tls 仅支持 PKCS#12），会返回明确错误
 
 use std::time::Duration;
 
@@ -46,7 +51,13 @@ impl PostgresSession {
         let settings = parse_settings(conn_str)?;
         let config = build_config(&settings);
 
-        let client = config.connect(NoTls).map_err(|e| {
+        let client = if settings.ssl_mode == PgSslMode::Disable {
+            config.connect(NoTls)
+        } else {
+            let connector = build_tls_connector(&settings)?;
+            config.connect(postgres_native_tls::MakeTlsConnector::new(connector))
+        }
+        .map_err(|e| {
             Error::Db(format!(
                 "连接 PostgreSQL 失败（{}:{}）：{e}",
                 settings.host, settings.port
@@ -54,6 +65,32 @@ impl PostgresSession {
         })?;
 
         Ok(Self { client })
+    }
+}
+
+/// TLS 模式（对齐 Npgsql 的 SslMode 语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgSslMode {
+    /// 明文
+    Disable,
+    /// 能 TLS 就 TLS，服务器不支持时回退明文（缺省）
+    Prefer,
+    /// 强制 TLS，只加密不校验证书
+    Require,
+    /// 校验证书链、不校验主机名
+    VerifyCa,
+    /// 校验证书链与主机名
+    VerifyFull,
+}
+
+impl PgSslMode {
+    /// → postgres crate 的协商模式（校验细节由 TLS 连接器决定）。
+    fn to_driver(self) -> SslMode {
+        match self {
+            PgSslMode::Disable => SslMode::Disable,
+            PgSslMode::Prefer => SslMode::Prefer,
+            PgSslMode::Require | PgSslMode::VerifyCa | PgSslMode::VerifyFull => SslMode::Require,
+        }
     }
 }
 
@@ -74,28 +111,42 @@ struct PostgresSettings {
     application_name: String,
     /// 连接超时
     connect_timeout: Option<Duration>,
-    /// 显式指定的 SSL 模式（None 表示使用驱动默认：无 TLS 时等效明文）
-    ssl_mode: Option<SslMode>,
+    /// TLS 模式（缺省 Prefer）
+    ssl_mode: PgSslMode,
+    /// 根证书路径（Root Certificate/SslCa，PEM/DER）
+    ssl_root_cert: Option<String>,
 }
 
 /// 解析连接串为设置结构（与 XCode 的键名兼容）。
 fn parse_settings(cs: &ConnectionString) -> Result<PostgresSettings> {
-    // TLS 前置校验：明确给出可操作提示
-    let ssl_mode = match cs.get("sslmode").map(str::to_ascii_lowercase) {
-        None => None,
+    // SslMode：与 Npgsql 语义对齐；缺省 Prefer（先试 TLS，服务器不支持回退明文）
+    let ssl_mode = match cs.get("sslmode").map(|v| v.trim().to_ascii_lowercase()) {
+        None => PgSslMode::Prefer,
         Some(mode) => match mode.as_str() {
-            // 无 TLS 支持时 Prefer 等效于明文（与 Npgsql 的 Prefer 语义一致）
-            "disable" | "none" | "allow" | "prefer" => Some(SslMode::Disable),
-            "require" | "verify-ca" | "verifyca" | "verify-full" | "verifyfull" => {
-                return Err(Error::Unsupported(
-                    "当前 PostgreSQL 驱动未启用 TLS：请将连接串 SslMode 设为 Disable/Prefer，\
-                     或使用 TLS 隧道；后续版本将提供 native-tls 支持"
-                        .into(),
-                ));
-            }
+            // Allow：优先明文，服务器要求时才 TLS；当前以明文实现（保持原语义）
+            "disable" | "none" | "allow" => PgSslMode::Disable,
+            "prefer" => PgSslMode::Prefer,
+            "require" => PgSslMode::Require,
+            "verifyca" | "verify-ca" => PgSslMode::VerifyCa,
+            "verifyfull" | "verify-full" => PgSslMode::VerifyFull,
             other => return Err(Error::Model(format!("无效的 SslMode \"{other}\""))),
         },
     };
+    // 客户端证书（PEM）当前后端不支持（native-tls 仅 PKCS#12），明确报错而非静默忽略
+    if cs.get("ssl certificate").is_some()
+        || cs.get("sslcert").is_some()
+        || cs.get("ssl key").is_some()
+        || cs.get("sslkey").is_some()
+    {
+        return Err(Error::Unsupported(
+            "PostgreSQL 客户端证书（SSL Certificate/SSL Key）暂不支持：native-tls 仅支持 PKCS#12 客户端标识"
+                .into(),
+        ));
+    }
+    let ssl_root_cert = cs
+        .get("root certificate")
+        .or(cs.get("sslca"))
+        .map(str::to_string);
 
     let host = cs
         .get("server")
@@ -155,6 +206,7 @@ fn parse_settings(cs: &ConnectionString) -> Result<PostgresSettings> {
         application_name,
         connect_timeout,
         ssl_mode,
+        ssl_root_cert,
     })
 }
 
@@ -174,10 +226,38 @@ fn build_config(settings: &PostgresSettings) -> PgConfig {
     if let Some(timeout) = settings.connect_timeout {
         config.connect_timeout(timeout);
     }
-    if let Some(mode) = settings.ssl_mode {
-        config.ssl_mode(mode);
-    }
+    config.ssl_mode(settings.ssl_mode.to_driver());
     config
+}
+
+/// 构建 native-tls 连接器（校验开关按 SslMode 映射）。
+fn build_tls_connector(settings: &PostgresSettings) -> Result<native_tls::TlsConnector> {
+    let mut builder = native_tls::TlsConnector::builder();
+    match settings.ssl_mode {
+        // Prefer/Require：只加密，不校验证书与主机名
+        PgSslMode::Prefer | PgSslMode::Require => {
+            builder.danger_accept_invalid_certs(true);
+            builder.danger_accept_invalid_hostnames(true);
+        }
+        // VerifyCA：校验证书链、不校验主机名
+        PgSslMode::VerifyCa => {
+            builder.danger_accept_invalid_hostnames(true);
+        }
+        // VerifyFull：证书链与主机名全量校验
+        PgSslMode::VerifyFull => {}
+        PgSslMode::Disable => unreachable!("Disable 不构建 TLS 连接器"),
+    }
+    if let Some(path) = &settings.ssl_root_cert {
+        let bytes = std::fs::read(path)
+            .map_err(|e| Error::Model(format!("读取根证书失败（{path}）：{e}")))?;
+        let cert = native_tls::Certificate::from_pem(&bytes)
+            .or_else(|_| native_tls::Certificate::from_der(&bytes))
+            .map_err(|e| Error::Model(format!("解析根证书失败（{path}）：{e}")))?;
+        builder.add_root_certificate(cert);
+    }
+    builder
+        .build()
+        .map_err(|e| Error::Db(format!("构建 TLS 连接器失败：{e}")))
 }
 
 /// PostgreSQL 参数：统一以**文本格式**传输。
@@ -411,20 +491,43 @@ mod tests {
         assert_eq!(s.port, 5432);
         assert_eq!(s.user, "postgres");
         assert_eq!(s.database, None);
-        assert_eq!(s.ssl_mode, None);
+        // 缺省 → Prefer（对齐 Npgsql，先试 TLS、服务器不支持时回退）
+        assert_eq!(s.ssl_mode, PgSslMode::Prefer);
     }
 
     #[test]
-    fn required_tls_reports_actionable_error() {
+    fn ssl_mode_parsing() {
+        let cs = ConnectionString::parse("Server=x;provider=postgresql;SslMode=Disable");
+        assert_eq!(parse_settings(&cs).unwrap().ssl_mode, PgSslMode::Disable);
+        let cs = ConnectionString::parse("Server=x;provider=postgresql;SslMode=Require");
+        assert_eq!(parse_settings(&cs).unwrap().ssl_mode, PgSslMode::Require);
+        let cs = ConnectionString::parse("Server=x;provider=postgresql;SslMode=VerifyCA");
+        assert_eq!(parse_settings(&cs).unwrap().ssl_mode, PgSslMode::VerifyCa);
         let cs = ConnectionString::parse(
-            "Server=x;Database=d;Uid=u;Pwd=p;provider=postgresql;SslMode=Require",
+            "Server=x;provider=postgresql;SslMode=VerifyFull;Root Certificate=ca.pem",
+        );
+        let s = parse_settings(&cs).unwrap();
+        assert_eq!(s.ssl_mode, PgSslMode::VerifyFull);
+        assert_eq!(s.ssl_root_cert.as_deref(), Some("ca.pem"));
+        // 无效值报错
+        let cs = ConnectionString::parse("Server=x;provider=postgresql;SslMode=Bogus");
+        assert!(parse_settings(&cs).is_err());
+        // 客户端证书（PEM）明确不支持
+        let cs = ConnectionString::parse(
+            "Server=x;provider=postgresql;SSL Certificate=c.pem;SSL Key=k.pem",
         );
         let err = parse_settings(&cs).unwrap_err().to_string();
-        assert!(err.contains("SslMode"), "{err}");
+        assert!(err.contains("客户端证书"), "{err}");
+    }
 
-        // Prefer/Disable 走明文连接（与 Npgsql 的降级行为一致）
-        let cs = ConnectionString::parse("Server=x;provider=postgresql;SslMode=Prefer");
-        assert!(parse_settings(&cs).is_ok());
+    #[test]
+    fn tls_connector_rejects_missing_root_cert() {
+        let cs = ConnectionString::parse(
+            "Server=x;provider=postgresql;SslMode=VerifyFull;Root Certificate=no-such-ca.pem",
+        );
+        let s = parse_settings(&cs).unwrap();
+        let err = build_tls_connector(&s).unwrap_err().to_string();
+        assert!(err.contains("根证书"), "{err}");
     }
 
     #[test]

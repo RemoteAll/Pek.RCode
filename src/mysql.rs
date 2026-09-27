@@ -12,15 +12,20 @@
 //! - 表结构探测走 `information_schema`（与 XCode 反向工程一致）
 //! - 自增回写：`SELECT LAST_INSERT_ID()`
 //!
-//! TLS 说明：当前版本固定不启用 TLS；连接串要求 `SslMode=Required/VerifyCA/VerifyFull` 时
-//! 会明确报错。RDS 未强制 SSL（如 `SslMode=None`）或经 TLS 隧道时可直接使用。
+//! TLS 说明（native-tls 后端）：
+//! - `SslMode=None/Disabled`：明文连接
+//! - `SslMode=Preferred`（缺省）：先尝试 TLS，服务器不支持时回退明文（对齐 MySqlConnector）
+//! - `SslMode=Required`：强制 TLS，只加密不校验证书
+//! - `SslMode=VerifyCA`：校验证书链、不校验主机名；`SslMode=VerifyFull`：全量校验
+//! - 根证书可用 `SslCa`/`CertificateFile` 指定（PEM/DER）
+//! - 客户端证书（`SslCert`/`SslKey`，PEM）暂不支持（native-tls 仅支持 PKCS#12），会返回明确错误
 
 use std::time::Duration;
 
 use chrono::{Datelike, Timelike};
 use mysql::consts::{ColumnFlags, ColumnType};
 use mysql::prelude::Queryable;
-use mysql::{Column, Conn, Opts, OptsBuilder, Value};
+use mysql::{Column, Conn, Opts, OptsBuilder, SslOpts, Value};
 
 use crate::dal::ConnectionString;
 use crate::dialect::DatabaseKind;
@@ -38,9 +43,20 @@ impl MysqlSession {
     /// 根据 XCode 风格连接串打开连接。
     pub fn open(conn_str: &ConnectionString) -> Result<Self> {
         let settings = parse_settings(conn_str)?;
-        let opts = build_opts(&settings);
 
-        let conn = Conn::new(opts).map_err(|e| {
+        let result = match settings.ssl_mode {
+            None => connect_once(&settings, false),
+            // Preferred：先尝试 TLS；服务器不支持 SSL 时回退明文（对齐 MySqlConnector 语义）
+            Some(MysqlSslMode::Preferred) => match connect_once(&settings, true) {
+                Err(mysql::Error::DriverError(mysql::DriverError::TlsNotSupported)) => {
+                    connect_once(&settings, false)
+                }
+                other => other,
+            },
+            Some(_) => connect_once(&settings, true),
+        };
+
+        let conn = result.map_err(|e| {
             Error::Db(format!(
                 "连接 MySQL 失败（{}:{}）：{e}",
                 settings.host, settings.port
@@ -49,6 +65,24 @@ impl MysqlSession {
 
         Ok(Self { conn })
     }
+}
+
+/// 单次建连（按是否启用 TLS 组装选项）。
+fn connect_once(settings: &MysqlSettings, tls: bool) -> std::result::Result<Conn, mysql::Error> {
+    Conn::new(build_opts(settings, tls))
+}
+
+/// MySQL 的 TLS 模式（对齐 MySqlConnector 的 SslMode 语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MysqlSslMode {
+    /// 能 TLS 就 TLS，服务器不支持时回退明文（缺省）
+    Preferred,
+    /// 强制 TLS，只加密不校验证书
+    Required,
+    /// 校验证书链、不校验主机名
+    VerifyCa,
+    /// 校验证书链与主机名
+    VerifyFull,
 }
 
 /// 从连接串解析出的 MySQL 连接设置。
@@ -68,21 +102,36 @@ struct MysqlSettings {
     charset: String,
     /// 连接超时
     connect_timeout: Option<Duration>,
+    /// TLS 模式（None 表示明文）
+    ssl_mode: Option<MysqlSslMode>,
+    /// 根证书路径（SslCa/CertificateFile，PEM/DER）
+    ssl_root_cert: Option<String>,
 }
 
 /// 解析连接串为设置结构（与 XCode 的键名兼容）。
 fn parse_settings(cs: &ConnectionString) -> Result<MysqlSettings> {
-    // TLS 前置校验：明确给出可操作提示
-    if let Some(mode) = cs.get("sslmode") {
-        let mode = mode.to_ascii_lowercase();
-        if matches!(mode.as_str(), "required" | "verifyca" | "verifyfull") {
-            return Err(Error::Unsupported(
-                "当前 MySQL 驱动未启用 TLS：请将连接串 SslMode 设为 None/Disabled，或使用 TLS 隧道；\
-                 后续版本将提供 rustls 支持"
-                    .into(),
-            ));
-        }
+    // SslMode：与 MySqlConnector 语义对齐；缺省 Preferred（先试 TLS，服务器不支持回退明文）
+    let ssl_mode = match cs.get("sslmode").map(|v| v.trim().to_ascii_lowercase()) {
+        None => Some(MysqlSslMode::Preferred),
+        Some(mode) => match mode.as_str() {
+            "none" | "disabled" | "disable" | "off" => None,
+            "preferred" | "prefer" => Some(MysqlSslMode::Preferred),
+            "required" | "require" => Some(MysqlSslMode::Required),
+            "verifyca" | "verify-ca" => Some(MysqlSslMode::VerifyCa),
+            "verifyfull" | "verify-full" => Some(MysqlSslMode::VerifyFull),
+            other => return Err(Error::Model(format!("无效的 SslMode \"{other}\""))),
+        },
+    };
+    // 客户端证书（PEM）当前后端不支持（native-tls 仅 PKCS#12），明确报错而非静默忽略
+    if cs.get("sslcert").is_some() || cs.get("sslkey").is_some() {
+        return Err(Error::Unsupported(
+            "MySQL 客户端证书（SslCert/SslKey）暂不支持：native-tls 仅支持 PKCS#12 客户端标识".into(),
+        ));
     }
+    let ssl_root_cert = cs
+        .get("sslca")
+        .or(cs.get("certificatefile"))
+        .map(str::to_string);
 
     let host = cs
         .get("server")
@@ -149,11 +198,13 @@ fn parse_settings(cs: &ConnectionString) -> Result<MysqlSettings> {
         database,
         charset,
         connect_timeout,
+        ssl_mode,
+        ssl_root_cert,
     })
 }
 
 /// 设置 → mysql crate 选项。
-fn build_opts(settings: &MysqlSettings) -> Opts {
+fn build_opts(settings: &MysqlSettings, tls: bool) -> Opts {
     let mut builder = OptsBuilder::new()
         .ip_or_hostname(Some(settings.host.clone()))
         .tcp_port(settings.port)
@@ -169,8 +220,37 @@ fn build_opts(settings: &MysqlSettings) -> Opts {
     if let Some(timeout) = settings.connect_timeout {
         builder = builder.tcp_connect_timeout(Some(timeout));
     }
+    if tls {
+        builder = builder.ssl_opts(Some(build_ssl_opts(
+            settings.ssl_mode,
+            settings.ssl_root_cert.as_deref(),
+        )));
+    }
 
     Opts::from(builder)
+}
+
+/// 按 SslMode 组装 TLS 选项（校验开关对齐 MySqlConnector 语义）。
+fn build_ssl_opts(mode: Option<MysqlSslMode>, root_cert: Option<&str>) -> SslOpts {
+    let mut ssl = SslOpts::default();
+    match mode {
+        // Preferred/Required：只加密，不校验证书与主机名
+        Some(MysqlSslMode::Preferred) | Some(MysqlSslMode::Required) => {
+            ssl = ssl
+                .with_danger_accept_invalid_certs(true)
+                .with_danger_skip_domain_validation(true);
+        }
+        // VerifyCA：校验证书链、不校验主机名
+        Some(MysqlSslMode::VerifyCa) => {
+            ssl = ssl.with_danger_skip_domain_validation(true);
+        }
+        // VerifyFull：证书链与主机名全量校验
+        Some(MysqlSslMode::VerifyFull) | None => {}
+    }
+    if let Some(path) = root_cert {
+        ssl = ssl.with_root_cert_path(Some(std::path::PathBuf::from(path)));
+    }
+    ssl
 }
 
 /// `DbValue` → MySQL 参数值。
@@ -389,14 +469,53 @@ mod tests {
     }
 
     #[test]
-    fn required_tls_reports_actionable_error() {
-        let cs = ConnectionString::parse("Server=x;Database=d;Uid=u;Pwd=p;provider=mysql;SslMode=Required");
+    fn ssl_mode_parsing() {
+        // 显式 None/Disabled → 明文
+        let cs = ConnectionString::parse("Server=x;provider=mysql;SslMode=None");
+        assert_eq!(parse_settings(&cs).unwrap().ssl_mode, None);
+        // 缺省 → Preferred（对齐 MySqlConnector）
+        let cs = ConnectionString::parse("Server=x;provider=mysql");
+        assert_eq!(
+            parse_settings(&cs).unwrap().ssl_mode,
+            Some(MysqlSslMode::Preferred)
+        );
+        // 各校验级别
+        let cs = ConnectionString::parse("Server=x;provider=mysql;SslMode=Required");
+        assert_eq!(
+            parse_settings(&cs).unwrap().ssl_mode,
+            Some(MysqlSslMode::Required)
+        );
+        let cs = ConnectionString::parse("Server=x;provider=mysql;SslMode=VerifyCA");
+        assert_eq!(
+            parse_settings(&cs).unwrap().ssl_mode,
+            Some(MysqlSslMode::VerifyCa)
+        );
+        // 无效值报错
+        let cs = ConnectionString::parse("Server=x;provider=mysql;SslMode=Bogus");
+        assert!(parse_settings(&cs).is_err());
+        // 客户端证书（PEM）明确不支持
+        let cs = ConnectionString::parse("Server=x;provider=mysql;SslCert=c.pem;SslKey=k.pem");
         let err = parse_settings(&cs).unwrap_err().to_string();
-        assert!(err.contains("SslMode"), "{err}");
+        assert!(err.contains("客户端证书"), "{err}");
+    }
 
-        // None/Preferred 可正常使用（明文连接）
-        let cs = ConnectionString::parse("Server=x;provider=mysql;SslMode=Preferred");
-        assert!(parse_settings(&cs).is_ok());
+    #[test]
+    fn ssl_opts_flags_by_mode() {
+        // Required：只加密，不校验证书与主机名
+        let opts = build_ssl_opts(Some(MysqlSslMode::Required), None);
+        assert!(opts.accept_invalid_certs());
+        assert!(opts.skip_domain_validation());
+
+        // VerifyCA：校验证书链、不校验主机名
+        let opts = build_ssl_opts(Some(MysqlSslMode::VerifyCa), None);
+        assert!(!opts.accept_invalid_certs());
+        assert!(opts.skip_domain_validation());
+
+        // VerifyFull：全量校验；根证书写入
+        let opts = build_ssl_opts(Some(MysqlSslMode::VerifyFull), Some("ca.pem"));
+        assert!(!opts.accept_invalid_certs());
+        assert!(!opts.skip_domain_validation());
+        assert_eq!(opts.root_cert_path(), Some(std::path::Path::new("ca.pem")));
     }
 
     #[test]

@@ -210,6 +210,139 @@ pub enum ParameterKinds {
     Hash = 22,
 }
 
+impl SexKinds {
+    /// 从数值解析（未知值返回 None）。
+    /// <param name="value">数值</param>
+    /// <returns>枚举值</returns>
+    pub fn from_i32(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Male),
+            2 => Some(Self::Female),
+            _ => None,
+        }
+    }
+}
+
+impl Default for SexKinds {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl MenuTypes {
+    /// 从数值解析（未知值返回 None）。
+    /// <param name="value">数值</param>
+    /// <returns>枚举值</returns>
+    pub fn from_i32(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(Self::Directory),
+            2 => Some(Self::Menu),
+            3 => Some(Self::Function),
+            _ => None,
+        }
+    }
+}
+
+impl Default for MenuTypes {
+    fn default() -> Self {
+        Self::Directory
+    }
+}
+
+impl RoleTypes {
+    /// 从数值解析（未知值返回 None）。
+    /// <param name="value">数值</param>
+    /// <returns>枚举值</returns>
+    pub fn from_i32(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(Self::System),
+            2 => Some(Self::Normal),
+            3 => Some(Self::Tenant),
+            _ => None,
+        }
+    }
+}
+
+impl Default for RoleTypes {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl TenantTypes {
+    /// 从数值解析（未知值返回 None）。
+    /// <param name="value">数值</param>
+    /// <returns>枚举值</returns>
+    pub fn from_i32(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(Self::Free),
+            2 => Some(Self::Personal),
+            3 => Some(Self::Enterprise),
+            4 => Some(Self::Flagship),
+            _ => None,
+        }
+    }
+}
+
+impl Default for TenantTypes {
+    fn default() -> Self {
+        Self::Free
+    }
+}
+
+impl DepartmentTypes {
+    /// 从数值解析（未知值返回 None）。
+    /// <param name="value">数值</param>
+    /// <returns>枚举值</returns>
+    pub fn from_i32(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(Self::Company),
+            2 => Some(Self::Department),
+            3 => Some(Self::Group),
+            4 => Some(Self::Virtual),
+            _ => None,
+        }
+    }
+}
+
+impl Default for DepartmentTypes {
+    fn default() -> Self {
+        Self::Company
+    }
+}
+
+impl ParameterKinds {
+    /// 从数值解析（未知值返回 None）。
+    /// <param name="value">数值</param>
+    /// <returns>枚举值</returns>
+    pub fn from_i32(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Normal),
+            3 => Some(Self::Boolean),
+            9 => Some(Self::Int),
+            14 => Some(Self::Double),
+            16 => Some(Self::DateTime),
+            18 => Some(Self::String),
+            21 => Some(Self::List),
+            22 => Some(Self::Hash),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ParameterKinds {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl Default for DataScope {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
 /// 操作权限位标志，对齐 DH.NCode `PermissionFlags`（`UInt32` 位标志）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PermissionFlags(pub u32);

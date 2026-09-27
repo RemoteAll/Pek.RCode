@@ -302,9 +302,12 @@ impl SqlSession for OdbcSession {
             DatabaseKind::Iris => format!(
                 "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME IN ('{table}', '{upper}')"
             ),
-            DatabaseKind::Access => format!(
-                "SELECT COUNT(*) FROM MSysObjects WHERE Name = '{table}' AND Type IN (1, 4, 6)"
-            ),
+            DatabaseKind::Access => {
+                // 走 ODBC 目录接口（MSysObjects 在部分驱动下不可见）
+                return Ok(read_access_catalog(&self.conn)?
+                    .iter()
+                    .any(|t| t.name.eq_ignore_ascii_case(table)));
+            }
             _ => return Err(Error::Unsupported("ODBC 表探测不支持该数据库".into())),
         };
         let set = self.query(&sql, &[])?;
@@ -329,9 +332,13 @@ impl SqlSession for OdbcSession {
                 "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME IN ('{table}', '{upper}') ORDER BY ORDINAL_POSITION"
             ),
             DatabaseKind::Access => {
-                return Err(Error::Unsupported(
-                    "Access 驱动暂不支持列清单探测：sync_schema 可建新表，但不会为已有表补列".into(),
-                ));
+                // 走 ODBC 目录接口
+                let tables = read_access_catalog(&self.conn)?;
+                return Ok(tables
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(table))
+                    .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+                    .unwrap_or_default());
             }
             _ => return Err(Error::Unsupported("ODBC 列探测不支持该数据库".into())),
         };
@@ -341,6 +348,146 @@ impl SqlSession for OdbcSession {
             .iter()
             .filter_map(|row| row.get(0).map(DbValue::to_text))
             .collect())
+    }
+
+    fn catalog_tables(&mut self) -> Result<Option<Vec<crate::catalog::TableInfo>>> {
+        if self.kind != DatabaseKind::Access {
+            return Ok(None);
+        }
+        Ok(Some(read_access_catalog(&self.conn)?))
+    }
+}
+
+/// Access：通过 ODBC 目录接口读取表/列/主键（Access 无 SQL 型目录；索引接口暂缺）。
+fn read_access_catalog(conn: &Connection<'static>) -> Result<Vec<crate::catalog::TableInfo>> {
+    use crate::catalog::{ColumnInfo, TableInfo};
+
+    /// ODBC 错误 → 统一错误。
+    fn odbc_err(e: odbc_api::Error) -> Error {
+        Error::Db(format!("Access ODBC 目录读取失败：{e}"))
+    }
+
+    let mut tables: Vec<TableInfo> = Vec::new();
+    for row in conn.tables("", "", "", "TABLE").map_err(odbc_err)? {
+        let row = row.map_err(odbc_err)?;
+        // as_str 的 UTF-8 错误按空串容忍（目录文本，无法解密时跳过）
+        let name = row
+            .table
+            .as_str()
+            .unwrap_or_default()
+            .unwrap_or_default()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        tables.push(TableInfo {
+            name,
+            description: row
+                .remarks
+                .as_str()
+                .unwrap_or_default()
+                .unwrap_or_default()
+                .to_string(),
+            columns: Vec::new(),
+            indexes: Vec::new(),
+        });
+    }
+
+    for table in &mut tables {
+        let mut columns: Vec<ColumnInfo> = Vec::new();
+        for row in conn.columns("", "", &table.name, "").map_err(odbc_err)? {
+            let row = row.map_err(odbc_err)?;
+            let name = row
+                .column_name
+                .as_str()
+                .unwrap_or_default()
+                .unwrap_or_default()
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let type_name = row
+                .type_name
+                .as_str()
+                .unwrap_or_default()
+                .unwrap_or_default()
+                .to_string();
+            let size = row.column_size.as_opt().copied().unwrap_or(0);
+            let (data_type, length, precision, scale, identity) = map_access_type(&type_name, size);
+            columns.push(ColumnInfo {
+                name,
+                raw_type: type_name,
+                data_type,
+                length,
+                precision,
+                scale,
+                identity,
+                primary_key: false,
+                nullable: row.nullable != 0,
+                default_value: row
+                    .column_default
+                    .as_str()
+                    .unwrap_or_default()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string),
+                description: row
+                    .remarks
+                    .as_str()
+                    .unwrap_or_default()
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+
+        // 主键列（ODBC SQLPrimaryKeys）
+        for pk in conn
+            .primary_keys(None, None, &table.name)
+            .map_err(odbc_err)?
+        {
+            let pk = pk.map_err(odbc_err)?;
+            let column_name = pk
+                .column
+                .as_str()
+                .unwrap_or_default()
+                .unwrap_or_default()
+                .to_string();
+            if let Some(col) = columns
+                .iter_mut()
+                .find(|c| c.name.eq_ignore_ascii_case(&column_name))
+            {
+                col.primary_key = true;
+                col.nullable = false;
+            }
+        }
+
+        table.columns = columns;
+    }
+
+    Ok(tables)
+}
+
+/// Access ODBC 类型名 → 模型类型（返回 类型/长度/精度/小数位/是否自增）。
+fn map_access_type(type_name: &str, size: i32) -> (crate::types::DataType, i32, i32, i32, bool) {
+    use crate::types::DataType as ModelType;
+    let upper = type_name.trim().to_ascii_uppercase();
+    match upper.as_str() {
+        "COUNTER" => (ModelType::Int32, 0, 0, 0, true),
+        "BYTE" => (ModelType::Byte, 0, 0, 0, false),
+        "SMALLINT" | "SHORT" => (ModelType::Int16, 0, 0, 0, false),
+        "INTEGER" | "LONG" => (ModelType::Int32, 0, 0, 0, false),
+        "BIGINT" => (ModelType::Int64, 0, 0, 0, false),
+        "REAL" | "SINGLE" => (ModelType::Single, 0, 0, 0, false),
+        "DOUBLE" | "FLOAT" => (ModelType::Double, 0, 0, 0, false),
+        "DECIMAL" | "NUMERIC" | "CURRENCY" | "MONEY" => {
+            (ModelType::Decimal, 0, size.max(0), 0, false)
+        }
+        "VARCHAR" | "CHAR" | "TEXT" => (ModelType::String, size.max(0), 0, 0, false),
+        "LONGCHAR" | "MEMO" | "LONGTEXT" | "NOTE" => (ModelType::String, 0, 0, 0, false),
+        "DATETIME" | "TIMESTAMP" | "DATE" => (ModelType::DateTime, 0, 0, 0, false),
+        "BIT" | "LOGICAL" | "YESNO" => (ModelType::Boolean, 0, 0, 0, false),
+        "BINARY" | "VARBINARY" | "LONGBINARY" | "OLE" => (ModelType::Binary, 0, 0, 0, false),
+        "GUID" | "UNIQUEIDENTIFIER" => (ModelType::String, 0, 0, 0, false),
+        _ => (ModelType::String, 0, 0, 0, false),
     }
 }
 

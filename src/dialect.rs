@@ -11,7 +11,7 @@
 //! 生成脚本与后续驱动接入（MySQL 优先）。
 
 use crate::error::{Error, Result};
-use crate::model::{ColumnMeta, TableMeta};
+use crate::model::{ColumnMeta, IndexMeta, TableMeta};
 use crate::types::DataType;
 
 /// 数据库类型（对应 C# 的 `DatabaseType`，覆盖 DH.NCode 全部主要数据库）。
@@ -555,6 +555,45 @@ impl DatabaseKind {
         }
     }
 
+    /// 索引名（未显式指定时按 `ix_{表名}_{列名}` 编制，与 DH.NCode 的建表约定一致）。
+    /// <param name="table">表</param>
+    /// <param name="idx">索引定义</param>
+    /// <returns>索引名</returns>
+    pub fn index_name(&self, table: &TableMeta, idx: &IndexMeta) -> String {
+        idx.name.clone().unwrap_or_else(|| {
+            format!(
+                "ix_{}_{}",
+                table.effective_table_name(),
+                idx.columns.join("_")
+            )
+        })
+    }
+
+    /// 生成索引创建语句（`None` 表示索引无列，可忽略）。
+    /// <param name="table">表</param>
+    /// <param name="idx">索引定义</param>
+    /// <returns>CREATE INDEX 语句</returns>
+    pub fn create_index_sql(&self, table: &TableMeta, idx: &IndexMeta) -> Option<String> {
+        if idx.columns.is_empty() {
+            return None;
+        }
+        let cols: Vec<String> = idx
+            .columns
+            .iter()
+            .map(|c| match table.column(c) {
+                Some(col) => self.quote(table.effective_column_name(col)),
+                None => self.quote(c),
+            })
+            .collect();
+        Some(format!(
+            "CREATE {}INDEX {} ON {} ({})",
+            if idx.unique { "UNIQUE " } else { "" },
+            self.quote(&self.index_name(table, idx)),
+            self.quote(table.effective_table_name()),
+            cols.join(", ")
+        ))
+    }
+
     /// 生成建表语句（表 + 索引）。
     ///
     /// 说明：
@@ -678,27 +717,9 @@ impl DatabaseKind {
 
         // 索引
         for idx in &table.indexes {
-            if idx.columns.is_empty() {
-                continue;
+            if let Some(sql) = self.create_index_sql(table, idx) {
+                statements.push(sql);
             }
-            let cols: Vec<String> = idx
-                .columns
-                .iter()
-                .map(|c| match table.column(c) {
-                    Some(col) => self.quote(table.effective_column_name(col)),
-                    None => self.quote(c),
-                })
-                .collect();
-            let idx_name = idx.name.clone().unwrap_or_else(|| {
-                format!("ix_{}_{}", tname, idx.columns.join("_"))
-            });
-            statements.push(format!(
-                "CREATE {}INDEX {} ON {} ({})",
-                if idx.unique { "UNIQUE " } else { "" },
-                self.quote(&idx_name),
-                self.quote(tname),
-                cols.join(", ")
-            ));
         }
 
         // 独立序列（XCode 约定 SEQ_{表名}）：Oracle/DB2/Firebird/DuckDB 的自增回写依赖它

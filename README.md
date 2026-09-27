@@ -26,7 +26,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `dialect` | 各 `DbBase` 子类（SQLite.cs / MySql.cs / …） | ✅ **16 种库**的类型映射 / DDL / 分页 / 自增 / 标识符与占位符 |
 | `session` | `IDbSession` | ✅ 抽象就绪，驱动可插拔 |
 | `sqlite` | `SQLite.cs` | ✅ **可执行**（rusqlite 内嵌，无外部依赖） |
-| `mysql` | `MySql.cs` | ✅ **可执行**（mysql crate，纯 Rust；连接串与 XCode 一致；未启用 TLS） |
+| `mysql` | `MySql.cs` | ✅ **可执行**（mysql crate，纯 Rust；连接串与 XCode 一致；TLS 已启用：Preferred 缺省可回退，Required/VerifyCA/VerifyFull 强制） |
 | `mssql` | `SqlServer.cs` | ✅ **可执行**（tiberius，纯 Rust TDS；同步接口内部维护专用 tokio 运行时） |
 | `postgres` | `PostgreSQL.cs` | ✅ **可执行**（postgres crate；HighGo/金仓/VastBase 同协议直接复用） |
 | `oracle` | `Oracle.cs` | ✅ **可执行**（oracle crate / OCI；运行时需 Instant Client；自增用序列 `SEQ_{表名}`） |
@@ -48,7 +48,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`） |
 
-测试：**110 项全部通过**（默认构建；`--features duckdb` 构建为 **117 项**，含 DuckDB 内嵌引擎全链路端到端；
+测试：**177 项全部通过**（库单测 158 + 集成 15 + 文档测试 4；`--features duckdb` 另含 DuckDB 内嵌引擎全链路用例；
 MySQL / PostgreSQL / SQL Server / Oracle 端到端用例在有真实库时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -189,7 +189,7 @@ let dal = Dal::open_with_model(
 dal.sync_schema()?;   // 增量建表/补列（information_schema 探测）
 ```
 
-- TLS：当前版本固定不启用；`SslMode=Required/VerifyCA/VerifyFull` 会给出明确错误（后续提供 rustls 支持）
+- TLS（native-tls）：`SslMode=None/Disabled` 明文；`Preferred`（缺省）先试 TLS、服务器不支持时回退明文；`Required` 强制加密（不校验证书）；`VerifyCA`/`VerifyFull` 逐级校验；根证书用 `SslCa`/`CertificateFile`；客户端证书（`SslCert`/`SslKey`，PEM）暂不支持（会明确报错）
 - MySQL 方言对齐 DH.NCode：布尔 `TINYINT`、字段说明生成列 `COMMENT`、`DECIMAL` 的 Length 覆盖 Precision
 - 真实库端到端测试（默认自动跳过；只操作 `rcode_test_` 前缀的专用表，结束即清理）：
 
@@ -226,7 +226,7 @@ $env:RCODE_ORACLE   = "Server=127.0.0.1;Port=1521;ServiceName=xepdb1;Uid=rcode;P
 cargo test --test remote_e2e
 ```
 
-> TLS：当前版本三个驱动均未内置 TLS（PG/Oracle 为明文；SQL Server 可自选 `Encrypt`，默认加密+信任自签证书）。
+> TLS：MySQL/PostgreSQL 已内置 native-tls（缺省 Preferred/Prefer：能 TLS 就 TLS、服务器不支持回退明文；`Require/VerifyCA/VerifyFull` 强制校验，根证书分别用 `SslCa`/`Root Certificate`）；Oracle 暂为明文（TCPS 待接线）；SQL Server 可自选 `Encrypt`，默认加密+信任自签证书。
 > 依赖镜像：工程内 `.cargo/config.toml` 已配置 rsproxy。
 
 ### 其它数据库（DH.NCode 全量驱动）
@@ -379,17 +379,19 @@ Pek.RCode/
 
 ---
 
-## 六、路线图（按优先级）
+## 六、未完成迁移项（按“完整功能迁移、可直接切换 C# 项目”标准）
 
-1. ~~MySQL 驱动~~ ✅ 已完成（mysql crate，纯 Rust；待办：rustls TLS 选项与连接池）
-2. ~~SQL Server / PostgreSQL / Oracle 驱动~~ ✅ 已完成
-3. ~~DH.NCode 其余数据库全量接入~~ ✅ 已完成（DuckDB/ClickHouse/TDengine/InfluxDB/Hana/Firebird/DB2/达梦/IRIS/Access/MongoDB；NovaDb 复用 MySQL）
-4. **异步门面**：为 tokio 应用提供 `AsyncDal`（连接池 + 全链路 async），与扫码枪网关等 tokio 服务对接
-5. ~~反向工程~~ ✅ 已完成（数据库 → `Model.xml`，SQLite 实测；`rcodegen --conn`；其它库按需扩展）
-6. **结构比对增强**：索引差异、类型差异检测与 ALTER 脚本导出（dry-run 输出）
-7. **代码生成增强**：枚举类型、审计字段基类、`#[derive(Entity)]` 属性宏（对象实体基础版已就绪）
-8. ~~缓存~~ ✅ 已完成（实体缓存 / 单对象缓存，写入自动失效；列数缓存与跨进程失效协调可后续）
-9. **高级能力**：批量写、分表（Shards）等（按需）
+> 以下是 DH.NCode 已有、Rust 侧**尚未完成**的功能迁移（不是可选增强项）：
+
+1. **连接池**：对应 C# `ConnectionPool`（Min=CPU 核数 2–8 / Max=1000 / 空闲 30s，按连接串共享）；Rust 目前每次 `open_session` 直接新建连接
+2. **异步 API**：对应 C# `IAsyncDbSession` 与 `DAL`/`Entity` 全量 `*Async`（SaveAsync/InsertAsync/FindAsync/QueryAsync/ExecuteAsync…）；Rust 目前为同步 API（异步驱动内部 block_on）
+3. **多库反向工程与结构比对**：反向工程目前仅 SQLite、且不读索引/唯一约束；`sync_schema` 只建表/补列（不为既存表补索引）；缺类型差异检测、ALTER 脚本导出、备份与在线库管理（对应 C# `DAL_DbOperate` / `MetaData`）
+4. **代码生成增强**：枚举类型、审计字段基类、`#[derive(Entity)]` 属性宏；C# XCodeTool 的 CubeBuilder/CustomBuilder 范围待确认
+5. **分布式缓存失效适配**：`VersionStore` 抽象已就绪但无 Redis 实现（对接 Pek.RRedis）；C# 用 Redis 版本号做跨进程失效
+6. **远程服务协议互通**：C# `DbServer`/`DbClient` 为 NewLife Packet 二进制，Rust 为 JSON 行集，两端不能直接互连
+7. **低优先级/待确认**：`MSPageSplit`（历史 SQLServer 分页）、`DataSimulation`（造数）、`HtmlBuilder`（Razor 页面生成）、Oracle TLS（TCPS）与客户端证书 PEM
+
+已完成补迁移：**TLS** ✅（MySQL/PostgreSQL native-tls：缺省 Preferred/Prefer 能 TLS 就 TLS、服务器不支持回退明文；Require/VerifyCA/VerifyFull 强制校验；根证书 `SslCa`/`CertificateFile`、`Root Certificate`；客户端证书 PEM 暂不支持并明确报错）。
 
 ---
 

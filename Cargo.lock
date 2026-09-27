@@ -2397,6 +2397,7 @@ dependencies = [
  "lru",
  "mysql_common",
  "named_pipe",
+ "native-tls",
  "pem",
  "percent-encoding",
  "socket2",
@@ -3026,9 +3027,11 @@ dependencies = [
  "md-5 0.10.6",
  "mongodb",
  "mysql",
+ "native-tls",
  "odbc-api",
  "oracle",
  "postgres",
+ "postgres-native-tls",
  "postgres-types",
  "roxmltree",
  "rsfbclient",
@@ -3147,6 +3150,18 @@ dependencies = [
  "futures-util",
  "log",
  "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
+name = "postgres-native-tls"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fef4de47bb81477e0c3deaf153a1b10ae176484713ff1640969f4cb96b653ebc"
+dependencies = [
+ "native-tls",
+ "tokio",
+ "tokio-native-tls",
  "tokio-postgres",
 ]
 
@@ -4310,6 +4325,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "tokio-native-tls"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbae76ab933c85776efabc971569dd6119c580d8f5d448769dec1764bf796ef2"
+dependencies = [
+ "native-tls",
+ "tokio",
 ]
 
 [[package]]

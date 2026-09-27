@@ -10,9 +10,14 @@ license = "MIT"
 chrono = "0.4.45"
 # PostgreSQL 参数绑定直接依赖 postgres-types（与 postgres 主驱动共用同一版本）
 bytes = "1"
-mysql = "28.0.2"
+# MySQL：native-tls 后端（SslMode=Required/VerifyCA/VerifyFull 真实建立 TLS）
+mysql = { version = "28.0.2", features = ["native-tls"] }
+# PostgreSQL/MySQL 共用 TLS 后端（Windows 下走 schannel）
+native-tls = "0.2.18"
 oracle = { version = "0.6.3", features = ["chrono"] }
 postgres = { version = "0.19.14", features = ["with-chrono-0_4"] }
+# PostgreSQL：TLS 经 native-tls（postgres-native-tls 提供 MakeTlsConnect 适配）
+postgres-native-tls = "0.5"
 postgres-types = "0.2"
 roxmltree = "0.21.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

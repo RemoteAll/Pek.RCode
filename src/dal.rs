@@ -8,13 +8,14 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use crate::cache::{EntityCache, SingleCache};
 use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
 use crate::model::{EntityModel, TableMeta};
+use crate::pool::{PoolOptions, PoolStats, SessionPool};
 use crate::query::{Query, Where};
 use crate::session::{DbRow, RowSet, SqlSession};
 use crate::sqlbuild;
@@ -175,6 +176,52 @@ pub struct Dal {
     pub(crate) entity_caches: Mutex<HashMap<String, Arc<EntityCache>>>,
     /// 单对象缓存注册表（按表共享，对应 DH.NCode 的 `Meta.SingleCache`）
     pub(crate) single_caches: Mutex<HashMap<String, Arc<SingleCache>>>,
+    /// 会话连接池（懒创建；`Pooling=false` 时不使用）
+    pool: OnceLock<Arc<SessionPool>>,
+    /// 是否启用连接池
+    pool_enabled: bool,
+}
+
+/// 直接创建会话（不走连接池；供 `Pooling=false` 与池工厂使用）。
+fn create_session(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    match kind {
+        DatabaseKind::Sqlite => {
+            let path = conn_str.data_source().ok_or_else(|| {
+                Error::Model("SQLite 连接串缺少 Data Source（数据库文件路径）".into())
+            })?;
+            Ok(Box::new(SqliteSession::open(path)?))
+        }
+        DatabaseKind::MySql => Ok(Box::new(crate::mysql::MysqlSession::open(conn_str)?)),
+        DatabaseKind::SqlServer => Ok(Box::new(crate::mssql::MssqlSession::open(conn_str)?)),
+        DatabaseKind::PostgreSql => Ok(Box::new(crate::postgres::PostgresSession::open(conn_str)?)),
+        DatabaseKind::Oracle => Ok(Box::new(crate::oracle::OracleSession::open(conn_str)?)),
+        DatabaseKind::DuckDb => {
+            #[cfg(feature = "duckdb")]
+            {
+                Ok(Box::new(crate::duckdb::DuckDbSession::open(conn_str)?))
+            }
+            #[cfg(not(feature = "duckdb"))]
+            {
+                Err(Error::Unsupported(
+                    "DuckDB 驱动未随本次构建编译：请使用 `cargo build --features duckdb` 启用\
+                     （内嵌 DuckDB 需要 CMake 构建，见 README）"
+                        .into(),
+                ))
+            }
+        }
+        DatabaseKind::Firebird => Ok(Box::new(crate::firebird::FirebirdSession::open(conn_str)?)),
+        DatabaseKind::ClickHouse => Ok(Box::new(crate::clickhouse::ClickHouseSession::open(
+            conn_str,
+        )?)),
+        DatabaseKind::TDengine => Ok(Box::new(crate::tdengine::TDengineSession::open(conn_str)?)),
+        DatabaseKind::InfluxDb => Ok(Box::new(crate::influxdb::InfluxDbSession::open(conn_str)?)),
+        DatabaseKind::Hana => Ok(Box::new(crate::hana::HanaSession::open(conn_str)?)),
+        DatabaseKind::MongoDb => Ok(Box::new(crate::mongodb::MongoSession::open(conn_str)?)),
+        // ODBC 桥：DB2 / 达梦 / IRIS / Access 共用一套通用驱动
+        DatabaseKind::Db2 | DatabaseKind::DaMeng | DatabaseKind::Iris | DatabaseKind::Access => {
+            Ok(Box::new(crate::odbc::OdbcSession::open(kind, conn_str)?))
+        }
+    }
 }
 
 impl Dal {
@@ -183,6 +230,16 @@ impl Dal {
         let conn_str = ConnectionString::parse(conn_str);
         let kind = conn_str.kind()?;
         let show_sql = conn_str.show_sql();
+        // 连接池默认开启；`Pooling=false` 关闭（对齐 XCode 的连接池默认行为）
+        let pool_enabled = conn_str
+            .get("pooling")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "false" | "0" | "no" | "off"
+                )
+            })
+            .unwrap_or(true);
         Ok(Self {
             conn_str,
             kind,
@@ -190,6 +247,8 @@ impl Dal {
             show_sql,
             entity_caches: Mutex::new(HashMap::new()),
             single_caches: Mutex::new(HashMap::new()),
+            pool: OnceLock::new(),
+            pool_enabled,
         })
     }
 
@@ -232,66 +291,47 @@ impl Dal {
         }
     }
 
-    /// 打开数据库会话。
+    /// 打开数据库会话（默认走连接池；`Pooling=false` 时每次新建）。
     ///
-    /// 五种数据库均已接入驱动：
-    /// SQLite（内嵌）、MySQL、SQL Server、PostgreSQL（含 HighGo/KingBase/VastBase）、Oracle。
+    /// 连接池按连接串（当前 `Dal`）共享，对应 C# 的 `ConnectionPool`：
+    /// 优先复用空闲会话；空闲超时（默认 30 秒）或调用出错的会话在归还时关闭。
     pub fn open_session(&self) -> Result<Box<dyn SqlSession>> {
-        match self.kind {
-            DatabaseKind::Sqlite => {
-                let path = self.conn_str.data_source().ok_or_else(|| {
-                    Error::Model("SQLite 连接串缺少 Data Source（数据库文件路径）".into())
-                })?;
-                Ok(Box::new(SqliteSession::open(path)?))
-            }
-            DatabaseKind::MySql => Ok(Box::new(crate::mysql::MysqlSession::open(&self.conn_str)?)),
-            DatabaseKind::SqlServer => {
-                Ok(Box::new(crate::mssql::MssqlSession::open(&self.conn_str)?))
-            }
-            DatabaseKind::PostgreSql => {
-                Ok(Box::new(crate::postgres::PostgresSession::open(&self.conn_str)?))
-            }
-            DatabaseKind::Oracle => {
-                Ok(Box::new(crate::oracle::OracleSession::open(&self.conn_str)?))
-            }
-            DatabaseKind::DuckDb => {
-                #[cfg(feature = "duckdb")]
-                {
-                    Ok(Box::new(crate::duckdb::DuckDbSession::open(&self.conn_str)?))
-                }
-                #[cfg(not(feature = "duckdb"))]
-                {
-                    Err(Error::Unsupported(
-                        "DuckDB 驱动未随本次构建编译：请使用 `cargo build --features duckdb` 启用\
-                         （内嵌 DuckDB 需要 CMake 构建，见 README）"
-                            .into(),
-                    ))
-                }
-            }
-            DatabaseKind::Firebird => {
-                Ok(Box::new(crate::firebird::FirebirdSession::open(&self.conn_str)?))
-            }
-            DatabaseKind::ClickHouse => {
-                Ok(Box::new(crate::clickhouse::ClickHouseSession::open(&self.conn_str)?))
-            }
-            DatabaseKind::TDengine => {
-                Ok(Box::new(crate::tdengine::TDengineSession::open(&self.conn_str)?))
-            }
-            DatabaseKind::InfluxDb => {
-                Ok(Box::new(crate::influxdb::InfluxDbSession::open(&self.conn_str)?))
-            }
-            DatabaseKind::Hana => Ok(Box::new(crate::hana::HanaSession::open(&self.conn_str)?)),
-            DatabaseKind::MongoDb => {
-                Ok(Box::new(crate::mongodb::MongoSession::open(&self.conn_str)?))
-            }
-            // ODBC 桥：DB2 / 达梦 / IRIS / Access 共用一套通用驱动
-            DatabaseKind::Db2 | DatabaseKind::DaMeng | DatabaseKind::Iris | DatabaseKind::Access => {
-                Ok(Box::new(crate::odbc::OdbcSession::open(
-                    self.kind,
-                    &self.conn_str,
-                )?))
-            }
+        if !self.pool_enabled {
+            return create_session(self.kind, &self.conn_str);
         }
+        self.session_pool().checkout()
+    }
+
+    /// 取（或懒创建）会话池。
+    fn session_pool(&self) -> Arc<SessionPool> {
+        self.pool
+            .get_or_init(|| {
+                let kind = self.kind;
+                let conn_str = self.conn_str.clone();
+                let factory: crate::pool::SessionFactory =
+                    Arc::new(move || create_session(kind, &conn_str));
+                Arc::new(SessionPool::new(PoolOptions::default(), factory))
+            })
+            .clone()
+    }
+
+    /// 连接池统计（未启用池时返回缺省值）。
+    pub fn pool_stats(&self) -> PoolStats {
+        self.pool.get().map(|p| p.stats()).unwrap_or_default()
+    }
+
+    /// 清空连接池（关闭全部空闲连接；`Dal` 仍可继续使用）。
+    ///
+    /// 删除/移动 SQLite 数据库文件前可先调用，确保文件句柄已释放。
+    pub fn clear_pool(&self) {
+        if let Some(pool) = self.pool.get() {
+            pool.clear();
+        }
+    }
+
+    /// 是否启用连接池（连接串 `Pooling` 键，默认 true）。
+    pub fn pooling_enabled(&self) -> bool {
+        self.pool_enabled
     }
 
     /// 获取表操作句柄。
@@ -349,6 +389,34 @@ impl Dal {
                 }
             }
 
+            // 既存表：补齐模型定义中缺失的索引（同列且同序即视为已存在，避免与其它工具命名差异重复建）
+            if crate::catalog::supports_index_catalog(self.kind) {
+                match crate::catalog::read_indexes(session.as_mut(), self.kind, table_name) {
+                    Ok(existing_indexes) => {
+                        for idx in &table.indexes {
+                            if idx.columns.is_empty()
+                                || existing_indexes
+                                    .iter()
+                                    .any(|e| same_index(&e.columns, &idx.columns))
+                            {
+                                continue;
+                            }
+                            if let Some(sql) = self.kind.create_index_sql(table, idx) {
+                                self.log_sql(&sql);
+                                session.execute(&sql, &[])?;
+                                report.added_indexes.push((
+                                    table_name.to_string(),
+                                    self.kind.index_name(table, idx),
+                                ));
+                            }
+                        }
+                    }
+                    // 目录不可用：跳过索引补齐（不阻断结构同步）
+                    Err(Error::Unsupported(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
             // 序列型自增（Oracle/DB2/Firebird/DuckDB）：补齐历史表缺失的序列
             if table.identity().is_some()
                 && matches!(
@@ -364,6 +432,128 @@ impl Dal {
         }
 
         Ok(report)
+    }
+
+    /// 结构比对：模型 vs 数据库（只读），并生成可直接执行的 ALTER 脚本（dry-run 输出）。
+    ///
+    /// 对应 DH.NCode 的迁移预检：缺失的表/列/索引会生成 `CREATE TABLE`/`ADD COLUMN`/
+    /// `CREATE INDEX` 语句；多余的对象与类型差异（可能涉及数据变化）**只报告不生成 DDL**。
+    /// 索引以“同列且同序”判定存在性（避免与其它工具的命名差异误报）。
+    pub fn diff_schema(&self) -> Result<SchemaDiff> {
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| Error::Model("尚未加载数据模型，无法比对结构".into()))?;
+        let mut diff = SchemaDiff::default();
+        if !self.kind.supports_ddl() {
+            return Ok(diff);
+        }
+        let mut session = self.open_session()?;
+
+        match crate::catalog::read_tables(session.as_mut(), self.kind, None) {
+            Ok(db_tables) => {
+                for table in &model.tables {
+                    let tname = table.effective_table_name();
+                    match db_tables.iter().find(|t| t.name.eq_ignore_ascii_case(tname)) {
+                        None => {
+                            diff.missing_tables.push(tname.to_string());
+                            diff.alter_sql.extend(self.kind.create_table_sql(table));
+                        }
+                        Some(db) => {
+                            // 列：缺失 / 类型差异 / 多余
+                            for col in &table.columns {
+                                let cname = table.effective_column_name(col);
+                                match db
+                                    .columns
+                                    .iter()
+                                    .find(|c| c.name.eq_ignore_ascii_case(cname))
+                                {
+                                    None => {
+                                        diff.missing_columns
+                                            .push((tname.to_string(), cname.to_string()));
+                                        diff.alter_sql.push(self.kind.add_column_sql(table, col));
+                                    }
+                                    Some(db_col) => {
+                                        let expected = self.kind.field_type(col);
+                                        if !same_base_type(&expected, &db_col.raw_type) {
+                                            diff.type_mismatches.push(ColumnTypeMismatch {
+                                                table: tname.to_string(),
+                                                column: cname.to_string(),
+                                                expected,
+                                                actual: db_col.raw_type.clone(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            for db_col in &db.columns {
+                                if table.column(&db_col.name).is_none() {
+                                    diff.extra_columns
+                                        .push((tname.to_string(), db_col.name.clone()));
+                                }
+                            }
+                            // 索引：缺失 / 多余（同列且同序视为一致）
+                            if crate::catalog::supports_index_catalog(self.kind) {
+                                for idx in &table.indexes {
+                                    if idx.columns.is_empty()
+                                        || db
+                                            .indexes
+                                            .iter()
+                                            .any(|e| same_index(&e.columns, &idx.columns))
+                                    {
+                                        continue;
+                                    }
+                                    diff.missing_indexes.push((
+                                        tname.to_string(),
+                                        self.kind.index_name(table, idx),
+                                    ));
+                                    if let Some(sql) = self.kind.create_index_sql(table, idx) {
+                                        diff.alter_sql.push(sql);
+                                    }
+                                }
+                                for e in &db.indexes {
+                                    let in_model = table
+                                        .indexes
+                                        .iter()
+                                        .any(|idx| same_index(&idx.columns, &e.columns));
+                                    if !in_model {
+                                        diff.extra_indexes
+                                            .push((tname.to_string(), e.name.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for db in &db_tables {
+                    if model.table(&db.name).is_none() {
+                        diff.extra_tables.push(db.name.clone());
+                    }
+                }
+            }
+            Err(Error::Unsupported(_)) => {
+                // 目录读取未覆盖的库：退回“存在性”级比对（表/列）
+                for table in &model.tables {
+                    let tname = table.effective_table_name();
+                    if !session.table_exists(tname)? {
+                        diff.missing_tables.push(tname.to_string());
+                        diff.alter_sql.extend(self.kind.create_table_sql(table));
+                        continue;
+                    }
+                    let existing = session.table_columns(tname)?;
+                    for col in &table.columns {
+                        let cname = table.effective_column_name(col);
+                        if !existing.iter().any(|c| c.eq_ignore_ascii_case(cname)) {
+                            diff.missing_columns
+                                .push((tname.to_string(), cname.to_string()));
+                            diff.alter_sql.push(self.kind.add_column_sql(table, col));
+                        }
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(diff)
     }
 
     /// 补齐自增序列（XCode 约定 `SEQ_{表名}`）：不存在时创建。
@@ -434,6 +624,8 @@ pub struct SchemaReport {
     pub added_columns: Vec<(String, String)>,
     /// 补建的序列（Oracle 自增序列 SEQ_{表名}）
     pub created_sequences: Vec<String>,
+    /// 补充的索引（表名, 索引名）
+    pub added_indexes: Vec<(String, String)>,
 }
 
 impl SchemaReport {
@@ -442,6 +634,7 @@ impl SchemaReport {
         self.created_tables.is_empty()
             && self.added_columns.is_empty()
             && self.created_sequences.is_empty()
+            && self.added_indexes.is_empty()
     }
 }
 
@@ -452,9 +645,10 @@ impl fmt::Display for SchemaReport {
         }
         write!(
             f,
-            "新建表 {} 张，补充列 {} 个",
+            "新建表 {} 张，补充列 {} 个，补充索引 {} 个",
             self.created_tables.len(),
-            self.added_columns.len()
+            self.added_columns.len(),
+            self.added_indexes.len()
         )?;
         if !self.created_tables.is_empty() {
             write!(f, "；新建：{}", self.created_tables.join(", "))?;
@@ -467,6 +661,14 @@ impl fmt::Display for SchemaReport {
                 .collect();
             write!(f, "；补列：{}", list.join(", "))?;
         }
+        if !self.added_indexes.is_empty() {
+            let list: Vec<String> = self
+                .added_indexes
+                .iter()
+                .map(|(t, i)| format!("{t}.{i}"))
+                .collect();
+            write!(f, "；补索引：{}", list.join(", "))?;
+        }
         if !self.created_sequences.is_empty() {
             write!(
                 f,
@@ -476,6 +678,104 @@ impl fmt::Display for SchemaReport {
         }
         Ok(())
     }
+}
+
+/// 结构差异（对应 DH.NCode 的迁移预检；`alter_sql` 为 dry-run 导出的可执行脚本）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SchemaDiff {
+    /// 模型有、数据库缺的表
+    pub missing_tables: Vec<String>,
+    /// 数据库有、模型没声明的表
+    pub extra_tables: Vec<String>,
+    /// 缺失的列（表名, 列名）
+    pub missing_columns: Vec<(String, String)>,
+    /// 多余的列（表名, 列名）
+    pub extra_columns: Vec<(String, String)>,
+    /// 缺失的索引（表名, 索引名）
+    pub missing_indexes: Vec<(String, String)>,
+    /// 多余的索引（表名, 索引名）
+    pub extra_indexes: Vec<(String, String)>,
+    /// 类型差异（只报告，不生成 DDL）
+    pub type_mismatches: Vec<ColumnTypeMismatch>,
+    /// 可直接执行的 ALTER/DDL 脚本（只包含补齐类操作）
+    pub alter_sql: Vec<String>,
+}
+
+impl SchemaDiff {
+    /// 是否完全一致（无差异）。
+    pub fn is_empty(&self) -> bool {
+        self.missing_tables.is_empty()
+            && self.extra_tables.is_empty()
+            && self.missing_columns.is_empty()
+            && self.extra_columns.is_empty()
+            && self.missing_indexes.is_empty()
+            && self.extra_indexes.is_empty()
+            && self.type_mismatches.is_empty()
+    }
+}
+
+/// 列类型差异（模型预期 vs 数据库实际）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnTypeMismatch {
+    /// 表名
+    pub table: String,
+    /// 列名
+    pub column: String,
+    /// 模型预期类型（按方言生成）
+    pub expected: String,
+    /// 数据库实际原始类型
+    pub actual: String,
+}
+
+/// 索引列集合是否一致（同列且同序，忽略大小写）。
+fn same_index(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// 宽松比较列类型：只比较基础类型名（忽略长度/精度/大小写），并处理常见等价别名。
+fn same_base_type(expected: &str, actual: &str) -> bool {
+    /// 取类型主名：去掉括号参数与后续修饰（如 `timestamp without time zone` → `timestamp`）。
+    fn base(text: &str) -> String {
+        let lower = text.trim().to_ascii_lowercase();
+        lower
+            .split(['(', ' '])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(')')
+            .to_string()
+    }
+    let (e, a) = (base(expected), base(actual));
+    if e == a {
+        return true;
+    }
+    matches!(
+        (e.as_str(), a.as_str()),
+        ("integer", "int")
+            | ("int", "integer")
+            | ("serial", "integer")
+            | ("serial", "int4")
+            | ("serial8", "bigint")
+            | ("serial8", "int8")
+            | ("boolean", "bool")
+            | ("bool", "boolean")
+            | ("single", "float4")
+            | ("float4", "single")
+            | ("double", "float8")
+            | ("float8", "double")
+            | ("double", "float")
+            | ("varchar", "character")
+            | ("character", "varchar")
+            | ("nvarchar", "varchar")
+            | ("varchar", "nvarchar")
+            | ("nvarchar", "character")
+            | ("character", "nvarchar")
+            | ("datetime", "timestamp")
+            | ("timestamp", "datetime")
+            | ("decimal", "numeric")
+            | ("numeric", "decimal")
+            | ("blob", "bytea")
+            | ("bytea", "blob")
+    )
 }
 
 /// 表操作句柄（绑定模型中的某张表）。
@@ -815,6 +1115,136 @@ mod tests {
         let report = dal2.sync_schema().unwrap();
         assert_eq!(report.added_columns, vec![("DH_Order".to_string(), "Remark".to_string())]);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_schema_adds_missing_index() {
+        let dir = temp_dir("index");
+        let db = dir.join("test.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
+        dal.sync_schema().unwrap();
+
+        // 手动删掉索引后再次同步：应补建
+        let mut session = dal.open_session().unwrap();
+        session
+            .execute("DROP INDEX \"ix_DH_Order_Code\"", &[])
+            .unwrap();
+        drop(session);
+
+        let report = dal.sync_schema().unwrap();
+        assert_eq!(
+            report.added_indexes,
+            vec![("DH_Order".to_string(), "ix_DH_Order_Code".to_string())]
+        );
+
+        // 再次同步无变更
+        assert!(dal.sync_schema().unwrap().is_empty());
+
+        dal.clear_pool();
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_schema_reports_and_exports_alter() {
+        let dir = temp_dir("diff");
+        let db = dir.join("test.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
+
+        // 全新建库：缺表，导出建表 + 建索引脚本
+        let diff = dal.diff_schema().unwrap();
+        assert_eq!(diff.missing_tables, vec!["DH_Order"]);
+        assert!(diff.alter_sql.iter().any(|s| s.starts_with("CREATE TABLE")));
+        assert!(
+            diff.alter_sql
+                .iter()
+                .any(|s| s.starts_with("CREATE UNIQUE INDEX"))
+        );
+
+        // 同步后无差异
+        dal.sync_schema().unwrap();
+        let diff = dal.diff_schema().unwrap();
+        assert!(diff.is_empty(), "同步后应无差异：{diff:?}");
+
+        // 手工制造差异：删索引、加多余列、加多余表
+        let mut session = dal.open_session().unwrap();
+        session
+            .execute("DROP INDEX \"ix_DH_Order_Code\"", &[])
+            .unwrap();
+        session
+            .execute("ALTER TABLE \"DH_Order\" ADD COLUMN \"Extra\" text", &[])
+            .unwrap();
+        session
+            .execute("CREATE TABLE \"DH_Other\" (\"X\" int)", &[])
+            .unwrap();
+        drop(session);
+
+        let diff = dal.diff_schema().unwrap();
+        assert_eq!(
+            diff.missing_indexes,
+            vec![("DH_Order".to_string(), "ix_DH_Order_Code".to_string())]
+        );
+        assert_eq!(
+            diff.extra_columns,
+            vec![("DH_Order".to_string(), "Extra".to_string())]
+        );
+        assert_eq!(diff.extra_tables, vec!["DH_Other"]);
+        assert!(
+            diff.alter_sql
+                .iter()
+                .any(|s| s.contains("CREATE UNIQUE INDEX"))
+        );
+
+        dal.clear_pool();
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_schema_detects_type_mismatch() {
+        const MODEL2: &str = r#"<EntityModel><Tables><Table Name="T2" TableName="DH_T2">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            <Column Name="Code" DataType="String" Length="50" />
+          </Columns>
+        </Table></Tables></EntityModel>"#;
+
+        let dir = temp_dir("diff-type");
+        let db = dir.join("test.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+
+        // 手工建一张与模型类型不符的表（Code 为 int，模型为 nvarchar(50)）
+        let setup = Dal::open(&conn).unwrap();
+        let mut session = setup.open_session().unwrap();
+        session
+            .execute(
+                "CREATE TABLE \"DH_T2\" (\"Id\" integer PRIMARY KEY AUTOINCREMENT, \"Code\" int)",
+                &[],
+            )
+            .unwrap();
+        drop(session);
+        setup.clear_pool();
+        drop(setup);
+
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL2).unwrap()).unwrap();
+        let diff = dal.diff_schema().unwrap();
+        assert_eq!(diff.type_mismatches.len(), 1, "{diff:?}");
+        let m = &diff.type_mismatches[0];
+        assert_eq!(m.table, "DH_T2");
+        assert_eq!(m.column, "Code");
+        assert_eq!(m.expected, "nvarchar(50)");
+        // 注意：SQLite 的 pragma_table_info 会把声明类型规范化为大写（int → INT）
+        assert!(m.actual.eq_ignore_ascii_case("int"), "diff={diff:?}");
+        // 类型差异只报告，不生成 ALTER
+        assert!(diff.alter_sql.is_empty());
+
+        dal.clear_pool();
+        drop(dal);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -51,7 +51,10 @@ pub fn generate(table: &TableMeta) -> String {
 
     for col in &table.columns {
         let field = safe_field_name(&to_snake_case(&col.name));
-        let mut ty = col.data_type.rust_type().to_string();
+        let mut ty = match col.enum_type.as_deref().and_then(known_enum) {
+            Some((path, _)) => path.to_string(),
+            None => col.data_type.rust_type().to_string(),
+        };
         if col.nullable {
             ty = format!("Option<{ty}>");
         }
@@ -62,6 +65,11 @@ pub fn generate(table: &TableMeta) -> String {
         }
         if col.identity {
             tags.push("自增");
+        }
+        if let Some(enum_type) = col.enum_type.as_deref() {
+            if known_enum(enum_type).is_some() {
+                tags.push("枚举");
+            }
         }
         let tag_text = if tags.is_empty() {
             String::new()
@@ -74,7 +82,16 @@ pub fn generate(table: &TableMeta) -> String {
         } else {
             clean_doc(&col.description)
         };
-        out.push_str(&format!("    /// {doc}{tag_text}\n    pub {field}: {ty},\n"));
+        // 未知枚举类型：按整型生成并注明对应的 C# 枚举
+        let enum_note = match col.enum_type.as_deref() {
+            Some(enum_type) if known_enum(enum_type).is_none() => {
+                format!("（对应 C# 枚举 {enum_type}，此处按整型生成）")
+            }
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "    /// {doc}{tag_text}{enum_note}\n    pub {field}: {ty},\n"
+        ));
     }
 
     out.push_str("}\n\n");
@@ -132,7 +149,14 @@ pub fn generate(table: &TableMeta) -> String {
     for col in &table.columns {
         let field = safe_field_name(&to_snake_case(&col.name));
         let name = table.effective_column_name(col);
-        let expr = if needs_clone(col.data_type) {
+        let expr = if col.enum_type.as_deref().and_then(known_enum).is_some() {
+            // 成员枚举：以 i32 存取（与 C# 枚举的底层类型一致）
+            if col.nullable {
+                format!("self.{field}.map(|v| v as i32).into()")
+            } else {
+                format!("(self.{field} as i32).into()")
+            }
+        } else if needs_clone(col.data_type) {
             format!("self.{field}.clone().into()")
         } else {
             format!("self.{field}.into()")
@@ -178,6 +202,44 @@ pub fn generate(table: &TableMeta) -> String {
     out
 }
 
+/// 已知成员枚举 → Rust 枚举（返回 `(类型路径, 默认成员表达式)`）。
+///
+/// 对应 C# 的 `Column.Type` 枚举引用；已知枚举来自 [`crate::membership`]（与 DH.NCode 数值一致）。
+fn known_enum(enum_type: &str) -> Option<(&'static str, &'static str)> {
+    let short = enum_type.rsplit('.').next().unwrap_or(enum_type);
+    match short {
+        "SexKinds" => Some((
+            "pek_rcode::membership::SexKinds",
+            "pek_rcode::membership::SexKinds::Unknown",
+        )),
+        "MenuTypes" => Some((
+            "pek_rcode::membership::MenuTypes",
+            "pek_rcode::membership::MenuTypes::Directory",
+        )),
+        "RoleTypes" => Some((
+            "pek_rcode::membership::RoleTypes",
+            "pek_rcode::membership::RoleTypes::Normal",
+        )),
+        "TenantTypes" => Some((
+            "pek_rcode::membership::TenantTypes",
+            "pek_rcode::membership::TenantTypes::Free",
+        )),
+        "DepartmentTypes" => Some((
+            "pek_rcode::membership::DepartmentTypes",
+            "pek_rcode::membership::DepartmentTypes::Company",
+        )),
+        "ParameterKinds" => Some((
+            "pek_rcode::membership::ParameterKinds",
+            "pek_rcode::membership::ParameterKinds::Normal",
+        )),
+        "DataScopes" | "DataScope" => Some((
+            "pek_rcode::membership::DataScope",
+            "pek_rcode::membership::DataScope::Default",
+        )),
+        _ => None,
+    }
+}
+
 /// 字段是否为字符串/二进制（非 Copy，输出时需 clone）。
 fn needs_clone(t: DataType) -> bool {
     matches!(t, DataType::String | DataType::Binary)
@@ -187,6 +249,9 @@ fn needs_clone(t: DataType) -> bool {
 fn default_expr(col: &ColumnMeta) -> String {
     if col.nullable {
         return "None".into();
+    }
+    if let Some((_, default_member)) = col.enum_type.as_deref().and_then(known_enum) {
+        return default_member.into();
     }
     match col.data_type {
         DataType::Boolean => "false".into(),
@@ -201,6 +266,18 @@ fn default_expr(col: &ColumnMeta) -> String {
 
 /// `from_row` 中每个字段的取值表达式（NULL/转换失败时使用列类型默认值）。
 fn from_row_expr(col: &ColumnMeta, name: &str) -> String {
+    // 成员枚举：i32 → 枚举（未知值取默认成员）
+    if let Some((path, default_member)) = col.enum_type.as_deref().and_then(known_enum) {
+        return if col.nullable {
+            format!(
+                "row.get_by_name(\"{name}\").and_then(DbValue::as_i32).and_then({path}::from_i32)"
+            )
+        } else {
+            format!(
+                "row.get_by_name(\"{name}\").and_then(DbValue::as_i32).and_then({path}::from_i32).unwrap_or({default_member})"
+            )
+        };
+    }
     if col.nullable {
         return match col.data_type {
             DataType::String => {

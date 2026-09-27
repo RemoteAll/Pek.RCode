@@ -6,29 +6,26 @@
 //! 数据库 ──read_model()──▶ EntityModel ──to_xml()──▶ Model.xml ──codegen──▶ Rust 实体
 //! ```
 //!
-//! 当前支持范围：
-//! - **SQLite**（完整）：表清单取 `sqlite_master`，列信息取 `pragma_table_info` 表值函数，
-//!   自增按 DDL 中的 `AUTOINCREMENT` 识别（与 XCode 的建表约定一致）
-//! - 其它数据库返回明确的 `Unsupported` 提示（可按需扩展各库的 `OnGetTables` 对应实现）
+//! 目录读取（表/列/索引）统一由 [`crate::catalog`] 承担：
+//! - 已支持：SQLite、MySQL、PostgreSQL（含 HighGo/KingBase/VastBase）、SQL Server、Oracle、DuckDB
+//! - 索引与唯一约束一并反向（主键索引不写入 `Indexes`）
+//! - 其余驱动返回明确的 `Unsupported` 提示（按批补齐中）
 //!
 //! 已知限制：
 //! - SQLite 的 DECIMAL 不带精度参数（与 DH.NCode 的建表行为一致），反向后的
 //!   `Precision`/`Scale` 为 0，需要时可在模型里补充
-//! - 索引/唯一约束暂不反向（`Indexes` 为空）
 
+use crate::catalog;
 use crate::dal::Dal;
-use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
-use crate::model::{ColumnMeta, EntityModel, ModelOptions, TableMeta};
+use crate::model::{ColumnMeta, EntityModel, IndexMeta, ModelOptions, TableMeta};
 use crate::session::SqlSession;
-use crate::types::DataType;
-use crate::value::DbValue;
 
 impl Dal {
     /// 反向工程：读取数据库结构，生成实体模型（可 [`EntityModel::to_xml`] 输出 `Model.xml`）。
     ///
     /// 与 DH.NCode 的 `DAL.GetTables()` 对应：读取全部用户表及其列定义
-    /// （名称、类型、长度、主键、自增、可空、默认值）。
+    /// （名称、类型、长度、主键、自增、可空、默认值）与索引（名称/列/唯一）。
     pub fn read_model(&self) -> Result<EntityModel> {
         self.ensure_reverse_supported()?;
         let mut session = self.open_session()?;
@@ -41,23 +38,36 @@ impl Dal {
         })
     }
 
-    /// 读取数据库中的全部用户表定义。
+    /// 读取数据库中的全部用户表定义（含非主键索引）。
     pub fn read_tables(&self, session: &mut dyn SqlSession) -> Result<Vec<TableMeta>> {
         self.ensure_reverse_supported()?;
-        match self.kind() {
-            DatabaseKind::Sqlite => read_tables_sqlite(session),
-            _ => unreachable!("ensure_reverse_supported 已拦截非 SQLite"),
-        }
+        let infos = catalog::read_tables(session, self.kind(), None)?;
+        Ok(infos.into_iter().map(to_table_meta).collect())
+    }
+
+    /// 按表名读取表定义（供 `rcodegen --table` 等按需反向使用）。
+    /// <param name="session">会话</param>
+    /// <param name="names">表名（忽略大小写）</param>
+    /// <returns>命中的表定义</returns>
+    pub fn read_tables_of(
+        &self,
+        session: &mut dyn SqlSession,
+        names: &[String],
+    ) -> Result<Vec<TableMeta>> {
+        self.ensure_reverse_supported()?;
+        let infos = catalog::read_tables(session, self.kind(), Some(names))?;
+        Ok(infos.into_iter().map(to_table_meta).collect())
     }
 
     /// 校验当前数据库是否支持反向工程。
     fn ensure_reverse_supported(&self) -> Result<()> {
-        match self.kind() {
-            DatabaseKind::Sqlite => Ok(()),
-            other => Err(Error::Unsupported(format!(
-                "反向工程当前已支持 SQLite（本次连接为 {}）；按需可扩展其它数据库",
-                other.name()
-            ))),
+        if catalog::supports_reverse(self.kind()) {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(format!(
+                "反向工程不支持 {}：文档数据库无固定表结构；其余驱动均已支持",
+                self.kind().name()
+            )))
         }
     }
 
@@ -69,168 +79,55 @@ impl Dal {
     }
 }
 
-/// SQLite：读取全部用户表（排除 `sqlite_%` 内部表）。
-fn read_tables_sqlite(session: &mut dyn SqlSession) -> Result<Vec<TableMeta>> {
-    let set = session.query(
-        "SELECT name, sql FROM sqlite_master \
-         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        &[],
-    )?;
-
-    let mut tables = Vec::with_capacity(set.len());
-    for row in &set.rows {
-        let name = row
-            .get(0)
-            .and_then(DbValue::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let ddl = row.get(1).and_then(DbValue::as_str).unwrap_or_default();
-
-        // AUTOINCREMENT 只出现在建表 DDL 中
-        let auto_increment = ddl.to_ascii_uppercase().contains("AUTOINCREMENT");
-
-        let columns = read_columns_sqlite(session, &name, auto_increment)?;
-        tables.push(TableMeta {
-            name,
-            table_name: String::new(),
-            description: String::new(),
-            conn_name: None,
-            columns,
-            indexes: Vec::new(),
-        });
-    }
-    Ok(tables)
-}
-
-/// SQLite：读取单表列定义（`pragma_table_info` 表值函数，参数可安全绑定）。
-fn read_columns_sqlite(
-    session: &mut dyn SqlSession,
-    table: &str,
-    auto_increment: bool,
-) -> Result<Vec<ColumnMeta>> {
-    let set = session.query(
-        "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)",
-        &[DbValue::Text(table.to_string())],
-    )?;
-
-    let mut columns = Vec::with_capacity(set.len());
-    for row in &set.rows {
-        let name = row
-            .get(0)
-            .and_then(DbValue::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let raw_type = row.get(1).and_then(DbValue::as_str).unwrap_or_default();
-        let not_null = row.get(2).and_then(DbValue::as_i64).unwrap_or(0) == 1;
-        let default_value = row.get(3).and_then(DbValue::as_str).map(str::to_string);
-        let pk_order = row.get(4).and_then(DbValue::as_i64).unwrap_or(0);
-        let primary_key = pk_order > 0;
-
-        // 自增：AUTOINCREMENT 且为整数主键首列（与 XCode 的建表约定一致）
-        let identity = auto_increment && primary_key && pk_order == 1;
-
-        let (data_type, length, precision, scale) = map_sqlite_type(raw_type, identity);
-
-        columns.push(ColumnMeta {
-            name,
-            column_name: None,
-            data_type,
-            raw_type: None,
-            length,
-            precision,
-            scale,
-            identity,
-            primary_key,
-            master: false,
-            // XML 语义：Nullable 缺省 false（即 NOT NULL）。
-            // 主键强制 NOT NULL（SQLite 的 rowid 主键不报 notnull，但 XCode 模型主键总是非空）
-            nullable: !not_null && !primary_key,
-            default_value,
-            description: String::new(),
-            enum_type: None,
-            data_scale: None,
-            map: None,
-            show_in: None,
-            model: None,
-        });
-    }
-    Ok(columns)
-}
-
-/// SQLite 列类型文本 → 模型类型（与 [`crate::dialect`] 的正向映射互逆）。
-///
-/// 返回 `(数据类型, 长度, 精度, 小数位)`。
-fn map_sqlite_type(raw_type: &str, identity: bool) -> (DataType, i32, i32, i32) {
-    let text = raw_type.trim().to_ascii_lowercase();
-    if text.is_empty() {
-        // SQLite 允许无类型列（动态类型）
-        return (DataType::String, 0, 0, 0);
-    }
-
-    let (base, args) = split_type_params(&text);
-    match base {
-        // 自增主键建表为 integer（AUTOINCREMENT 要求）；其余 integer 对应 Int64
-        "integer" => {
-            if identity {
-                (DataType::Int32, 0, 0, 0)
-            } else {
-                (DataType::Int64, 0, 0, 0)
-            }
-        }
-        "int" => (DataType::Int32, 0, 0, 0),
-        "tinyint" => (DataType::Byte, 0, 0, 0),
-        "smallint" => (DataType::Int16, 0, 0, 0),
-        "bigint" => (DataType::Int64, 0, 0, 0),
-        "bit" | "bool" | "boolean" => (DataType::Boolean, 0, 0, 0),
-        "single" | "float" => (DataType::Single, 0, 0, 0),
-        "real" | "double" => (DataType::Double, 0, 0, 0),
-        "decimal" | "numeric" => {
-            let precision = args.first().copied().unwrap_or(0);
-            let scale = args.get(1).copied().unwrap_or(0);
-            (DataType::Decimal, 0, precision, scale)
-        }
-        "nvarchar" | "varchar" | "nchar" | "char" | "character" => {
-            (DataType::String, args.first().copied().unwrap_or(0), 0, 0)
-        }
-        "text" | "clob" | "ntext" | "longtext" => (DataType::String, 0, 0, 0),
-        "datetime" | "timestamp" | "date" => (DataType::DateTime, 0, 0, 0),
-        "binary" | "varbinary" | "blob" => (DataType::Binary, 0, 0, 0),
-        // 宽松兜底：含 char 视为文本、含 int 视为整数、其余按文本
-        other => {
-            if other.contains("char") || other.contains("text") {
-                (DataType::String, args.first().copied().unwrap_or(0), 0, 0)
-            } else if other.contains("int") {
-                (DataType::Int32, 0, 0, 0)
-            } else {
-                (DataType::String, 0, 0, 0)
-            }
-        }
+/// 目录信息 → 模型表定义。
+fn to_table_meta(info: catalog::TableInfo) -> TableMeta {
+    TableMeta {
+        name: info.name,
+        table_name: String::new(),
+        description: info.description,
+        conn_name: None,
+        columns: info
+            .columns
+            .into_iter()
+            .map(|col| ColumnMeta {
+                name: col.name,
+                column_name: None,
+                data_type: col.data_type,
+                raw_type: (!col.raw_type.is_empty()).then_some(col.raw_type),
+                length: col.length,
+                precision: col.precision,
+                scale: col.scale,
+                identity: col.identity,
+                primary_key: col.primary_key,
+                master: false,
+                nullable: col.nullable,
+                default_value: col.default_value,
+                description: col.description,
+                enum_type: None,
+                data_scale: None,
+                map: None,
+                show_in: None,
+                model: None,
+            })
+            .collect(),
+        indexes: info
+            .indexes
+            .into_iter()
+            .map(|idx| IndexMeta {
+                name: Some(idx.name),
+                columns: idx.columns,
+                unique: idx.unique,
+            })
+            .collect(),
     }
 }
 
-/// 拆分类型与括号参数：`nvarchar(50)` → `("nvarchar", [50])`。
-fn split_type_params(text: &str) -> (&str, Vec<i32>) {
-    let Some(open) = text.find('(') else {
-        return (text, Vec::new());
-    };
-    let close = text.rfind(')').unwrap_or(text.len());
-    let base = text[..open].trim();
-    let args = text[open + 1..close]
-        .split(',')
-        .filter_map(|part| part.trim().parse::<i32>().ok())
-        .collect();
-    (base, args)
-}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::map_sqlite_type;
     use crate::dal::Dal;
     use crate::types::DataType;
 
@@ -250,6 +147,7 @@ mod tests {
         <Column Name="When" DataType="DateTime" />
         <Column Name="Data" DataType="Binary" Nullable="True" />
       </Columns>
+      <Indexes><Index Columns="Title" Unique="True" /></Indexes>
     </Table></Tables></EntityModel>"#;
 
     #[test]
@@ -299,6 +197,11 @@ mod tests {
         assert_eq!(table.effective_table_name(), "DH_Reverse");
         assert_eq!(table.columns.len(), source.tables[0].columns.len());
 
+        // 索引反向（含唯一标记与列序）
+        assert_eq!(table.indexes.len(), 1);
+        assert!(table.indexes[0].unique);
+        assert_eq!(table.indexes[0].columns, vec!["Title"]);
+
         // 逐列核对：类型 / 长度 / 主键 / 自增 / 可空
         for src in &source.tables[0].columns {
             let col = table
@@ -342,13 +245,10 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_for_non_sqlite() {
-        // 连接串只是构造 Dal（不真正连接其它库即可验证分支）
-        let dal = Dal::open("Server=127.0.0.1;Database=x;Uid=u;Pwd=p;provider=mysql").unwrap();
+    fn unsupported_for_uncovered_db() {
+        // 连接串只是构造 Dal（不真正连接数据库即可验证分支）
+        let dal = Dal::open("Server=127.0.0.1;Port=27017;Database=x;provider=mongodb").unwrap();
         let err = dal.read_model().unwrap_err();
-        assert!(
-            err.to_string().contains("反向工程当前已支持 SQLite"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("反向工程不支持"), "{err}");
     }
 }
