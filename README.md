@@ -56,7 +56,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`） |
 
-测试：**234 项全部通过**（库单测 207 + 集成 17 + 文档测试 10；`--features duckdb` 全量 241 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 235 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 234 项（rustls TLS 后端）；
+测试：**237 项全部通过**（库单测 210 + 集成 17 + 文档测试 10；`--features duckdb` 全量 244 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 238 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 237 项（rustls TLS 后端）；
 MySQL / PostgreSQL / SQL Server / Oracle / network 端到端用例在有真实库/服务时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -418,8 +418,8 @@ Pek.RCode/
 8. **基础库下沉** ✅ 时间文本格式/解析、MD5 摘要、文本文件读写（BOM 兼容）等基础方法下沉到 **DH.RustBase**（crate `dhrust` 0.1.4）；Pek.RCode 与 Pek.RRedis 均已 path 依赖复用（不再各自内联实现）
 9. **远程服务协议互通** ✅ `/Db/Query` 采用 NewLife **DbTable v3 二进制**（`dbtable` 模块：7 位压缩整数、大端浮点、Decimal 四元组、DateTime 刻度、`System.Byte[]`/`Guid`）；`DbService::query_packet` 输出报文、`DbClient::query_rowset` 自动识别二进制（C# `DbServer`）与 JSON（Rust 宿主）应答；黄金样本由**真实 C# NewLife.Core** 生成，编码**逐字节一致**、双向互读验证通过
 10. **MSPageSplit（可选能力）** ✅ `PageStyle::RowNumber`（`Query::page_style`）：SQL Server 2005/2008 的 `ROW_NUMBER()` 双层分页（对齐 `MSPageSplit.RowNumber`，含无排序兜底）；DH.NCode 现行默认仍为 2012+ `OFFSET..FETCH`，Rust 默认行为与其保持一致
-11. **`provider=network` 远程驱动** ✅ `network` 模块（对齐 `Database/Network.cs`：`Server`/`Database`/`Password` → `DbClient`，`Dal::open` 登录探明远端类型后委托其格式化/分页）；SQL 转发占位符改写为远端命名式（`@p0`/`:p0`/`?p0`，与 C# `FormatParameterName`/`ConvertParameters` 一致）、插入走远端 `Db/InsertAndGetIdentity`、`sync_schema` 不建表（对齐 `NetworkMetaData` 空实现）、事务明确拒绝；另附 `examples/dbserver` 参考宿主（Rust ↔ Rust 全链路实机验证通过，C# `DbServer` 亦可作为服务端）
-12. **`DAL_Backup`（备份/恢复/同步）** ✅ `backup` 模块：单表备份到 DbTable v3 文件（`.gz` 自动 GZip）、多表 zip 包（`{连接名}.xml` 模型 + `{实体名}.table`）、`restore`/`restore_all`（表名可从包内推导、`set_schema` 自动建表）、跨库 `sync_table`/`sync_all`；表头列名为实体属性名、行数上限 i32、NULL 折叠为类型默认值，均与 C# 一致，文件双向互认
+11. **`provider=network` 远程驱动** ✅ `network` 模块（对齐 `Database/Network.cs`：`Server`/`Database`/`Password` → `DbClient`，`Dal::open` 登录探明远端类型后委托其格式化/分页）；SQL 转发占位符改写为远端命名式（`@p0`/`:p0`/`?p0`，与 C# `FormatParameterName`/`ConvertParameters` 一致）、插入走远端 `Db/InsertAndGetIdentity`、`sync_schema` 不建表（对齐 `NetworkMetaData` 空实现）、事务明确拒绝；另附 `examples/dbserver` 参考宿主；**实机联调**：Rust ↔ Rust 与 **Rust ↔ 真实 C# `DbServer`**（本机 DH.NCode net10.0 产物）全链路双向通过（登录探明类型含 NewLife 数字枚举、转发建表、实体增删改查、自增回写、分页、事务拒绝；NULL 参数内联与表探测已按实测校正）；已知 C# 侧 `ToPacket()` 对同列跨行混合存储类型（如 decimal 整数值行存 INTEGER）会抛 `InvalidCastException`（C# 源码注释已标注该问题）
+12. **`DAL_Backup`（备份/恢复/同步）** ✅ `backup` 模块：单表备份到 DbTable v3 文件（`.gz` 自动 GZip）、多表 zip 包（`{连接名}.xml` 模型 + `{实体名}.table`）、`restore`/`restore_all`（表名可从包内推导、`set_schema` 自动建表）、跨库 `sync_table`/`sync_all`；表头列名为实体属性名、行数上限 i32、NULL 折叠为类型默认值，均与 C# 一致；**C#↔Rust 双向实测互认**（C# `DbPackage` 导出 → Rust 恢复、Rust 备份 → C# 恢复，逐值核对一致，`RCODE_BACKUP_IMPORT`/`RCODE_BACKUP_EXPORT` 门控用例）
 13. **`DbMetaData` 在线库管理** ✅ `meta` 模块：建库/删库/存在性（文件库=文件操作；SQL 库按方言语句与元数据查询，逐一对齐各驱动覆写）、建表/删表（Firebird 连带序列）、列增/改/删、索引建/删、表列注释（`Comment On`/`Alter .. Comment`/`sp_addextendedproperty`）；无能力库返回 `false`（对齐 C# 空语句）
 14. **导航属性与行访问器** ✅ `navigation` 模块：`NavigationRegistry`（HasOne/HasMany，本地或进程级）+ `load_one`/`load_many` + `Entity::load`/`from_rows`（行集→实体，对应 `DataRowEntityAccessor.LoadData`）；C# 的 LINQ `Include`/反射注值在 Rust 无对应机制，以“注册表 + 显式装载”为对等能力面
 
