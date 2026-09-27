@@ -49,11 +49,14 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `reverse` | `DAL.GetTables`（反向工程） | ✅ 数据库 → `EntityModel` / `Model.xml`（**全部驱动**、含索引/唯一约束；`rcodegen --conn`） |
 | `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count`；`AuditExt` 审计字段访问；`#[derive(Entity)]` 宏 |
 | `db_service` | `Services`（`DbServer` / `DbClient`） | ✅ 远程服务层 + HTTP 客户端；`/Db/Query` 为 **DbTable v3 二进制**（与 C# `DbClient` 双向互通，黄金样本逐字节验证）；配套 `provider=network` 驱动与 `examples/dbserver` 参考宿主 |
+| `backup` | `DAL_Backup` / `DbPackage` | ✅ 单表备份/恢复（DbTable v3 文件、`.gz` 自动压缩）、多表 zip 包（`{连接名}.xml` + `{实体名}.table`）、跨库同步 `sync_table`/`sync_all`；**与 C# 备份文件互认** |
+| `meta` | `DbMetaData` / `IMetaData` | ✅ 建库/删库/存在性、建表/删表、列增/改/删、索引建/删、表列注释（按方言，语句逐一对齐各驱动覆写） |
+| `navigation` | `Navigation*` / `DataRowEntityAccessor` | ✅ 导航注册表（HasOne/HasMany）+ 装载 `load_one`/`load_many` + 行集→实体（`Entity::load`，同一能力面） |
 | `simulation` | `Common/DataSimulation` | ✅ 造数压测（随机整型/字符串/时间 + 分批事务 + TPS） |
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`） |
 
-测试：**220 项全部通过**（库单测 196 + 集成 17 + 文档测试 7；`--features duckdb` 全量 227 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 221 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 220 项（rustls TLS 后端）；
+测试：**234 项全部通过**（库单测 207 + 集成 17 + 文档测试 10；`--features duckdb` 全量 241 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 235 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 234 项（rustls TLS 后端）；
 MySQL / PostgreSQL / SQL Server / Oracle / network 端到端用例在有真实库/服务时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -379,6 +382,9 @@ Pek.RCode/
 │   ├── entity.rs     Entity trait（对象实体的 CRUD/查询默认实现）
 │   ├── db_service.rs 远程服务层 + HTTP 客户端（DbServer/DbClient，DbTable v3 二进制互通）
 │   ├── network.rs    provider=network 驱动（转发 SQL、登录探明远端类型、远端表结构探测）
+│   ├── backup.rs     数据备份/恢复/同步（DbPackage 文件格式，与 C# 互认）
+│   ├── meta.rs       在线库管理（建/删/存库，表/列/索引/注释 DDL）
+│   ├── navigation.rs 导航属性注册表与装载（HasOne/HasMany）
 │   ├── codegen.rs    Model.xml → Rust 对象实体
 │   ├── bin/
 │   │   └── rcodegen.rs   实体生成命令行工具
@@ -413,12 +419,13 @@ Pek.RCode/
 9. **远程服务协议互通** ✅ `/Db/Query` 采用 NewLife **DbTable v3 二进制**（`dbtable` 模块：7 位压缩整数、大端浮点、Decimal 四元组、DateTime 刻度、`System.Byte[]`/`Guid`）；`DbService::query_packet` 输出报文、`DbClient::query_rowset` 自动识别二进制（C# `DbServer`）与 JSON（Rust 宿主）应答；黄金样本由**真实 C# NewLife.Core** 生成，编码**逐字节一致**、双向互读验证通过
 10. **MSPageSplit（可选能力）** ✅ `PageStyle::RowNumber`（`Query::page_style`）：SQL Server 2005/2008 的 `ROW_NUMBER()` 双层分页（对齐 `MSPageSplit.RowNumber`，含无排序兜底）；DH.NCode 现行默认仍为 2012+ `OFFSET..FETCH`，Rust 默认行为与其保持一致
 11. **`provider=network` 远程驱动** ✅ `network` 模块（对齐 `Database/Network.cs`：`Server`/`Database`/`Password` → `DbClient`，`Dal::open` 登录探明远端类型后委托其格式化/分页）；SQL 转发占位符改写为远端命名式（`@p0`/`:p0`/`?p0`，与 C# `FormatParameterName`/`ConvertParameters` 一致）、插入走远端 `Db/InsertAndGetIdentity`、`sync_schema` 不建表（对齐 `NetworkMetaData` 空实现）、事务明确拒绝；另附 `examples/dbserver` 参考宿主（Rust ↔ Rust 全链路实机验证通过，C# `DbServer` 亦可作为服务端）
+12. **`DAL_Backup`（备份/恢复/同步）** ✅ `backup` 模块：单表备份到 DbTable v3 文件（`.gz` 自动 GZip）、多表 zip 包（`{连接名}.xml` 模型 + `{实体名}.table`）、`restore`/`restore_all`（表名可从包内推导、`set_schema` 自动建表）、跨库 `sync_table`/`sync_all`；表头列名为实体属性名、行数上限 i32、NULL 折叠为类型默认值，均与 C# 一致，文件双向互认
+13. **`DbMetaData` 在线库管理** ✅ `meta` 模块：建库/删库/存在性（文件库=文件操作；SQL 库按方言语句与元数据查询，逐一对齐各驱动覆写）、建表/删表（Firebird 连带序列）、列增/改/删、索引建/删、表列注释（`Comment On`/`Alter .. Comment`/`sp_addextendedproperty`）；无能力库返回 `false`（对齐 C# 空语句）
+14. **导航属性与行访问器** ✅ `navigation` 模块：`NavigationRegistry`（HasOne/HasMany，本地或进程级）+ `load_one`/`load_many` + `Entity::load`/`from_rows`（行集→实体，对应 `DataRowEntityAccessor.LoadData`）；C# 的 LINQ `Include`/反射注值在 Rust 无对应机制，以“注册表 + 显式装载”为对等能力面
 
-**完整性审计新发现（待补，2026-09-27 文件级抽查）**：
+**完整性审计缺口已全部落地（2026-09-27）**：
 
-1. **`DAL_Backup`**：表数据备份/恢复（文件）与跨库同步（`Sync`/`SyncAll`）尚未迁移
-2. **`DbMetaData` 在线库管理**：建库/删库/库列表等（`sync_schema` 仅覆盖结构同步）
-3. **实体导航属性**（`Navigation*`）与 `DataRowEntityAccessor`：现为链式/映射近似（语义近似，非对等）
+- 四项新发现（network 驱动 / DAL_Backup / DbMetaData / 导航与访问器）均已实现并测试（见上 11–14），无待补项
 
 **边界确认（非待办）**：
 
