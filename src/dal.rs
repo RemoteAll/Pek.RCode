@@ -171,8 +171,8 @@ impl Dal {
 
     /// 打开数据库会话。
     ///
-    /// 当前已实现 SQLite 驱动；其余数据库在连接时会返回“暂不支持”，
-    /// 但其方言 SQL 仍可由 [`crate::dialect`] 与 [`crate::sqlbuild`] 生成（用于脚本导出）。
+    /// 五种数据库均已接入驱动：
+    /// SQLite（内嵌）、MySQL、SQL Server、PostgreSQL（含 HighGo/KingBase/VastBase）、Oracle。
     pub fn open_session(&self) -> Result<Box<dyn SqlSession>> {
         match self.kind {
             DatabaseKind::Sqlite => {
@@ -181,10 +181,16 @@ impl Dal {
                 })?;
                 Ok(Box::new(SqliteSession::open(path)?))
             }
-            other => Err(Error::Unsupported(format!(
-                "{} 驱动尚未接入（已完成方言与 SQL 生成），当前版本请使用 SQLite",
-                other.name()
-            ))),
+            DatabaseKind::MySql => Ok(Box::new(crate::mysql::MysqlSession::open(&self.conn_str)?)),
+            DatabaseKind::SqlServer => {
+                Ok(Box::new(crate::mssql::MssqlSession::open(&self.conn_str)?))
+            }
+            DatabaseKind::PostgreSql => {
+                Ok(Box::new(crate::postgres::PostgresSession::open(&self.conn_str)?))
+            }
+            DatabaseKind::Oracle => {
+                Ok(Box::new(crate::oracle::OracleSession::open(&self.conn_str)?))
+            }
         }
     }
 
@@ -237,6 +243,36 @@ impl Dal {
                         .push((table_name.to_string(), col_name.to_string()));
                 }
             }
+
+            // Oracle：自增列依赖序列（SEQ_{表名}），补齐历史表缺失的序列
+            if self.kind == DatabaseKind::Oracle
+                && table.identity().is_some()
+            {
+                let sequence = crate::dialect::oracle_identity_sequence(table_name);
+                // 引号建表时序列名按原大小写存储，未引号时折为大写，两种都探测
+                let set = session.query(
+                    "SELECT COUNT(*) FROM USER_SEQUENCES WHERE SEQUENCE_NAME IN (:1, :2)",
+                    &[
+                        DbValue::Text(sequence.clone()),
+                        DbValue::Text(sequence.to_uppercase()),
+                    ],
+                )?;
+                let exists = set
+                    .first()
+                    .and_then(|row| row.get(0))
+                    .and_then(DbValue::as_i64)
+                    .unwrap_or(0)
+                    > 0;
+                if !exists {
+                    let sql = format!(
+                        "CREATE SEQUENCE {} START WITH 1 INCREMENT BY 1 CACHE 20",
+                        self.kind.quote(&sequence)
+                    );
+                    self.log_sql(&sql);
+                    session.execute(&sql, &[])?;
+                    report.created_sequences.push(sequence);
+                }
+            }
         }
 
         Ok(report)
@@ -250,12 +286,16 @@ pub struct SchemaReport {
     pub created_tables: Vec<String>,
     /// 补充的列（表名, 列名）
     pub added_columns: Vec<(String, String)>,
+    /// 补建的序列（Oracle 自增序列 SEQ_{表名}）
+    pub created_sequences: Vec<String>,
 }
 
 impl SchemaReport {
     /// 是否没有任何变更。
     pub fn is_empty(&self) -> bool {
-        self.created_tables.is_empty() && self.added_columns.is_empty()
+        self.created_tables.is_empty()
+            && self.added_columns.is_empty()
+            && self.created_sequences.is_empty()
     }
 }
 
@@ -281,6 +321,13 @@ impl fmt::Display for SchemaReport {
                 .collect();
             write!(f, "；补列：{}", list.join(", "))?;
         }
+        if !self.created_sequences.is_empty() {
+            write!(
+                f,
+                "；补建序列：{}",
+                self.created_sequences.join(", ")
+            )?;
+        }
         Ok(())
     }
 }
@@ -300,13 +347,34 @@ impl<'a> TableRef<'a> {
     }
 
     /// 插入一行，返回自增主键（无自增列时返回 0）。
+    ///
+    /// 自增回写策略按数据库区分：
+    /// - PostgreSQL 系：`INSERT ... RETURNING 列`（与 DH.NCode 的 `RETURNING *` 一致），直接回读
+    /// - Oracle：插入语句携带 `SEQ_{表名}.NEXTVAL`（由 [`sqlbuild::insert_sql`] 注入），随后读取序列 CURRVAL
+    /// - 其余：插入后通过会话读取自增函数（`last_insert_rowid()` / `LAST_INSERT_ID()` / `SCOPE_IDENTITY()`）
     pub fn insert(&self, session: &mut dyn SqlSession, fields: &[(&str, DbValue)]) -> Result<i64> {
-        let (sql, params) = sqlbuild::insert_sql(self.dal.kind, self.table, fields)?;
+        let identity = self.table.identity();
+        let (mut sql, params) = sqlbuild::insert_sql(self.dal.kind, self.table, fields)?;
+
+        if let Some(id_col) = identity
+            && self.dal.kind == DatabaseKind::PostgreSql
+        {
+            sql.push_str(" RETURNING ");
+            sql.push_str(&self.dal.kind.quote(self.table.effective_column_name(id_col)));
+            self.dal.log_sql(&sql);
+            let set = session.query(&sql, &params)?;
+            return Ok(set
+                .first()
+                .and_then(|row| row.get(0))
+                .and_then(DbValue::as_i64)
+                .unwrap_or(0));
+        }
+
         self.dal.log_sql(&sql);
         session.execute(&sql, &params)?;
 
-        if self.table.identity().is_some() {
-            Ok(session.last_identity()?)
+        if identity.is_some() {
+            Ok(session.last_identity_of(self.table.effective_table_name())?)
         } else {
             Ok(0)
         }

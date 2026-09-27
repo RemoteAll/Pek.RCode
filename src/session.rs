@@ -1,8 +1,9 @@
 //! SQL 会话抽象：对应 DH.NCode 的 `IDbSession`。
 //!
 //! 上层 ORM（建表迁移、增删改查）只依赖本 trait，具体数据库由各驱动实现：
-//! - 已实现：SQLite（[`crate::sqlite::SqliteSession`]）
-//! - 规划中：MySQL / SQL Server / PostgreSQL（方言已就绪，接入驱动即可）
+//! - 已实现：SQLite（[`crate::sqlite::SqliteSession`]）、MySQL（[`crate::mysql::MysqlSession`]）、
+//!   SQL Server（[`crate::mssql::MssqlSession`]）、PostgreSQL 系（[`crate::postgres::PostgresSession`]，
+//!   含 HighGo/KingBase/VastBase）、Oracle（[`crate::oracle::OracleSession`]）
 
 use std::sync::Arc;
 
@@ -139,6 +140,14 @@ pub trait SqlSession {
 
     /// 最近一次自增主键值（对应 XCode 插入后的 Identity 回写）。
     fn last_identity(&mut self) -> Result<i64>;
+
+    /// 最近一次自增主键值（带表名）。
+    ///
+    /// Oracle 需要由表名推导序列（`SEQ_{表名}` 的 CURRVAL），其余数据库忽略 `table` 参数。
+    fn last_identity_of(&mut self, table: &str) -> Result<i64> {
+        let _ = table;
+        self.last_identity()
+    }
 
     /// 表是否存在。
     fn table_exists(&mut self, table: &str) -> Result<bool>;

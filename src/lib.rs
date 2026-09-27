@@ -23,12 +23,13 @@
 //! | 数据库 | 方言（SQL 生成） | 驱动（执行） |
 //! |--------|------------------|--------------|
 //! | SQLite | ✅ | ✅（rusqlite，内嵌） |
-//! | MySQL | ✅ | 规划中 |
-//! | SQL Server | ✅ | 规划中 |
-//! | PostgreSQL | ✅ | 规划中 |
-//! | Oracle | ✅（基础） | 规划中 |
+//! | MySQL | ✅ | ✅（mysql crate，纯 Rust；未启用 TLS，SslMode=None 可用） |
+//! | SQL Server | ✅ | ✅（tiberius，纯 Rust TDS；`Encrypt`/`TrustServerCertificate` 可配） |
+//! | PostgreSQL | ✅ | ✅（postgres crate；HighGo/KingBase/VastBase 同协议复用） |
+//! | Oracle | ✅ | ✅（oracle crate/OCI，运行时需 Instant Client；自增用序列 `SEQ_{表名}`） |
 //!
-//! 未接入驱动的数据库目前可用于：生成建表/查询脚本、离线校验模型、作为接入模板。
+//! DH.NCode 的其它数据库（Access/ClickHouse/DaMeng/DB2/DuckDB/Firebird/Hana/InfluxDB/IRIS/MongoDB/SqlCe/TDengine）
+//! 在路线图中：方言与连接串解析已就绪，就近可直接生成脚本，后续按需求接入驱动。
 //!
 //! ## 快速开始
 //!
@@ -67,6 +68,10 @@ pub mod dialect;
 pub mod entity;
 mod error;
 pub mod model;
+pub mod mssql;
+pub mod mysql;
+pub mod oracle;
+pub mod postgres;
 pub mod query;
 pub mod session;
 pub mod sqlbuild;

@@ -3,7 +3,7 @@
 //! 对应 DH.NCode 的 `InsertBuilder` / `SelectBuilder`：语句完全由参数绑定生成，
 //! 列名一律经方言引用，杜绝拼接注入。
 
-use crate::dialect::DatabaseKind;
+use crate::dialect::{DatabaseKind, oracle_identity_sequence};
 use crate::error::{Error, Result};
 use crate::model::TableMeta;
 use crate::query::{OrderBy, Query, Where};
@@ -30,14 +30,29 @@ pub fn insert_sql(
         )));
     }
 
-    let mut columns = Vec::with_capacity(fields.len());
-    let mut marks = Vec::with_capacity(fields.len());
+    let mut columns = Vec::with_capacity(fields.len() + 1);
+    let mut marks = Vec::with_capacity(fields.len() + 1);
     let mut params = Vec::with_capacity(fields.len());
 
     for (index, (field, value)) in fields.iter().enumerate() {
         columns.push(kind.quote(column_name(table, field)?));
         marks.push(kind.placeholder(index));
         params.push(value.clone());
+    }
+
+    // Oracle 自增列没有内联自增属性（与 XCode 一致，使用序列 SEQ_{表名}）：
+    // 未显式提供自增列时补上序列表达式，插入后由驱动读取 CURRVAL 回写
+    if kind == DatabaseKind::Oracle
+        && let Some(identity) = table.identity()
+        && !fields
+            .iter()
+            .any(|(field, _)| field.eq_ignore_ascii_case(&identity.name))
+    {
+        columns.push(kind.quote(table.effective_column_name(identity)));
+        marks.push(format!(
+            "{}.NEXTVAL",
+            kind.quote(&oracle_identity_sequence(table.effective_table_name()))
+        ));
     }
 
     let sql = format!(
@@ -259,6 +274,31 @@ mod tests {
 
         // 未知列应尽早报错
         assert!(insert_sql(DatabaseKind::Sqlite, &t, &[("Nope", 1.into())]).is_err());
+    }
+
+    #[test]
+    fn oracle_insert_injects_sequence_expression() {
+        let t = table();
+        // 自增列未显式提供时，自动补上序列表达式（XCode 约定 SEQ_{表名}，不占绑定参数）
+        let (sql, params) = insert_sql(DatabaseKind::Oracle, &t, &[("Code", "A1".into())]).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"DH_Order\" (\"Code\", \"Id\") VALUES (:1, \"SEQ_DH_Order\".NEXTVAL)"
+        );
+        assert_eq!(params.len(), 1);
+
+        // 显式提供自增列时不注入（保持调用方语义）
+        let (sql, params) = insert_sql(
+            DatabaseKind::Oracle,
+            &t,
+            &[("Id", 9.into()), ("Code", "A1".into())],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"DH_Order\" (\"Id\", \"Code\") VALUES (:1, :2)"
+        );
+        assert_eq!(params.len(), 2);
     }
 
     #[test]

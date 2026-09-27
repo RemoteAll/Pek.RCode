@@ -26,7 +26,10 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `dialect` | 各 `DbBase` 子类（SQLite.cs / MySql.cs / …） | ✅ 五种库的类型映射 / DDL / 分页 / 自增 / 标识符与占位符 |
 | `session` | `IDbSession` | ✅ 抽象就绪，驱动可插拔 |
 | `sqlite` | `SQLite.cs` | ✅ **可执行**（rusqlite 内嵌，无外部依赖） |
-| MySQL / SQL Server / PostgreSQL / Oracle | 同名驱动 | 🚧 方言已就绪，**驱动规划中**（可用于生成脚本） |
+| `mysql` | `MySql.cs` | ✅ **可执行**（mysql crate，纯 Rust；连接串与 XCode 一致；未启用 TLS） |
+| `mssql` | `SqlServer.cs` | ✅ **可执行**（tiberius，纯 Rust TDS；同步接口内部维护专用 tokio 运行时） |
+| `postgres` | `PostgreSQL.cs` | ✅ **可执行**（postgres crate；HighGo/金仓/VastBase 同协议直接复用） |
+| `oracle` | `Oracle.cs` | ✅ **可执行**（oracle crate / OCI；运行时需 Instant Client；自增用序列 `SEQ_{表名}`） |
 | `sqlbuild` | `InsertBuilder` / `SelectBuilder` | ✅ INSERT/UPDATE/DELETE/SELECT/COUNT |
 | `query` | `WhereExpression` / `PageParameter` | ✅ 链式条件 + 分页/取前 N |
 | `dal` | `DAL` / 迁移 Migration | ✅ 连接串解析、结构同步（建表/补列）、实体表操作 |
@@ -34,9 +37,23 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`） |
 
-测试：**53 项全部通过**，其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归，
+测试：**78 项全部通过**（其中 MySQL / PostgreSQL / SQL Server / Oracle 端到端用例在有真实库时自动启用），
+其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
+**对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
+（远端库侧用与 `rcodegen` 输出同构的实体，覆盖 insert/save 新增与更新双分支/find/query/count/delete/事务）、
 以及用真实表（JiLiYu、VerifyCode）生成实体后的编译与运行验证；
 另可用环境变量 `RCODE_MODEL` 对完整生产 `Model.xml` 跑全量回归（见下文）。
+
+### 与 DH.NCode 支持范围的对照
+
+DH.NCode 内置的数据库驱动较全，Pek.RCode 按“线协议可分阶段接入”的思路推进：
+
+| 状态 | 数据库 |
+|------|--------|
+| ✅ 已接入驱动 | SQLite、MySQL/MariaDB、SQL Server、PostgreSQL（含 HighGo/瀚高、KingBase/金仓、VastBase/海量）、Oracle |
+| 🚧 路线图 | Access、ClickHouse、DaMeng/达梦、DB2、DuckDB、Firebird、Hana、InfluxDB、IRIS、MongoDB、SqlCe、TDengine、NovaDb |
+
+各库的方言（类型映射/DDL/分页）与连接串解析已就绪；未接入的 `provider` 会返回可操作的提示信息。
 
 ---
 
@@ -48,8 +65,10 @@ use pek_rcode::{Dal, EntityModel, Query, Where};
 // 1) 复用 C# 项目中的 Model.xml（路径指向实体项目里的 Entity/Model.xml 即可）
 let model = EntityModel::load(std::path::Path::new("Model.xml"))?;
 
-// 2) 打开数据库：连接串与 XCode 格式一致
+// 2) 打开数据库：连接串与 XCode 格式一致（SQLite / MySQL 均可）
 let dal = Dal::open_with_model("Data Source=..\\..\\Data\\DG.db;Provider=SQLite;ShowSql=false", model)?;
+// 或 MySQL：
+// let dal = Dal::open_with_model("Server=localhost;Port=3306;Database=mes;Uid=root;Pwd=***;provider=mysql;SslMode=None", model)?;
 
 // 3) 同步结构：只做增量（建表 / 补列），不改不删
 let report = dal.sync_schema()?;
@@ -79,7 +98,7 @@ println!("共 {total} 条，本页 {} 条", page.len());
 
 ```powershell
 cd G:\Code\Pek.Rust\Pek.RCode
-cargo test          # 53 项测试（固件回归 + 对象实体端到端）
+cargo test          # 78 项测试（固件回归 + 对象实体端到端）
 cargo clippy        # 零警告
 ```
 
@@ -93,6 +112,55 @@ $env:RCODE_MODEL = "<你的项目>\Entity\Model.xml"
 cargo test full_model      # 解析全量模型 + 全部表同步到临时 SQLite 库验证
 ```
 
+### MySQL 使用与集成测试
+
+连接串与 XCode 完全兼容（键名：`Server`/`Port`/`Database`/`Uid`/`Pwd`/`SslMode`/`Charset`/`Timeout`），
+驱动基于纯 Rust 的 `mysql` crate：
+
+```rust
+let dal = Dal::open_with_model(
+    "Server=10.0.0.8;Port=3306;Database=mes;Uid=app;Pwd=***;provider=mysql;SslMode=None", model)?;
+dal.sync_schema()?;   // 增量建表/补列（information_schema 探测）
+```
+
+- TLS：当前版本固定不启用；`SslMode=Required/VerifyCA/VerifyFull` 会给出明确错误（后续提供 rustls 支持）
+- MySQL 方言对齐 DH.NCode：布尔 `TINYINT`、字段说明生成列 `COMMENT`、`DECIMAL` 的 Length 覆盖 Precision
+- 真实库端到端测试（默认自动跳过；只操作 `rcode_test_` 前缀的专用表，结束即清理）：
+
+```powershell
+$env:RCODE_MYSQL = "Server=127.0.0.1;Port=3306;Database=rcode_test;Uid=root;Pwd=root;provider=mysql;SslMode=None"
+cargo test --test mysql_e2e
+```
+
+### PostgreSQL / SQL Server / Oracle 使用与集成测试
+
+三个驱动的连接串同样与 XCode 兼容，按 `provider` 分发（`highgo`/`kingbase`/`vastbase` 自动走 PostgreSQL 驱动）：
+
+```rust
+// PostgreSQL（也用于瀚高/金仓/海量）
+let dal = Dal::open_with_model(
+    "Server=10.0.0.9;Port=5432;Database=mes;Uid=app;Pwd=***;provider=postgresql", model)?;
+// SQL Server（缺省 Encrypt=Required + TrustServerCertificate=true，可直连自签证书实例）
+let dal = Dal::open_with_model(
+    "Server=10.0.0.5;Port=1433;Database=mes;Uid=sa;Pwd=***;provider=sqlserver;Encrypt=false", model)?;
+// Oracle（EZConnect 或 TNS 别名；需 Instant Client）
+let dal = Dal::open_with_model(
+    "Server=10.0.0.6;Port=1521;ServiceName=xepdb1;Uid=dbuser;Pwd=***;provider=oracle", model)?;
+```
+
+- 自增回写：PostgreSQL 用 `INSERT ... RETURNING`（对齐 DH.NCode 的 `RETURNING *`）；SQL Server 用 `SCOPE_IDENTITY()`；
+  Oracle 用序列 `SEQ_{表名}`（建表/同步结构时自动创建，插入时写 `NEXTVAL`、随后读 `CURRVAL`）
+- 事务：PostgreSQL/MySQL/SQL Server 显式 `BEGIN`；Oracle 隐式事务（`begin()` 为空操作）
+- 真实库端到端测试（各库默认自动跳过；只创建/删除 `rcode_test_` 前缀的专用对象）：
+
+```powershell
+$env:RCODE_POSTGRES = "Server=127.0.0.1;Port=5432;Database=rcode_test;Uid=postgres;Pwd=***;provider=postgresql"
+$env:RCODE_MSSQL    = "Server=127.0.0.1;Port=1433;Database=rcode_test;Uid=sa;Pwd=***;provider=sqlserver;Encrypt=false"
+$env:RCODE_ORACLE   = "Server=127.0.0.1;Port=1521;ServiceName=xepdb1;Uid=rcode;Pwd=***;provider=oracle"
+cargo test --test remote_e2e
+```
+
+> TLS：当前版本三个驱动均未内置 TLS（PG/Oracle 为明文；SQL Server 可自选 `Encrypt`，默认加密+信任自签证书）。
 > 依赖镜像：工程内 `.cargo/config.toml` 已配置 rsproxy。
 
 ### 实体生成工具（对应 C# 的 `xcode` 命令）
@@ -156,7 +224,7 @@ order.delete(&dal, session.as_mut())?;
 | String(50) | `nvarchar(50)` | `varchar(50)` | `nvarchar(50)` | `varchar(50)` | `varchar2(50)` |
 | String(不限) | `text` | `longtext` | `nvarchar(max)` | `text` | `clob` |
 | DateTime | `datetime` | `datetime` | `datetime` | `timestamp` | `timestamp` |
-| Boolean | `bit` | `bit` | `bit` | `boolean` | `number(1)` |
+| Boolean | `bit` | `TINYINT` | `bit` | `boolean` | `number(1)` |
 
 其余方言差异（分页 `LIMIT/OFFSET` vs `OFFSET..FETCH`、占位符 `?` / `@pN` / `$N` / `:pN`、
 标识符引用 `` ` `` / `[]` / `""`、自增 `AUTO_INCREMENT` / `IDENTITY(1,1)` / `GENERATED BY DEFAULT AS IDENTITY`）
@@ -185,6 +253,7 @@ Pek.RCode/
 │   ├── dialect.rs    多数据库方言（类型/DDL/分页/自增/引用）
 │   ├── session.rs    SqlSession 抽象与结果集
 │   ├── sqlite.rs     SQLite 驱动
+│   ├── mysql.rs      MySQL 驱动（XCode 连接串 / information_schema / LAST_INSERT_ID）
 │   ├── sqlbuild.rs   INSERT/UPDATE/DELETE/SELECT/COUNT 组装
 │   ├── query.rs      条件与查询描述
 │   ├── dal.rs        连接串、Dal、结构同步、实体表操作
@@ -203,7 +272,7 @@ Pek.RCode/
 
 ## 六、路线图（按优先级）
 
-1. **MySQL 驱动**（本项目生产库是阿里云 RDS MySQL）——计划用 `mysql_async` 或 `sqlx`，含 TLS 选项与连接池
+1. ~~MySQL 驱动~~ ✅ 已完成（mysql crate，纯 Rust；待办：rustls TLS 选项与连接池）
 2. **SQL Server / PostgreSQL 驱动**（tiberius / tokio-postgres 或 sqlx），复用现有方言层
 3. **异步门面**：为 tokio 应用提供 `AsyncDal`（连接池 + 全链路 async），与扫码枪网关等 tokio 服务对接
 4. **反向工程**：数据库 → `Model.xml`（对应 XCode `GetTables`），支持历史库生成模型
