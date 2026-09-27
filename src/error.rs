@@ -26,6 +26,10 @@ pub enum Error {
     /// 功能尚不支持（例如驱动未实现）
     #[error("暂不支持：{0}")]
     Unsupported(String),
+
+    /// 参数错误（对应 ArgumentException 系列）
+    #[error("参数错误：{0}")]
+    Argument(String),
 }
 
 impl From<rusqlite::Error> for Error {

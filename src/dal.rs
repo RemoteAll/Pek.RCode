@@ -5,8 +5,13 @@
 //! - 按模型同步数据库结构（建表 / 补列，对应 XCode 的反向工程与迁移）
 //! - 提供实体表的增删改查（与 `SqlSession` 组合使用，会话可复用可独立）
 
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    sync::{Arc, Mutex},
+};
 
+use crate::cache::{EntityCache, SingleCache};
 use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
 use crate::model::{EntityModel, TableMeta};
@@ -21,8 +26,8 @@ use crate::value::DbValue;
 pub struct ConnectionString {
     /// 原始连接串
     raw: String,
-    /// 小写键 → 值
-    items: BTreeMap<String, String>,
+    /// 小写键 → (原键, 值)
+    items: BTreeMap<String, (String, String)>,
 }
 
 impl ConnectionString {
@@ -37,7 +42,11 @@ impl ConnectionString {
             if let Some((key, value)) = part.split_once('=')
                 && !key.trim().is_empty()
             {
-                items.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+                let key = key.trim();
+                items.insert(
+                    key.to_ascii_lowercase(),
+                    (key.to_string(), value.trim().to_string()),
+                );
             }
         }
         Self {
@@ -51,10 +60,58 @@ impl ConnectionString {
         &self.raw
     }
 
+    /// 设置项（插入或覆盖，键大小写不敏感，对齐 `ConnectionStringBuilder` 索引器）。
+    /// <param name="key">键</param>
+    /// <param name="value">值</param>
+    pub fn set(&mut self, key: &str, value: &str) {
+        self.items.insert(
+            key.to_ascii_lowercase(),
+            (key.to_string(), value.to_string()),
+        );
+    }
+
+    /// 尝试添加项，已存在则失败（对齐 `TryAdd`）。
+    /// <param name="key">键</param>
+    /// <param name="value">值</param>
+    /// <returns>是否添加成功</returns>
+    pub fn try_add(&mut self, key: &str, value: &str) -> bool {
+        if self.items.contains_key(&key.to_ascii_lowercase()) {
+            return false;
+        }
+        self.set(key, value);
+        true
+    }
+
+    /// 删除项（对齐 `Remove`）。
+    /// <param name="key">键</param>
+    /// <returns>是否存在并删除</returns>
+    pub fn remove(&mut self, key: &str) -> bool {
+        self.items.remove(&key.to_ascii_lowercase()).is_some()
+    }
+
+    /// 获取并删除项（对齐 `TryGetAndRemove`）。
+    /// <param name="key">键</param>
+    /// <returns>项的值（含空值时也返回，以对齐 C# 的 out 语义）；不存在时为 None</returns>
+    pub fn try_get_and_remove(&mut self, key: &str) -> Option<String> {
+        self.items
+            .remove(&key.to_ascii_lowercase())
+            .map(|(_, value)| value)
+    }
+
+    /// 重新组装连接串（小写键排序、保留键的原始大小写；对齐 `ConnectionString` 属性）。
+    /// <returns>连接串文本</returns>
+    pub fn to_connection_string(&self) -> String {
+        self.items
+            .values()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
     /// 取值（忽略键大小写）。
     pub fn get(&self, key: &str) -> Option<&str> {
         match self.items.get(&key.to_ascii_lowercase()) {
-            Some(v) if !v.is_empty() => Some(v),
+            Some((_, v)) if !v.is_empty() => Some(v),
             _ => None,
         }
     }
@@ -114,6 +171,10 @@ pub struct Dal {
     model: Option<Arc<EntityModel>>,
     /// 是否输出执行的 SQL
     show_sql: bool,
+    /// 实体缓存注册表（按表共享，对应 DH.NCode 的 `Meta.Cache`）
+    pub(crate) entity_caches: Mutex<HashMap<String, Arc<EntityCache>>>,
+    /// 单对象缓存注册表（按表共享，对应 DH.NCode 的 `Meta.SingleCache`）
+    pub(crate) single_caches: Mutex<HashMap<String, Arc<SingleCache>>>,
 }
 
 impl Dal {
@@ -127,6 +188,8 @@ impl Dal {
             kind,
             model: None,
             show_sql,
+            entity_caches: Mutex::new(HashMap::new()),
+            single_caches: Mutex::new(HashMap::new()),
         })
     }
 
@@ -191,6 +254,43 @@ impl Dal {
             DatabaseKind::Oracle => {
                 Ok(Box::new(crate::oracle::OracleSession::open(&self.conn_str)?))
             }
+            DatabaseKind::DuckDb => {
+                #[cfg(feature = "duckdb")]
+                {
+                    Ok(Box::new(crate::duckdb::DuckDbSession::open(&self.conn_str)?))
+                }
+                #[cfg(not(feature = "duckdb"))]
+                {
+                    Err(Error::Unsupported(
+                        "DuckDB 驱动未随本次构建编译：请使用 `cargo build --features duckdb` 启用\
+                         （内嵌 DuckDB 需要 CMake 构建，见 README）"
+                            .into(),
+                    ))
+                }
+            }
+            DatabaseKind::Firebird => {
+                Ok(Box::new(crate::firebird::FirebirdSession::open(&self.conn_str)?))
+            }
+            DatabaseKind::ClickHouse => {
+                Ok(Box::new(crate::clickhouse::ClickHouseSession::open(&self.conn_str)?))
+            }
+            DatabaseKind::TDengine => {
+                Ok(Box::new(crate::tdengine::TDengineSession::open(&self.conn_str)?))
+            }
+            DatabaseKind::InfluxDb => {
+                Ok(Box::new(crate::influxdb::InfluxDbSession::open(&self.conn_str)?))
+            }
+            DatabaseKind::Hana => Ok(Box::new(crate::hana::HanaSession::open(&self.conn_str)?)),
+            DatabaseKind::MongoDb => {
+                Ok(Box::new(crate::mongodb::MongoSession::open(&self.conn_str)?))
+            }
+            // ODBC 桥：DB2 / 达梦 / IRIS / Access 共用一套通用驱动
+            DatabaseKind::Db2 | DatabaseKind::DaMeng | DatabaseKind::Iris | DatabaseKind::Access => {
+                Ok(Box::new(crate::odbc::OdbcSession::open(
+                    self.kind,
+                    &self.conn_str,
+                )?))
+            }
         }
     }
 
@@ -218,6 +318,11 @@ impl Dal {
         let mut session = self.open_session()?;
         let mut report = SchemaReport::default();
 
+        // 时序/文档库无建表 DDL（measurement/collection 写入时自动创建）
+        if !self.kind.supports_ddl() {
+            return Ok(report);
+        }
+
         for table in &model.tables {
             let table_name = table.effective_table_name();
 
@@ -244,38 +349,79 @@ impl Dal {
                 }
             }
 
-            // Oracle：自增列依赖序列（SEQ_{表名}），补齐历史表缺失的序列
-            if self.kind == DatabaseKind::Oracle
-                && table.identity().is_some()
+            // 序列型自增（Oracle/DB2/Firebird/DuckDB）：补齐历史表缺失的序列
+            if table.identity().is_some()
+                && matches!(
+                    self.kind,
+                    DatabaseKind::Oracle
+                        | DatabaseKind::Db2
+                        | DatabaseKind::Firebird
+                        | DatabaseKind::DuckDb
+                )
             {
-                let sequence = crate::dialect::oracle_identity_sequence(table_name);
-                // 引号建表时序列名按原大小写存储，未引号时折为大写，两种都探测
-                let set = session.query(
-                    "SELECT COUNT(*) FROM USER_SEQUENCES WHERE SEQUENCE_NAME IN (:1, :2)",
-                    &[
-                        DbValue::Text(sequence.clone()),
-                        DbValue::Text(sequence.to_uppercase()),
-                    ],
-                )?;
-                let exists = set
-                    .first()
-                    .and_then(|row| row.get(0))
-                    .and_then(DbValue::as_i64)
-                    .unwrap_or(0)
-                    > 0;
-                if !exists {
-                    let sql = format!(
-                        "CREATE SEQUENCE {} START WITH 1 INCREMENT BY 1 CACHE 20",
-                        self.kind.quote(&sequence)
-                    );
-                    self.log_sql(&sql);
-                    session.execute(&sql, &[])?;
-                    report.created_sequences.push(sequence);
-                }
+                self.ensure_identity_sequence(&mut *session, &mut report, table_name)?;
             }
         }
 
         Ok(report)
+    }
+
+    /// 补齐自增序列（XCode 约定 `SEQ_{表名}`）：不存在时创建。
+    ///
+    /// 不同数据库的序列目录不同（Oracle/DB2 的 `USER_SEQUENCES`、Firebird 的 `RDB$GENERATORS`、
+    /// DuckDB 的 `duckdb_sequences()`），统一探测两种存储大小写。
+    fn ensure_identity_sequence(
+        &self,
+        session: &mut dyn SqlSession,
+        report: &mut SchemaReport,
+        table_name: &str,
+    ) -> Result<()> {
+        let sequence = crate::dialect::oracle_identity_sequence(table_name);
+        let (probe, create) = match self.kind {
+            DatabaseKind::Oracle => (
+                "SELECT COUNT(*) FROM USER_SEQUENCES WHERE SEQUENCE_NAME IN (:1, :2)".to_string(),
+                format!(
+                    "CREATE SEQUENCE {} START WITH 1 INCREMENT BY 1 CACHE 20",
+                    self.kind.quote(&sequence)
+                ),
+            ),
+            DatabaseKind::Db2 => (
+                "SELECT COUNT(*) FROM USER_SEQUENCES WHERE SEQUENCE_NAME = ? OR SEQUENCE_NAME = ?"
+                    .to_string(),
+                format!("CREATE SEQUENCE {sequence} START WITH 1 INCREMENT BY 1"),
+            ),
+            DatabaseKind::Firebird => (
+                "SELECT COUNT(*) FROM RDB$GENERATORS WHERE RDB$GENERATOR_NAME = ? OR RDB$GENERATOR_NAME = ?"
+                    .to_string(),
+                format!("CREATE SEQUENCE {}", self.kind.quote(&sequence)),
+            ),
+            DatabaseKind::DuckDb => (
+                "SELECT COUNT(*) FROM duckdb_sequences() WHERE sequence_name = ? OR sequence_name = ?"
+                    .to_string(),
+                format!("CREATE SEQUENCE {}", self.kind.quote(&sequence)),
+            ),
+            _ => return Ok(()),
+        };
+
+        let set = session.query(
+            &probe,
+            &[
+                DbValue::Text(sequence.clone()),
+                DbValue::Text(sequence.to_uppercase()),
+            ],
+        )?;
+        let exists = set
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(DbValue::as_i64)
+            .unwrap_or(0)
+            > 0;
+        if !exists {
+            self.log_sql(&create);
+            session.execute(&create, &[])?;
+            report.created_sequences.push(sequence);
+        }
+        Ok(())
     }
 }
 
@@ -346,6 +492,11 @@ impl<'a> TableRef<'a> {
         self.table
     }
 
+    /// 所属数据访问层。
+    pub(crate) fn dal(&self) -> &Dal {
+        self.dal
+    }
+
     /// 插入一行，返回自增主键（无自增列时返回 0）。
     ///
     /// 自增回写策略按数据库区分：
@@ -354,15 +505,28 @@ impl<'a> TableRef<'a> {
     /// - 其余：插入后通过会话读取自增函数（`last_insert_rowid()` / `LAST_INSERT_ID()` / `SCOPE_IDENTITY()`）
     pub fn insert(&self, session: &mut dyn SqlSession, fields: &[(&str, DbValue)]) -> Result<i64> {
         let identity = self.table.identity();
-        let (mut sql, params) = sqlbuild::insert_sql(self.dal.kind, self.table, fields)?;
+        // 拦截器补全审计字段（对应实体拦截器 OnValid）
+        let values = crate::interceptor::prepare(
+            self.table,
+            crate::interceptor::DataMethod::Insert,
+            fields,
+        );
+        let fields: Vec<(&str, DbValue)> =
+            values.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let (mut sql, params) = sqlbuild::insert_sql(self.dal.kind, self.table, &fields)?;
 
         if let Some(id_col) = identity
-            && self.dal.kind == DatabaseKind::PostgreSql
+            && matches!(
+                self.dal.kind,
+                DatabaseKind::PostgreSql | DatabaseKind::DuckDb
+            )
         {
             sql.push_str(" RETURNING ");
             sql.push_str(&self.dal.kind.quote(self.table.effective_column_name(id_col)));
             self.dal.log_sql(&sql);
             let set = session.query(&sql, &params)?;
+            // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
+            self.dal.invalidate_cache(self.table.effective_table_name());
             return Ok(set
                 .first()
                 .and_then(|row| row.get(0))
@@ -373,11 +537,14 @@ impl<'a> TableRef<'a> {
         self.dal.log_sql(&sql);
         session.execute(&sql, &params)?;
 
-        if identity.is_some() {
-            Ok(session.last_identity_of(self.table.effective_table_name())?)
+        let id = if identity.is_some() {
+            session.last_identity_of(self.table.effective_table_name())?
         } else {
-            Ok(0)
-        }
+            0
+        };
+        // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
+        self.dal.invalidate_cache(self.table.effective_table_name());
+        Ok(id)
     }
 
     /// 按主键查找（主键值按 `TableMeta::primary_keys()` 顺序传入）。
@@ -398,22 +565,129 @@ impl<'a> TableRef<'a> {
         pk: &[DbValue],
     ) -> Result<u64> {
         let filter = self.pk_filter(pk)?;
-        let (sql, params) = sqlbuild::update_sql(self.dal.kind, self.table, sets, &filter)?;
+        // 拦截器刷新审计字段（对应实体拦截器 OnValid）
+        let values = crate::interceptor::prepare(
+            self.table,
+            crate::interceptor::DataMethod::Update,
+            sets,
+        );
+        let sets: Vec<(&str, DbValue)> =
+            values.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let (sql, params) = sqlbuild::update_sql(self.dal.kind, self.table, &sets, &filter)?;
         self.dal.log_sql(&sql);
-        session.execute(&sql, &params)
+        let affected = session.execute(&sql, &params)?;
+        if affected > 0 {
+            // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
+            self.dal.invalidate_cache(self.table.effective_table_name());
+        }
+        Ok(affected)
     }
 
     /// 按主键删除，返回受影响行数。
     pub fn delete_by_pk(&self, session: &mut dyn SqlSession, pk: &[DbValue]) -> Result<u64> {
         let filter = self.pk_filter(pk)?;
+        // 拦截器通知（对应 OnValid/Delete；默认拦截器不处理删除，保留扩展点）
+        let mut notify: Vec<(String, DbValue)> = Vec::new();
+        crate::interceptor::apply_registered(
+            self.table,
+            crate::interceptor::DataMethod::Delete,
+            &mut notify,
+        );
         let (sql, params) = sqlbuild::delete_sql(self.dal.kind, self.table, &filter);
         self.dal.log_sql(&sql);
-        session.execute(&sql, &params)
+        let affected = session.execute(&sql, &params)?;
+        if affected > 0 {
+            // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
+            self.dal.invalidate_cache(self.table.effective_table_name());
+        }
+        Ok(affected)
     }
 
     /// 主键是否存在。
     pub fn exists_by_pk(&self, session: &mut dyn SqlSession, pk: &[DbValue]) -> Result<bool> {
         Ok(self.find_by_pk(session, pk)?.is_some())
+    }
+
+    /// 按保存模式保存一行数据（对齐 C# `Entity.Save(SaveModes)` 的核心语义）。
+    ///
+    /// - [`crate::data_access::SaveModes::Insert`]：直接插入；
+    /// - [`crate::data_access::SaveModes::Upsert`]：主键已存在则按主键更新，否则插入；
+    /// - [`crate::data_access::SaveModes::InsertIgnore`]：主键已存在则忽略（返回 0）；
+    /// - [`crate::data_access::SaveModes::Replace`]：主键已存在则先删除再插入。
+    ///
+    /// 非插入模式下 `fields` 必须包含全部主键列；写入路径中的拦截器刷新与缓存失效由
+    /// [`TableRef::insert`]/[`TableRef::update_by_pk`]/[`TableRef::delete_by_pk`] 各自处理。
+    /// <param name="session">数据库会话</param>
+    /// <param name="fields">字段值集合</param>
+    /// <param name="mode">保存模式</param>
+    /// <returns>受影响行数</returns>
+    pub fn save(
+        &self,
+        session: &mut dyn SqlSession,
+        fields: &[(&str, DbValue)],
+        mode: crate::data_access::SaveModes,
+    ) -> Result<u64> {
+        use crate::data_access::SaveModes;
+        if mode == SaveModes::Insert {
+            self.insert(session, fields)?;
+            return Ok(1);
+        }
+
+        let pk = self.pk_values_from_fields(fields)?;
+        match mode {
+            SaveModes::Insert => unreachable!(),
+            SaveModes::Upsert => {
+                if self.exists_by_pk(session, &pk)? {
+                    self.update_by_pk(session, fields, &pk)
+                } else {
+                    self.insert(session, fields)?;
+                    Ok(1)
+                }
+            }
+            SaveModes::InsertIgnore => {
+                if self.exists_by_pk(session, &pk)? {
+                    Ok(0)
+                } else {
+                    self.insert(session, fields)?;
+                    Ok(1)
+                }
+            }
+            SaveModes::Replace => {
+                if self.exists_by_pk(session, &pk)? {
+                    self.delete_by_pk(session, &pk)?;
+                }
+                self.insert(session, fields)?;
+                Ok(1)
+            }
+        }
+    }
+
+    /// 从字段集中按主键顺序提取主键值（缺失时报错）。
+    fn pk_values_from_fields(&self, fields: &[(&str, DbValue)]) -> Result<Vec<DbValue>> {
+        let keys = self.table.primary_keys();
+        if keys.is_empty() {
+            return Err(Error::Model(format!(
+                "表 {} 没有主键，无法按主键保存",
+                self.table.name
+            )));
+        }
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys.iter() {
+            let value = fields
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&key.name))
+                .map(|(_, value)| value.clone());
+            match value {
+                Some(v) => values.push(v),
+                None => {
+                    return Err(Error::Argument(format!(
+                        "表 {} 缺少主键列 {} 的值",
+                        self.table.name, key.name
+                    )));
+                }
+            }
+        }
+        Ok(values)
     }
 
     /// 统计行数。
@@ -535,6 +809,7 @@ mod tests {
             data_scale: None,
             map: None,
             show_in: None,
+            model: None,
         });
         let dal2 = Dal::open_with_model(&conn, model).unwrap();
         let report = dal2.sync_schema().unwrap();
@@ -588,6 +863,114 @@ mod tests {
         // 删除
         assert_eq!(table.delete_by_pk(session.as_mut(), &[id.into()]).unwrap(), 1);
         assert_eq!(table.count(session.as_mut(), None).unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn table_save_modes_roundtrip() {
+        let dir = temp_dir("save");
+        let db = dir.join("test.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
+        dal.sync_schema().unwrap();
+        let table = dal.table("Order").unwrap();
+        let mut session = dal.open_session().unwrap();
+
+        use crate::data_access::SaveModes;
+
+        let created = chrono::NaiveDate::from_ymd_opt(2026, 9, 26)
+            .unwrap()
+            .and_hms_opt(18, 0, 0)
+            .unwrap();
+
+        // 先插入一行
+        let id = table
+            .insert(
+                session.as_mut(),
+                &[
+                    ("Code", "S-001".into()),
+                    ("Status", 1.into()),
+                    ("CreateTime", created.into()),
+                ],
+            )
+            .unwrap();
+        let pk = [DbValue::Int(id)];
+
+        // Upsert：存在则更新
+        let affected = table
+            .save(
+                session.as_mut(),
+                &[
+                    ("Id", id.into()),
+                    ("Code", "S-001".into()),
+                    ("Status", 2.into()),
+                    ("CreateTime", created.into()),
+                ],
+                SaveModes::Upsert,
+            )
+            .unwrap();
+        assert_eq!(affected, 1);
+        let row = table.find_by_pk(session.as_mut(), &pk).unwrap().unwrap();
+        assert_eq!(row.get_by_name("Status").unwrap().as_i64(), Some(2));
+
+        // InsertIgnore：存在则忽略
+        let affected = table
+            .save(
+                session.as_mut(),
+                &[
+                    ("Id", id.into()),
+                    ("Code", "S-001".into()),
+                    ("Status", 9.into()),
+                    ("CreateTime", created.into()),
+                ],
+                SaveModes::InsertIgnore,
+            )
+            .unwrap();
+        assert_eq!(affected, 0);
+        let row = table.find_by_pk(session.as_mut(), &pk).unwrap().unwrap();
+        assert_eq!(row.get_by_name("Status").unwrap().as_i64(), Some(2));
+
+        // Replace：删除后插入
+        let affected = table
+            .save(
+                session.as_mut(),
+                &[
+                    ("Id", id.into()),
+                    ("Code", "S-001".into()),
+                    ("Status", 7.into()),
+                    ("CreateTime", created.into()),
+                ],
+                SaveModes::Replace,
+            )
+            .unwrap();
+        assert_eq!(affected, 1);
+        let row = table.find_by_pk(session.as_mut(), &pk).unwrap().unwrap();
+        assert_eq!(row.get_by_name("Status").unwrap().as_i64(), Some(7));
+
+        // Upsert 主键不存在：插入
+        let affected = table
+            .save(
+                session.as_mut(),
+                &[
+                    ("Id", 999.into()),
+                    ("Code", "S-999".into()),
+                    ("Status", 3.into()),
+                    ("CreateTime", created.into()),
+                ],
+                SaveModes::Upsert,
+            )
+            .unwrap();
+        assert_eq!(affected, 1);
+        assert!(table.exists_by_pk(session.as_mut(), &[999.into()]).unwrap());
+
+        // 缺少主键列时报错
+        assert!(
+            table
+                .save(session.as_mut(), &[("Code", "X".into())], SaveModes::Upsert)
+                .is_err()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

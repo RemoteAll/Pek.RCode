@@ -30,6 +30,11 @@ pub fn insert_sql(
         )));
     }
 
+    // InfluxDB：直接生成行协议文本（非 SQL），写入由驱动 POST 到 /write
+    if kind == DatabaseKind::InfluxDb {
+        return Ok((influx_line_protocol(table, fields)?, Vec::new()));
+    }
+
     let mut columns = Vec::with_capacity(fields.len() + 1);
     let mut marks = Vec::with_capacity(fields.len() + 1);
     let mut params = Vec::with_capacity(fields.len());
@@ -40,19 +45,27 @@ pub fn insert_sql(
         params.push(value.clone());
     }
 
-    // Oracle 自增列没有内联自增属性（与 XCode 一致，使用序列 SEQ_{表名}）：
-    // 未显式提供自增列时补上序列表达式，插入后由驱动读取 CURRVAL 回写
-    if kind == DatabaseKind::Oracle
-        && let Some(identity) = table.identity()
+    // 序列型自增（Oracle/DB2/Firebird，XCode 约定 SEQ_{表名}）：
+    // 未显式提供自增列时补上序列表达式，插入后由驱动读取序列当前值回写
+    if matches!(
+        kind,
+        DatabaseKind::Oracle | DatabaseKind::Db2 | DatabaseKind::Firebird
+    ) && let Some(identity) = table.identity()
         && !fields
             .iter()
             .any(|(field, _)| field.eq_ignore_ascii_case(&identity.name))
     {
+        let sequence = oracle_identity_sequence(table.effective_table_name());
+        let expression = match kind {
+            // Oracle："SEQ_x".NEXTVAL（引号保持大小写）
+            DatabaseKind::Oracle => format!("{}.NEXTVAL", kind.quote(&sequence)),
+            // DB2（Oracle 兼容模式）：与 DH.NCode 一致使用未引号 SEQ_表名.nextval
+            DatabaseKind::Db2 => format!("{sequence}.nextval"),
+            // Firebird：next value for "SEQ_x"
+            _ => format!("next value for {}", kind.quote(&sequence)),
+        };
         columns.push(kind.quote(table.effective_column_name(identity)));
-        marks.push(format!(
-            "{}.NEXTVAL",
-            kind.quote(&oracle_identity_sequence(table.effective_table_name()))
-        ));
+        marks.push(expression);
     }
 
     let sql = format!(
@@ -62,6 +75,104 @@ pub fn insert_sql(
         marks.join(", ")
     );
     Ok((sql, params))
+}
+
+/// InfluxDB 行协议：`measurement,tag=.. field=.. timestamp`。
+///
+/// 与 DH.NCode 的批量写入规则一致：主键/主列（`PrimaryKey`/`Master`）作为 tag，
+/// 其余作为 field；名为 `Time`/`CreateTime`/`UpdateTime` 的时间列作为时间戳（纳秒）。
+fn influx_line_protocol(table: &TableMeta, fields: &[(&str, DbValue)]) -> Result<String> {
+    let time_column = fields.iter().find_map(|(name, value)| {
+        let is_time = name.eq_ignore_ascii_case("Time")
+            || name.eq_ignore_ascii_case("CreateTime")
+            || name.eq_ignore_ascii_case("UpdateTime");
+        (is_time && matches!(value, DbValue::DateTime(_))).then_some(*name)
+    });
+
+    let mut line = escape_influx(table.effective_table_name());
+    let mut values = String::new();
+    let mut timestamp: Option<i64> = None;
+
+    for (name, value) in fields {
+        if Some(*name) == time_column {
+            if let DbValue::DateTime(v) = value {
+                timestamp = v.and_utc().timestamp_nanos_opt();
+            }
+            continue;
+        }
+        let col = table
+            .column(name)
+            .ok_or_else(|| Error::Model(format!("表 {} 不存在列 {}", table.name, name)))?;
+        let key = escape_influx(table.effective_column_name(col));
+
+        if col.primary_key || col.master {
+            // tag：值不能为 NULL（NULL 时跳过该 tag）
+            if !value.is_null() {
+                line.push_str(&format!(",{key}={}", escape_influx(&influx_tag_value(value))));
+            }
+        } else {
+            if !values.is_empty() {
+                values.push(',');
+            }
+            values.push_str(&format!("{key}={}", influx_field_value(value)?));
+        }
+    }
+
+    if values.is_empty() {
+        return Err(Error::Model(format!(
+            "表 {} 的插入除了 tag/时间戳外至少需要一个 field（InfluxDB 行协议要求）",
+            table.name
+        )));
+    }
+
+    line.push(' ');
+    line.push_str(&values);
+    if let Some(ts) = timestamp {
+        line.push(' ');
+        line.push_str(&ts.to_string());
+    }
+    Ok(line)
+}
+
+/// tag 值（仅数值/布尔/文本有意义）。
+fn influx_tag_value(value: &DbValue) -> String {
+    match value {
+        DbValue::Bool(v) => v.to_string(),
+        other => other.to_text(),
+    }
+}
+
+/// field 值（字符串需引号包裹；整数带 `i` 后缀；DECIMAL 降级为浮点文本）。
+fn influx_field_value(value: &DbValue) -> Result<String> {
+    Ok(match value {
+        DbValue::Bool(v) => v.to_string(),
+        DbValue::Int(v) => format!("{v}i"),
+        DbValue::Float(v) => {
+            if v.is_finite() {
+                v.to_string()
+            } else {
+                return Err(Error::Model("InfluxDB 不接受 NaN/Inf 浮点值".into()));
+            }
+        }
+        DbValue::Decimal(v) => v.to_string(),
+        DbValue::Text(v) => format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")),
+        DbValue::DateTime(v) => v.and_utc().timestamp_nanos_opt().unwrap_or(0).to_string(),
+        DbValue::Blob(_) => {
+            return Err(Error::Model(
+                "InfluxDB 行协议不支持二进制 field（请改用文本/数值列）".into(),
+            ));
+        }
+        DbValue::Null => "NULL".into(),
+    })
+}
+
+/// 行协议标识符转义（逗号/空格/等号/反斜杠）。
+fn escape_influx(ident: &str) -> String {
+    ident
+        .replace('\\', "\\\\")
+        .replace(',', "\\,")
+        .replace(' ', "\\ ")
+        .replace('=', "\\=")
 }
 
 /// 组装 UPDATE 语句（`sets` 为 SET 子句，`filter` 为空时更新全部行，慎用）。

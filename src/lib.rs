@@ -16,6 +16,8 @@
 //! | `WhereExpression` | [`query::Where`] |
 //! | `PageParameter` | [`query::Query`]（`page` / `take`） |
 //! | 迁移 Migration（建表/加列） | [`Dal::sync_schema`](dal::Dal::sync_schema) |
+//! | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | [`cache::EntityCache`] / [`cache::SingleCache`]（写入自动失效） |
+//! | `DAL.GetTables`（反向工程） | [`reverse`]（[`Dal::read_model`](dal::Dal::read_model)） |
 //! | `xcode` 命令（XCodeTool 代码生成） | [`codegen`]（`generate` / `generate_all`） |
 //!
 //! ## 支持的数据库
@@ -27,9 +29,17 @@
 //! | SQL Server | ✅ | ✅（tiberius，纯 Rust TDS；`Encrypt`/`TrustServerCertificate` 可配） |
 //! | PostgreSQL | ✅ | ✅（postgres crate；HighGo/KingBase/VastBase 同协议复用） |
 //! | Oracle | ✅ | ✅（oracle crate/OCI，运行时需 Instant Client；自增用序列 `SEQ_{表名}`） |
+//! | DuckDB | ✅ | ✅（duckdb crate 内嵌；`--features duckdb`，需 CMake 工具链） |
+//! | ClickHouse | ✅ | ✅（HTTP `:8123`，`TSVWithNamesAndTypes`） |
+//! | TDengine | ✅ | ✅（REST `:6041`） |
+//! | InfluxDB | ✅ | ✅（1.x 行协议写入 + InfluxQL 查询） |
+//! | SAP HANA | ✅ | ✅（hdbconnect） |
+//! | Firebird | ✅ | ✅（rsfbclient 动态加载 fbclient.dll；Remote/Embedded） |
+//! | DB2 / 达梦 / IRIS / Access | ✅ | ✅（odbc-api 桥接本机 ODBC 驱动） |
+//! | MongoDB | ✅ | ✅（SQL 子集翻译为文档操作；无 DDL） |
+//! | NovaDb | ✅ | ✅（复用 MySQL 驱动） |
 //!
-//! DH.NCode 的其它数据库（Access/ClickHouse/DaMeng/DB2/DuckDB/Firebird/Hana/InfluxDB/IRIS/MongoDB/SqlCe/TDengine）
-//! 在路线图中：方言与连接串解析已就绪，就近可直接生成脚本，后续按需求接入驱动。
+//! `network` 与 `sqlce` 明确不支持（拆返回可操作提示）。
 //!
 //! ## 快速开始
 //!
@@ -62,22 +72,51 @@
 //! - 所有查询/写入均使用参数绑定；列名、表名经方言引用转义
 //! - `sync_schema` 只做增量补齐（建表/加列），不修改、不删除已有对象
 
+pub mod batch;
+pub mod cache;
+pub mod clickhouse;
 pub mod codegen;
+pub mod common;
 pub mod dal;
+pub mod data_access;
+pub mod db_service;
 pub mod dialect;
+pub mod dirty;
+#[cfg(feature = "duckdb")]
+pub mod duckdb;
 pub mod entity;
+pub mod entity_queue;
 mod error;
+pub mod firebird;
+pub mod hana;
+pub mod http;
+pub mod influxdb;
+pub mod interceptor;
+pub mod membership;
 pub mod model;
+pub mod mongodb;
 pub mod mssql;
 pub mod mysql;
+pub mod odbc;
 pub mod oracle;
 pub mod postgres;
 pub mod query;
+pub mod reverse;
 pub mod session;
+pub mod shards;
+pub mod show_in;
 pub mod sqlbuild;
 pub mod sqlite;
+pub mod sql_template;
+pub mod statistics;
+pub mod tdengine;
+pub mod transaction;
+pub mod transform;
+pub mod tree;
 pub mod types;
 pub mod value;
+
+mod rt;
 
 pub use error::{Error, Result};
 

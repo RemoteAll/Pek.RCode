@@ -23,37 +23,50 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `model` | `Model.xml` / `EntityModel` | ✅ 解析 + 写出（往返一致） |
 | `types` | `DataType`（CLR 类型名） | ✅ `Boolean/Byte/Int16/Int32/Int64/Single/Double/Decimal/String/DateTime/Binary` |
 | `value` | 字段值 / `DbType` 转换 | ✅ 含 Decimal 精确值、XCode 格式时间文本（7 位小数秒） |
-| `dialect` | 各 `DbBase` 子类（SQLite.cs / MySql.cs / …） | ✅ 五种库的类型映射 / DDL / 分页 / 自增 / 标识符与占位符 |
+| `dialect` | 各 `DbBase` 子类（SQLite.cs / MySql.cs / …） | ✅ **16 种库**的类型映射 / DDL / 分页 / 自增 / 标识符与占位符 |
 | `session` | `IDbSession` | ✅ 抽象就绪，驱动可插拔 |
 | `sqlite` | `SQLite.cs` | ✅ **可执行**（rusqlite 内嵌，无外部依赖） |
 | `mysql` | `MySql.cs` | ✅ **可执行**（mysql crate，纯 Rust；连接串与 XCode 一致；未启用 TLS） |
 | `mssql` | `SqlServer.cs` | ✅ **可执行**（tiberius，纯 Rust TDS；同步接口内部维护专用 tokio 运行时） |
 | `postgres` | `PostgreSQL.cs` | ✅ **可执行**（postgres crate；HighGo/金仓/VastBase 同协议直接复用） |
 | `oracle` | `Oracle.cs` | ✅ **可执行**（oracle crate / OCI；运行时需 Instant Client；自增用序列 `SEQ_{表名}`） |
+| `duckdb` | `DuckDb.cs` | ✅ **可执行**（duckdb crate 内嵌引擎；`--features duckdb`，需 CMake 工具链） |
+| `clickhouse` | `ClickHouse.cs` | ✅ **可执行**（HTTP 接口 `:8123`，`TSVWithNamesAndTypes`） |
+| `tdengine` | `TDengine.cs` | ✅ **可执行**（REST 接口 `:6041`） |
+| `influxdb` | `Influx.cs` | ✅ **可执行**（1.x 行协议写入 + InfluxQL 查询） |
+| `hana` | `SapHana.cs` | ✅ **可执行**（hdbconnect，原生 hdb:// 连接） |
+| `firebird` | `Firebird.cs` | ✅ **可执行**（rsfbclient 动态加载 fbclient.dll；Remote/Embedded 双模式） |
+| `odbc` | `Db2.cs` / `DaMeng.cs` / `Iris.cs` / `Access.cs` | ✅ **可执行**（odbc-api 桥：DB2 / 达梦 / IRIS / Access） |
+| `mongodb` | `MongoDb.cs` | ✅ **可执行**（SQL 子集翻译为文档操作；无独立查询语言） |
+| `http` / `rt` | — | 内部公共层：HTTP 驱动共用传输层、异步驱动共用 tokio 运行时 |
 | `sqlbuild` | `InsertBuilder` / `SelectBuilder` | ✅ INSERT/UPDATE/DELETE/SELECT/COUNT |
 | `query` | `WhereExpression` / `PageParameter` | ✅ 链式条件 + 分页/取前 N |
 | `dal` | `DAL` / 迁移 Migration | ✅ 连接串解析、结构同步（建表/补列）、实体表操作 |
+| `cache` | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | ✅ 整表实体缓存 + 单对象缓存（默认 60s 过期；写入自动失效） |
+| `reverse` | `DAL.GetTables`（反向工程） | ✅ 数据库 → `EntityModel` / `Model.xml`（SQLite 实测；`rcodegen --conn`） |
 | `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count` |
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
-| `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`） |
+| `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`） |
 
-测试：**78 项全部通过**（其中 MySQL / PostgreSQL / SQL Server / Oracle 端到端用例在有真实库时自动启用），
+测试：**110 项全部通过**（默认构建；`--features duckdb` 构建为 **117 项**，含 DuckDB 内嵌引擎全链路端到端；
+MySQL / PostgreSQL / SQL Server / Oracle 端到端用例在有真实库时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
 （远端库侧用与 `rcodegen` 输出同构的实体，覆盖 insert/save 新增与更新双分支/find/query/count/delete/事务）、
 以及用真实表（JiLiYu、VerifyCode）生成实体后的编译与运行验证；
+DuckDB 在 `--features duckdb` 下用**内嵌真实引擎**跑通建序列/建表/增删改查/事务回滚全链路；
+**实体缓存 / 单对象缓存**（命中、失效、过期重载）与**反向工程**（建库 → 反向 → 逐列对比 roundtrip）均有行为用例；
+其余网络型数据库（ClickHouse/TDengine/InfluxDB/Hana/Firebird/ODBC 系列/MongoDB）提供值转换与语句翻译单测；
 另可用环境变量 `RCODE_MODEL` 对完整生产 `Model.xml` 跑全量回归（见下文）。
 
 ### 与 DH.NCode 支持范围的对照
 
-DH.NCode 内置的数据库驱动较全，Pek.RCode 按“线协议可分阶段接入”的思路推进：
+DH.NCode 内置的全部数据库驱动均已接入（provider 名称与 XCode 链接串一致）：
 
 | 状态 | 数据库 |
 |------|--------|
-| ✅ 已接入驱动 | SQLite、MySQL/MariaDB、SQL Server、PostgreSQL（含 HighGo/瀚高、KingBase/金仓、VastBase/海量）、Oracle |
-| 🚧 路线图 | Access、ClickHouse、DaMeng/达梦、DB2、DuckDB、Firebird、Hana、InfluxDB、IRIS、MongoDB、SqlCe、TDengine、NovaDb |
-
-各库的方言（类型映射/DDL/分页）与连接串解析已就绪；未接入的 `provider` 会返回可操作的提示信息。
+| ✅ 已接入驱动 | SQLite、MySQL/MariaDB、SQL Server、PostgreSQL（含 HighGo/瀚高、KingBase/金仓、VastBase/海量）、Oracle、DuckDB、ClickHouse、TDengine、InfluxDB、SAP HANA、Firebird、DB2、达梦（DaMeng）、IRIS、Access、MongoDB、NovaDb（复用 MySQL 协议） |
+| ⚠️ 明确不支持 | `network`（并非数据库，为网络接入占位）、`sqlce`（SSCE 已停止维护且无可行运行时） |
 
 ---
 
@@ -98,7 +111,8 @@ println!("共 {total} 条，本页 {} 条", page.len());
 
 ```powershell
 cd G:\Code\Pek.Rust\Pek.RCode
-cargo test          # 78 项测试（固件回归 + 对象实体端到端）
+cargo test          # 默认测试（含 SQLite + 固件回归 + 对象实体端到端）
+cargo test --features duckdb   # 额外交付 DuckDB 内嵌引擎的完整用例
 cargo clippy        # 零警告
 ```
 
@@ -111,6 +125,58 @@ cargo clippy        # 零警告
 $env:RCODE_MODEL = "<你的项目>\Entity\Model.xml"
 cargo test full_model      # 解析全量模型 + 全部表同步到临时 SQLite 库验证
 ```
+
+### 真实 SQLite 历史库兼容性验证（副本）
+
+用生产历史库的**副本**验证与 C#/.NET 端“共库”的能力：既存表全部可读、增量同步零破坏、抽样 CRUD：
+
+```powershell
+Copy-Item <生产库> $env:TEMP\DG-live-copy.db -Force
+$env:RCODE_LIVE_DB = "$env:TEMP\DG-live-copy.db"   # 测试内置防呆：拒绝 BinWeb 生产路径
+$env:RCODE_MODEL   = "<你的项目>\Entity\Model.xml"
+cargo test --test live_sqlite_e2e -- --nocapture
+```
+
+实测结果（2026-09-27，本仓库历史业务库副本）：库中既存 52 张表全部可读；
+增量同步新建 **168 张表**、补充 **8 个列**（`DH_WmsOrder.*`）；同步前后 52 张表行数**完全一致**（数据零破坏）；
+模型 **176/176** 张表就位；自增主键与字符串主键两条 CRUD 往返均通过；
+反向工程读回 220 张表，模型 176 张表全部覆盖。
+
+### 反向工程与实体缓存
+
+**反向工程**（对应 C# 的 `DAL.GetTables`）：数据库结构 → `EntityModel`，可写出 `Model.xml`，
+再由 `codegen` 生成实体，形成“库 → 模型 → 实体”闭环：
+
+```rust
+let dal = Dal::open("Data Source=..\\Data\\DG.db;Provider=SQLite")?;
+let model = dal.read_model()?;      // 读取全部表/列/主键/自增/可空/默认值
+std::fs::write("Model.xml", model.to_xml())?;
+```
+
+```powershell
+# 命令行用法（rcodegen）
+rcodegen --conn "Data Source=..\Data\DG.db;Provider=SQLite" --list          # 列出库表
+rcodegen --conn "Data Source=..\Data\DG.db;Provider=SQLite" --out Model.xml # 生成 Model.xml
+```
+
+- 当前支持 SQLite（`pragma_table_info` 表值函数 + `sqlite_master`，自增按 `AUTOINCREMENT` 识别）；
+  其它数据库返回可操作提示，可按需扩展
+- 实测：对历史库副本（220 表）一键反向生成 250KB `Model.xml`，产物可直接作为 `rcodegen --model` 的输入；
+  固件模型“建库 → 反向 → 逐表逐列对比”roundtrip 全等（类型/主键/自增/可空/字符串长度）
+
+**实体缓存**（对应 C# 的 `Meta.Cache` / `Meta.SingleCache`）：
+
+```rust
+let cache = dal.entity_cache("JiLiYu")?;                 // 整表缓存（读多写少）
+let rows  = cache.entities(&dal, session.as_mut())?;     // 首次加载整表，之后走内存
+let one   = cache.find_by_pk("Id", &1.into());
+
+let single = dal.single_cache("VerifyCode")?;            // 单对象缓存（按主键点查）
+let item   = single.get(&dal, session.as_mut(), &["k-001".into()])?;
+```
+
+- 默认过期 60 秒；任何写入（表句柄/实体层）都会**立即失效**对应表缓存，下次访问自动重载
+- 与 C# 版的差异：C# 过期后“返回旧数据 + 异步更新”，Rust 版首版为“过期后同步重载”（语义更直观）
 
 ### MySQL 使用与集成测试
 
@@ -163,6 +229,29 @@ cargo test --test remote_e2e
 > TLS：当前版本三个驱动均未内置 TLS（PG/Oracle 为明文；SQL Server 可自选 `Encrypt`，默认加密+信任自签证书）。
 > 依赖镜像：工程内 `.cargo/config.toml` 已配置 rsproxy。
 
+### 其它数据库（DH.NCode 全量驱动）
+
+DH.NCode 内置的其余数据库均已接入，按 `provider` 分发：
+
+| provider | 连接串要点 | 说明 |
+|----------|------------|------|
+| `duckdb` | `Data Source=mes.duckdb`（或 `:memory:`） | 内嵌引擎（`--features duckdb`，需 CMake）；自增=序列+`RETURNING` |
+| `clickhouse` | `Server=..;Port=8123;Database=..` | HTTP 接口（`TSVWithNamesAndTypes`）；无事务；`UPDATE/DELETE` 走 `ALTER TABLE ... UPDATE` 语义仍受服务端限制 |
+| `tdengine` | `Server=..;Port=6041;Database=..` | REST 接口；无事务 |
+| `influxdb` | `Server=..;Port=8086;Database=..`（1.x） | 写入自动生成行协议；查询走 InfluxQL；不支持 UPDATE |
+| `hana` | `Server=..;Port=30015;Uid=..;Pwd=..` | hdbconnect 原生协议（`hdb://`） |
+| `firebird` | `Server=（缺省则内嵌）;Database=xx.fdb;Uid=SYSDBA;Pwd=..` | 运行时动态加载 `fbclient.dll`（可用 `FBCLIENT_LIB_DIR` 指定） |
+| `db2` / `dameng` / `iris` / `access` | `Driver={...};...` 直通 ODBC；或 XCode 风格模板（缺省巴适） | 经 odbc-api 桥接本机 ODBC 驱动 |
+| `mongodb` | `Server=..;Port=27017;Database=..`（或 `Uri=mongodb://...`） | SQL 子集翻译为文档操作；无 DDL（`sync_schema` 自动跳过） |
+| `nova` | 同 MySQL | NovaDb 走 MySQL 协议（声明为 MySql 驱动） |
+| `network` / `sqlce` | — | 明确不支持（拆返回可操作提示：前者非数据库，后者 SSCE 已停止维护） |
+
+- 这些库的方言（类型/DDL/分页/自增/引用）与连接串解析均已有单测；网络型驱动另单测覆盖值转换与语句翻译
+- DuckDB 使用提示：① `:memory:` 内存库为“每连接独立”，多连接流程（先 `sync_schema` 再 `open_session`）请用**文件库**；
+  ② 文件库同一文件不允许并存两个连接（含同进程），操作需串行（与 SQLite 的多进程并发方案不同）
+- DuckDB 因内嵌无需外部实例，直接在每台机器跑 `cargo test --features duckdb` 即可（含内嵌引擎全链路用例）
+- 其余网络库的端到端用例在本机有实例时可按环境变量门控启用（见 `tests/remote_e2e.rs`）
+
 ### 实体生成工具（对应 C# 的 `xcode` 命令）
 
 ```powershell
@@ -212,7 +301,8 @@ order.delete(&dal, session.as_mut())?;
   - SQLite 字符串列生成 `COLLATE NOCASE`（与 XCode 保持一致，保证大小写不敏感检索）
   - 未知属性 / 未知元素一律忽略，向后兼容新版本 XSD
 - **可写出**：`EntityModel::to_xml()` 输出同规范 XML（解析 → 写出 → 解析 完全一致），可交回 C# 侧使用
-- **已回归验证**：本仓库真实 `Model.xml`（176 表、3088 列、8 种数据类型）解析、建表、写出全部通过
+- **已回归验证**：本仓库真实 `Model.xml`（176 表、3088 列、8 种数据类型）解析、建表、写出全部通过；
+  **历史库副本共库验证**（2026-09-27）：52 张既存表增量同步零破坏（新建 168 表 / 补 8 列），176/176 表就位，CRUD 往返通过
 
 ### 多数据库类型映射（节选）
 
@@ -249,14 +339,29 @@ Pek.RCode/
 │   ├── lib.rs        入口与概念对照（crate 文档）
 │   ├── model.rs      Model.xml 解析 / 写出 / 子集
 │   ├── types.rs      数据类型系统
-│   ├── value.rs      值模型（DbValue）与时间文本
-│   ├── dialect.rs    多数据库方言（类型/DDL/分页/自增/引用）
+│   ├── value.rs      值模型（DbValue）与时间文本（含 RFC3339 兼容）
+│   ├── dialect.rs    多数据库方言（16 种库的类型/DDL/分页/自增/引用）
 │   ├── session.rs    SqlSession 抽象与结果集
 │   ├── sqlite.rs     SQLite 驱动
 │   ├── mysql.rs      MySQL 驱动（XCode 连接串 / information_schema / LAST_INSERT_ID）
+│   ├── mssql.rs      SQL Server 驱动（tiberius）
+│   ├── postgres.rs   PostgreSQL 驱动（含 HighGo/金仓/VastBase）
+│   ├── oracle.rs     Oracle 驱动（序列 SEQ_{表名}）
+│   ├── duckdb.rs     DuckDB 驱动（内嵌，`--features duckdb`）
+│   ├── clickhouse.rs ClickHouse 驱动（HTTP）
+│   ├── tdengine.rs   TDengine 驱动（REST）
+│   ├── influxdb.rs   InfluxDB 驱动（行协议 + InfluxQL）
+│   ├── hana.rs       SAP HANA 驱动（hdbconnect）
+│   ├── firebird.rs   Firebird 驱动（rsfbclient 动态加载）
+│   ├── odbc.rs       ODBC 桥（DB2/达梦/IRIS/Access）
+│   ├── mongodb.rs    MongoDB 驱动（SQL 子集翻译）
+│   ├── http.rs       HTTP 驱动公共层（ureq3 / 字面量内联 / Base64）
+│   ├── rt.rs         共享 tokio 运行时（异步驱动内部 block_on）
 │   ├── sqlbuild.rs   INSERT/UPDATE/DELETE/SELECT/COUNT 组装
 │   ├── query.rs      条件与查询描述
 │   ├── dal.rs        连接串、Dal、结构同步、实体表操作
+│   ├── cache.rs      实体缓存 / 单对象缓存（对应 Meta.Cache / Meta.SingleCache）
+│   ├── reverse.rs    反向工程：数据库结构 → EntityModel / Model.xml（对应 DAL.GetTables）
 │   ├── entity.rs     Entity trait（对象实体的 CRUD/查询默认实现）
 │   ├── codegen.rs    Model.xml → Rust 对象实体
 │   ├── bin/
@@ -265,7 +370,11 @@ Pek.RCode/
 └── tests/
     ├── fixtures/wms_model_sample.xml   生产模型快照固件（7 张表 / 8 种类型）
     ├── entity_layer.rs                 对象实体端到端（insert/save/update/delete）
-    └── model_e2e.rs                    固件端到端（方言 DDL / SQLite CRUD / 代码生成）
+    ├── model_e2e.rs                    固件端到端（方言 DDL / SQLite CRUD / 代码生成）
+    ├── mysql_e2e.rs                    MySQL 真实库端到端（RCODE_MYSQL 门控）
+    ├── remote_e2e.rs                   PostgreSQL / SQL Server / Oracle 端到端（环境变量门控）
+    ├── reverse_e2e.rs                  反向工程 roundtrip（固件建库 → 反向 → 逐列对比 → 再生成实体）
+    └── live_sqlite_e2e.rs              真实 SQLite 历史库副本兼容性验证（RCODE_LIVE_DB + RCODE_MODEL 门控）
 ```
 
 ---
@@ -273,13 +382,14 @@ Pek.RCode/
 ## 六、路线图（按优先级）
 
 1. ~~MySQL 驱动~~ ✅ 已完成（mysql crate，纯 Rust；待办：rustls TLS 选项与连接池）
-2. **SQL Server / PostgreSQL 驱动**（tiberius / tokio-postgres 或 sqlx），复用现有方言层
-3. **异步门面**：为 tokio 应用提供 `AsyncDal`（连接池 + 全链路 async），与扫码枪网关等 tokio 服务对接
-4. **反向工程**：数据库 → `Model.xml`（对应 XCode `GetTables`），支持历史库生成模型
-5. **结构比对增强**：索引差异、类型差异检测与 ALTER 脚本导出（dry-run 输出）
-6. **代码生成增强**：枚举类型、审计字段基类、`#[derive(Entity)]` 属性宏（对象实体基础版已就绪）
-7. **缓存**：实体缓存与二级缓存（XCode 的 EntityCache 对应物）
-8. **高级能力**：批量写、分表（Shards）、TDengine/时序扩展等（按需）
+2. ~~SQL Server / PostgreSQL / Oracle 驱动~~ ✅ 已完成
+3. ~~DH.NCode 其余数据库全量接入~~ ✅ 已完成（DuckDB/ClickHouse/TDengine/InfluxDB/Hana/Firebird/DB2/达梦/IRIS/Access/MongoDB；NovaDb 复用 MySQL）
+4. **异步门面**：为 tokio 应用提供 `AsyncDal`（连接池 + 全链路 async），与扫码枪网关等 tokio 服务对接
+5. ~~反向工程~~ ✅ 已完成（数据库 → `Model.xml`，SQLite 实测；`rcodegen --conn`；其它库按需扩展）
+6. **结构比对增强**：索引差异、类型差异检测与 ALTER 脚本导出（dry-run 输出）
+7. **代码生成增强**：枚举类型、审计字段基类、`#[derive(Entity)]` 属性宏（对象实体基础版已就绪）
+8. ~~缓存~~ ✅ 已完成（实体缓存 / 单对象缓存，写入自动失效；列数缓存与跨进程失效协调可后续）
+9. **高级能力**：批量写、分表（Shards）等（按需）
 
 ---
 

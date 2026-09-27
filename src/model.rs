@@ -182,6 +182,8 @@ pub struct ColumnMeta {
     pub map: Option<String>,
     /// 显示选项（`ShowIn`）
     pub show_in: Option<String>,
+    /// 模型类开关（`Model`，`"False"` 表示排除；对应 DH.NCode 的 `Properties["Model"]`）
+    pub model: Option<String>,
 }
 
 /// 索引定义（`<Index>`）。
@@ -318,6 +320,7 @@ impl EntityModel {
                 write_attr(&mut out, "DataScale", col.data_scale.as_deref());
                 write_attr(&mut out, "Map", col.map.as_deref());
                 write_attr(&mut out, "ShowIn", col.show_in.as_deref());
+                write_attr(&mut out, "Model", col.model.as_deref());
                 write_attr(&mut out, "Description", Some(&col.description));
                 out.push_str(" />\n");
             }
@@ -425,6 +428,7 @@ fn parse_column(node: &Node, table_name: &str) -> Result<ColumnMeta> {
         data_scale: attr_string(node, "DataScale"),
         map: attr_string(node, "Map"),
         show_in: attr_string(node, "ShowIn"),
+        model: attr_string(node, "Model"),
     })
 }
 

@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::model::{ColumnMeta, TableMeta};
 use crate::types::DataType;
 
-/// 数据库类型（对应 C# 的 `DatabaseType`，先覆盖常用五种）。
+/// 数据库类型（对应 C# 的 `DatabaseType`，覆盖 DH.NCode 全部主要数据库）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DatabaseKind {
     /// SQLite（文件数据库）
@@ -23,20 +23,53 @@ pub enum DatabaseKind {
     MySql,
     /// Microsoft SQL Server
     SqlServer,
-    /// PostgreSQL
+    /// PostgreSQL（含 HighGo/KingBase/VastBase）
     PostgreSql,
     /// Oracle
     Oracle,
+    /// DuckDB（内嵌分析数据库）
+    DuckDb,
+    /// Firebird（含 InterBase 兼容）
+    Firebird,
+    /// ClickHouse（列式分析库，HTTP 协议）
+    ClickHouse,
+    /// TDengine（时序数据库，REST 协议）
+    TDengine,
+    /// InfluxDB（时序数据库，HTTP 行协议）
+    InfluxDb,
+    /// SAP HANA
+    Hana,
+    /// MongoDB（文档库，非 SQL，走子集翻译）
+    MongoDb,
+    /// IBM DB2（按 DH.NCode 采用 Oracle 兼容模式）
+    Db2,
+    /// DaMeng 达梦（DM8）
+    DaMeng,
+    /// InterSystems IRIS
+    Iris,
+    /// Microsoft Access（JET/ACE）
+    Access,
 }
 
 impl DatabaseKind {
     /// 全部已建模的数据库类型。
-    pub const ALL: [DatabaseKind; 5] = [
+    pub const ALL: [DatabaseKind; 16] = [
         DatabaseKind::Sqlite,
         DatabaseKind::MySql,
         DatabaseKind::SqlServer,
         DatabaseKind::PostgreSql,
         DatabaseKind::Oracle,
+        DatabaseKind::DuckDb,
+        DatabaseKind::Firebird,
+        DatabaseKind::ClickHouse,
+        DatabaseKind::TDengine,
+        DatabaseKind::InfluxDb,
+        DatabaseKind::Hana,
+        DatabaseKind::MongoDb,
+        DatabaseKind::Db2,
+        DatabaseKind::DaMeng,
+        DatabaseKind::Iris,
+        DatabaseKind::Access,
     ];
 
     /// 显示名称。
@@ -47,26 +80,49 @@ impl DatabaseKind {
             DatabaseKind::SqlServer => "SqlServer",
             DatabaseKind::PostgreSql => "PostgreSQL",
             DatabaseKind::Oracle => "Oracle",
+            DatabaseKind::DuckDb => "DuckDB",
+            DatabaseKind::Firebird => "Firebird",
+            DatabaseKind::ClickHouse => "ClickHouse",
+            DatabaseKind::TDengine => "TDengine",
+            DatabaseKind::InfluxDb => "InfluxDB",
+            DatabaseKind::Hana => "HANA",
+            DatabaseKind::MongoDb => "MongoDB",
+            DatabaseKind::Db2 => "DB2",
+            DatabaseKind::DaMeng => "DaMeng",
+            DatabaseKind::Iris => "IRIS",
+            DatabaseKind::Access => "Access",
         }
     }
 
-    /// 是否为文件型数据库（SQLite）。
+    /// 是否为文件型数据库。
     pub fn is_file_based(&self) -> bool {
-        matches!(self, DatabaseKind::Sqlite)
+        matches!(
+            self,
+            DatabaseKind::Sqlite | DatabaseKind::DuckDb | DatabaseKind::Firebird | DatabaseKind::Access
+        )
+    }
+
+    /// 是否支持关系式 DDL（建表/加列）。
+    ///
+    /// InfluxDB 的 measurement 写入时自动创建；MongoDB 的 collection 亦然。
+    pub fn supports_ddl(&self) -> bool {
+        !matches!(self, DatabaseKind::InfluxDb | DatabaseKind::MongoDb)
     }
 
     /// 从连接串中的 `provider` 名称解析（兼容常见别名）。
     ///
-    /// 与 DH.NCode 支持的国产/衍生库对应关系：
+    /// 与 DH.NCode 支持的库对应关系：
     /// - HighGo（瀚高）/KingBase（金仓）/VastBase（海量）与 PostgreSQL 同协议，驱动直接复用
-    /// - DH.NCode 的其它数据库（Access/ClickHouse/DaMeng/DB2/DuckDB/Firebird/Hana/InfluxDB/IRIS/MongoDB/SqlCe/TDengine）
-    ///   暂未接入驱动，会返回可操作的错误提示
+    /// - NovaDb 为 MySQL 系协议（端口 3306/反引号/`LAST_INSERT_ID()`），复用 MySQL 驱动
+    /// - `network`（XCode 远程服务协议）与 `sqlce`（已停更的 SQL Server Compact 运行时）不在数据库驱动范畴
     pub fn from_provider(name: &str) -> Result<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "sqlite" | "sqlite3" | "system.data.sqlite" | "microsoft.data.sqlite" => {
                 Ok(DatabaseKind::Sqlite)
             }
             "mysql" | "mariadb" | "system.data.mysql" => Ok(DatabaseKind::MySql),
+            // NovaDb：NewLife 自研库，连接串/语法/自增均与 MySQL 一致
+            "novadb" | "nova" => Ok(DatabaseKind::MySql),
             "sqlserver" | "mssql" | "system.data.sqlclient" | "microsoft.data.sqlclient" => {
                 Ok(DatabaseKind::SqlServer)
             }
@@ -76,14 +132,30 @@ impl DatabaseKind {
             "oracle" | "system.data.oracleclient" | "oracle.manageddataaccess" => {
                 Ok(DatabaseKind::Oracle)
             }
-            other @ ("access" | "clickhouse" | "dameng" | "dm" | "db2" | "duckdb" | "firebird"
-            | "hana" | "influxdb" | "iris" | "mongodb" | "sqlce" | "tdengine") => {
-                Err(Error::Unsupported(format!(
-                    "provider={other} 已在 DH.NCode 支持范围内，但 Pek.RCode 驱动尚在路线图（见 README，欢迎贡献适配）"
-                )))
-            }
+            "duckdb" => Ok(DatabaseKind::DuckDb),
+            "firebird" | "fb" => Ok(DatabaseKind::Firebird),
+            "clickhouse" | "clickhouse.client" => Ok(DatabaseKind::ClickHouse),
+            "tdengine" | "td" => Ok(DatabaseKind::TDengine),
+            "influxdb" | "influx" => Ok(DatabaseKind::InfluxDb),
+            "hana" | "sap" => Ok(DatabaseKind::Hana),
+            "mongodb" | "mongo" => Ok(DatabaseKind::MongoDb),
+            "db2" => Ok(DatabaseKind::Db2),
+            "dameng" | "dm" => Ok(DatabaseKind::DaMeng),
+            "iris" | "iris.data.irisclient" => Ok(DatabaseKind::Iris),
+            "access" | "microsoft.jet.oledb" | "oledb" | "ace" => Ok(DatabaseKind::Access),
+            "network" | "net" => Err(Error::Unsupported(
+                "provider=network 是 XCode 远程服务协议（转发 SQL 到远端 XCode 节点），不是数据库驱动；\
+                 请在目标节点上直接使用对应数据库的 provider"
+                    .into(),
+            )),
+            "sqlce" => Err(Error::Unsupported(
+                "provider=sqlce（SQL Server Compact）依赖已停止维护的 SSCE 原生运行时，Rust 生态无可用驱动；\
+                 建议迁移到 SQLite（Pek.RCode 内嵌支持）"
+                    .into(),
+            )),
             other => Err(Error::Unsupported(format!(
-                "未知的数据库类型 provider={other}（支持：sqlite/mysql/sqlserver/postgresql(含 highgo/kingbase/vastbase)/oracle）"
+                "未知的数据库类型 provider={other}\n支持：sqlite/mysql(nova)/sqlserver/postgresql(highgo/kingbase/vastbase)/oracle/\
+                 duckdb/firebird/clickhouse/tdengine/influxdb/hana/mongodb/db2/dameng/iris/access"
             ))),
         }
     }
@@ -92,21 +164,26 @@ impl DatabaseKind {
     pub fn quote(&self, ident: &str) -> String {
         // 内部引号统一双写转义，避免标识符注入
         match self {
-            DatabaseKind::MySql => format!("`{}`", ident.replace('`', "``")),
-            DatabaseKind::SqlServer => format!("[{}]", ident.replace(']', "]]")),
+            DatabaseKind::MySql | DatabaseKind::ClickHouse | DatabaseKind::TDengine => {
+                format!("`{}`", ident.replace('`', "``"))
+            }
+            DatabaseKind::SqlServer | DatabaseKind::Access => {
+                format!("[{}]", ident.replace(']', "]]"))
+            }
             _ => format!("\"{}\"", ident.replace('"', "\"\"")),
         }
     }
 
     /// 参数占位符（`index` 从 0 开始）。
     ///
-    /// Oracle 使用 1 基的 `:1/:2/...`（OCI 位置绑定，与 rust oracle 驱动一致）。
+    /// Oracle 使用 1 基的 `:1/:2/...`（OCI 位置绑定，与 rust oracle 驱动一致）；
+    /// HTTP/REST 型数据库（ClickHouse/TDengine/InfluxDB/MongoDB）由驱动把参数内联为字面量。
     pub fn placeholder(&self, index: usize) -> String {
         match self {
-            DatabaseKind::Sqlite | DatabaseKind::MySql => "?".to_string(),
             DatabaseKind::SqlServer => format!("@p{index}"),
             DatabaseKind::PostgreSql => format!("${}", index + 1),
             DatabaseKind::Oracle => format!(":{}", index + 1),
+            _ => "?".to_string(),
         }
     }
 
@@ -118,12 +195,24 @@ impl DatabaseKind {
             DatabaseKind::SqlServer => Some(" IDENTITY(1,1)".into()),
             // PostgreSQL 的 serial/serial8 是伪类型，需要替换列类型（见 identity_type）
             DatabaseKind::PostgreSql => None,
-            // Oracle 自增由独立序列承担（XCode 约定 SEQ_{表名}），列本身无内联属性
-            DatabaseKind::Oracle => None,
+            // Oracle/DB2/Firebird 自增由独立序列承担（XCode 约定 SEQ_{表名}），列本身无内联属性
+            DatabaseKind::Oracle | DatabaseKind::Db2 | DatabaseKind::Firebird => None,
+            // DuckDB：序列 + DEFAULT nextval（与 PostgreSQL 函数同源）
+            DatabaseKind::DuckDb => None,
+            DatabaseKind::Hana => Some(" GENERATED BY DEFAULT AS IDENTITY".into()),
+            DatabaseKind::DaMeng => Some(" IDENTITY(1,1)".into()),
+            DatabaseKind::Iris => Some(" IDENTITY".into()),
+            // Access：自增列类型为 COUNTER（见 identity_type）
+            DatabaseKind::Access => None,
+            // 列式/时序/文档库无自增主键概念（与 DH.NCode 一致：Identity 回写返回 0）
+            DatabaseKind::ClickHouse
+            | DatabaseKind::TDengine
+            | DatabaseKind::InfluxDb
+            | DatabaseKind::MongoDb => None,
         }
     }
 
-    /// 自增列的列类型改写（如 PostgreSQL 的 `serial`/`serial8` 是伪类型，需整体替换原类型）。
+    /// 自增列的列类型改写（`serial`/`COUNTER` 等伪类型需整体替换原类型）。
     fn identity_type(&self, col: &ColumnMeta) -> Option<String> {
         match self {
             // 与 DH.NCode 对齐：PostgreSQL 自增使用 serial（Int32）/serial8（Int64）
@@ -131,14 +220,18 @@ impl DatabaseKind {
                 Some("serial8".into())
             }
             DatabaseKind::PostgreSql if col.identity => Some("serial".into()),
+            // Access 自增为 COUNTER（32 位）；Int64 自增在 ACE 中降级为 BIGINT
+            DatabaseKind::Access if col.identity && col.data_type == DataType::Int64 => None,
+            DatabaseKind::Access if col.identity => Some("COUNTER".into()),
             _ => None,
         }
     }
 
     /// 查询“最近一次自增 ID”的语句（对应 XCode 的自增回写）。
     ///
-    /// 说明：驱动实现已改为插入后直接回读（PostgreSQL 系 `RETURNING`、SQL Server `SCOPE_IDENTITY()`、
-    /// Oracle 按表名推导序列 CURRVAL）；本方法保留用于脚本导出与诊断输出。
+    /// 说明：驱动实现已在插入后直接回读（PostgreSQL/DuckDB 系 `RETURNING`、
+    /// SQL Server `SCOPE_IDENTITY()`、Oracle/DB2/Firebird 按表名推导序列）；
+    /// 本方法保留用于脚本导出与诊断输出。
     pub fn last_identity_sql(&self) -> &'static str {
         match self {
             DatabaseKind::Sqlite => "SELECT last_insert_rowid()",
@@ -146,6 +239,17 @@ impl DatabaseKind {
             DatabaseKind::SqlServer => "SELECT SCOPE_IDENTITY()",
             DatabaseKind::PostgreSql => "SELECT lastval()",
             DatabaseKind::Oracle => "SELECT \"SEQ_<表名>\".CURRVAL FROM DUAL",
+            DatabaseKind::DuckDb => "SELECT currval('<SEQ_表名>')",
+            DatabaseKind::Firebird => "SELECT GEN_ID(\"SEQ_<表名>\", 0) FROM RDB$DATABASE",
+            DatabaseKind::Hana => "SELECT CURRENT_IDENTITY_VALUE() FROM DUMMY",
+            DatabaseKind::Db2 => "SELECT SEQ_<表名>.CURRVAL FROM dual",
+            DatabaseKind::DaMeng => "SELECT @@IDENTITY",
+            DatabaseKind::Iris => "SELECT LAST_IDENTITY()",
+            DatabaseKind::Access => "SELECT @@IDENTITY",
+            DatabaseKind::ClickHouse
+            | DatabaseKind::TDengine
+            | DatabaseKind::InfluxDb
+            | DatabaseKind::MongoDb => "（无自增主键）",
         }
     }
 
@@ -257,6 +361,197 @@ impl DatabaseKind {
                 DataType::DateTime => "timestamp".into(),
                 DataType::Binary => "blob".into(),
             },
+            DatabaseKind::DuckDb => match t {
+                DataType::Boolean => "BOOLEAN".into(),
+                DataType::Byte | DataType::Int16 => "SMALLINT".into(),
+                DataType::Int32 => "INTEGER".into(),
+                DataType::Int64 => "BIGINT".into(),
+                DataType::Single => "REAL".into(),
+                DataType::Double => "DOUBLE".into(),
+                DataType::Decimal => format!("DECIMAL({},{})", col.precision, col.scale),
+                DataType::String => {
+                    if col.length > 0 {
+                        format!("VARCHAR({})", col.length)
+                    } else {
+                        "TEXT".into()
+                    }
+                }
+                DataType::DateTime => "TIMESTAMP".into(),
+                DataType::Binary => "BLOB".into(),
+            },
+            DatabaseKind::Firebird => match t {
+                // 与 DH.NCode 对齐：Firebird 无布尔类型，用 SMALLINT 承载
+                DataType::Boolean => "SMALLINT".into(),
+                DataType::Byte | DataType::Int16 => "SMALLINT".into(),
+                DataType::Int32 => "INTEGER".into(),
+                DataType::Int64 => "BIGINT".into(),
+                DataType::Single => "FLOAT".into(),
+                DataType::Double => "DOUBLE PRECISION".into(),
+                DataType::Decimal => format!("DECIMAL({},{})", col.precision, col.scale),
+                DataType::String => {
+                    if col.length > 0 && col.length <= 32767 {
+                        format!("VARCHAR({})", col.length)
+                    } else {
+                        "BLOB SUB_TYPE TEXT".into()
+                    }
+                }
+                DataType::DateTime => "TIMESTAMP".into(),
+                DataType::Binary => "BLOB".into(),
+            },
+            DatabaseKind::ClickHouse => match t {
+                DataType::Boolean | DataType::Byte => "UInt8".into(),
+                DataType::Int16 => "Int16".into(),
+                DataType::Int32 => "Int32".into(),
+                DataType::Int64 => "Int64".into(),
+                DataType::Single => "Float32".into(),
+                DataType::Double => "Float64".into(),
+                DataType::Decimal => format!("Decimal({},{})", col.precision, col.scale),
+                // ClickHouse 字符串无长度参数
+                DataType::String | DataType::Binary => "String".into(),
+                DataType::DateTime => "DateTime64(6)".into(),
+            },
+            DatabaseKind::TDengine => match t {
+                DataType::Boolean => "BOOL".into(),
+                DataType::Byte => "TINYINT".into(),
+                DataType::Int16 => "SMALLINT".into(),
+                DataType::Int32 => "INT".into(),
+                DataType::Int64 => "BIGINT".into(),
+                DataType::Single => "FLOAT".into(),
+                DataType::Double => "DOUBLE".into(),
+                DataType::Decimal => format!("DECIMAL({},{})", col.precision.max(1), col.scale.max(0)),
+                DataType::String => {
+                    if col.length > 0 && col.length <= 16374 {
+                        format!("VARCHAR({})", col.length)
+                    } else {
+                        "TEXT".into()
+                    }
+                }
+                DataType::DateTime => "TIMESTAMP".into(),
+                DataType::Binary => "BLOB".into(),
+            },
+            DatabaseKind::InfluxDb => match t {
+                DataType::Boolean => "BOOLEAN".into(),
+                DataType::Byte | DataType::Int16 | DataType::Int32 | DataType::Int64 => "INTEGER".into(),
+                DataType::Single | DataType::Double | DataType::Decimal => "FLOAT".into(),
+                DataType::String => "STRING".into(),
+                DataType::DateTime => "TIMESTAMP".into(),
+                DataType::Binary => "BINARY".into(),
+            },
+            DatabaseKind::Hana => match t {
+                DataType::Boolean => "BOOLEAN".into(),
+                DataType::Byte => "TINYINT".into(),
+                DataType::Int16 => "SMALLINT".into(),
+                DataType::Int32 => "INTEGER".into(),
+                DataType::Int64 => "BIGINT".into(),
+                DataType::Single => "REAL".into(),
+                DataType::Double => "DOUBLE".into(),
+                DataType::Decimal => format!("DECIMAL({},{})", col.precision, col.scale),
+                DataType::String => {
+                    if col.length > 0 && col.length <= 5000 {
+                        format!("NVARCHAR({})", col.length)
+                    } else {
+                        "NCLOB".into()
+                    }
+                }
+                DataType::DateTime => "TIMESTAMP".into(),
+                DataType::Binary => {
+                    if col.length > 0 && col.length <= 5000 {
+                        format!("VARBINARY({})", col.length)
+                    } else {
+                        "BLOB".into()
+                    }
+                }
+            },
+            // 文档型：返回 BSON 类型名（供模型导出/诊断参考）
+            DatabaseKind::MongoDb => match t {
+                DataType::Boolean => "bool".into(),
+                DataType::Byte | DataType::Int16 | DataType::Int32 => "int".into(),
+                DataType::Int64 => "long".into(),
+                DataType::Single | DataType::Double => "double".into(),
+                DataType::Decimal => "decimal".into(),
+                DataType::String => "string".into(),
+                DataType::DateTime => "date".into(),
+                DataType::Binary => "binData".into(),
+            },
+            // 与 DH.NCode 对齐：DB2 采用 Oracle 兼容模式（NUMBER/BINARY_FLOAT/To_Date）
+            DatabaseKind::Db2 => match t {
+                DataType::Boolean => "NUMBER(1,0)".into(),
+                DataType::Byte => "NUMBER(1,0)".into(),
+                DataType::Int16 => "NUMBER(5,0)".into(),
+                DataType::Int32 => "NUMBER(10,0)".into(),
+                DataType::Int64 => "NUMBER(20,0)".into(),
+                DataType::Single => "BINARY_FLOAT".into(),
+                DataType::Double => "BINARY_DOUBLE".into(),
+                DataType::Decimal => format!("NUMBER({},{})", col.precision, col.scale),
+                DataType::String => {
+                    if col.length <= 0 || col.length > 4000 {
+                        "CLOB".into()
+                    } else {
+                        format!("VARCHAR2({})", col.length)
+                    }
+                }
+                DataType::DateTime => "TIMESTAMP".into(),
+                DataType::Binary => "BLOB".into(),
+            },
+            // 与 DH.NCode 对齐：达梦类型（BIT/TINYINT/DEC/DATETIME/BLOB）
+            DatabaseKind::DaMeng => match t {
+                DataType::Boolean => "BIT".into(),
+                DataType::Byte => "TINYINT".into(),
+                DataType::Int16 => "SMALLINT".into(),
+                DataType::Int32 => "INT".into(),
+                DataType::Int64 => "BIGINT".into(),
+                DataType::Single => "REAL".into(),
+                DataType::Double => "DOUBLE".into(),
+                DataType::Decimal => format!("DEC({},{})", col.precision, col.scale),
+                DataType::String => {
+                    if col.length <= 0 || col.length > 8188 {
+                        "CLOB".into()
+                    } else {
+                        format!("VARCHAR({})", col.length)
+                    }
+                }
+                DataType::DateTime => "DATETIME".into(),
+                DataType::Binary => "BLOB".into(),
+            },
+            // 与 DH.NCode 对齐：IRIS 类型表（布尔用 TINYINT 承载）
+            DatabaseKind::Iris => match t {
+                DataType::Boolean => "TINYINT".into(),
+                DataType::Byte => "TINYINT".into(),
+                DataType::Int16 => "SMALLINT".into(),
+                DataType::Int32 => "INT".into(),
+                DataType::Int64 => "BIGINT".into(),
+                DataType::Single => "FLOAT".into(),
+                DataType::Double => "DOUBLE".into(),
+                DataType::Decimal => format!("DECIMAL({},{})", col.precision, col.scale),
+                DataType::String => {
+                    if col.length > 0 && col.length <= 4000 {
+                        format!("VARCHAR({})", col.length)
+                    } else {
+                        "LONGVARCHAR".into()
+                    }
+                }
+                DataType::DateTime => "DATETIME".into(),
+                DataType::Binary => "BLOB".into(),
+            },
+            DatabaseKind::Access => match t {
+                DataType::Boolean => "BIT".into(),
+                DataType::Byte => "BYTE".into(),
+                DataType::Int16 => "SMALLINT".into(),
+                DataType::Int32 => "LONG".into(),
+                DataType::Int64 => "BIGINT".into(),
+                DataType::Single => "SINGLE".into(),
+                DataType::Double => "DOUBLE".into(),
+                DataType::Decimal => format!("DECIMAL({},{})", col.precision, col.scale),
+                DataType::String => {
+                    if col.length > 0 && col.length <= 255 {
+                        format!("TEXT({})", col.length)
+                    } else {
+                        "MEMO".into()
+                    }
+                }
+                DataType::DateTime => "DATETIME".into(),
+                DataType::Binary => "BINARY".into(),
+            },
         }
     }
 
@@ -267,13 +562,33 @@ impl DatabaseKind {
     /// - `Nullable` 缺省 false → 追加 `NOT NULL`（与 XCode 一致）
     /// - SQLite 字符串列追加 `COLLATE NOCASE`（与 XCode 保持一致，保证大小写不敏感检索）
     pub fn create_table_sql(&self, table: &TableMeta) -> Vec<String> {
+        // 时序/文档库无建表 DDL（measurement/collection 写入时自动创建）
+        if !self.supports_ddl() {
+            return Vec::new();
+        }
+
         let tname = table.effective_table_name();
         let mut sql = format!("CREATE TABLE {} (\n", self.quote(tname));
 
         let mut lines: Vec<String> = Vec::with_capacity(table.columns.len() + 1);
         let mut inline_pk = false;
 
-        for col in &table.columns {
+        // TDengine 3.x 要求首列必须是 TIMESTAMP：把第一个时间列提到最前
+        let ordered_columns: Vec<&ColumnMeta> = if *self == DatabaseKind::TDengine {
+            let mut cols: Vec<&ColumnMeta> = table.columns.iter().collect();
+            if let Some(pos) = cols
+                .iter()
+                .position(|c| c.data_type == DataType::DateTime)
+            {
+                let first = cols.remove(pos);
+                cols.insert(0, first);
+            }
+            cols
+        } else {
+            table.columns.iter().collect()
+        };
+
+        for col in &ordered_columns {
             let cname = table.effective_column_name(col);
             // 自增列在部分方言中需要改写类型（PostgreSQL 的 serial/serial8）
             let type_name = self
@@ -296,10 +611,21 @@ impl DatabaseKind {
                 }
             }
 
-            // 默认值：Oracle 要求 DEFAULT 出现在 NOT NULL 之前
-            let default_part = column_default_sql(self, col).map(|d| format!(" DEFAULT {d}"));
+            // 默认值：Oracle 系（Oracle/DB2）要求 DEFAULT 出现在 NOT NULL 之前
+            let mut default_part = column_default_sql(self, col).map(|d| format!(" DEFAULT {d}"));
+            // DuckDB 自增：序列 + DEFAULT nextval（插入时由列默认值生成）
+            if *self == DatabaseKind::DuckDb
+                && col.identity
+                && default_part.is_none()
+            {
+                // 序列名以“带双引号的字符串”传入（与 CREATE SEQUENCE 的大小写一致）
+                default_part = Some(format!(
+                    " DEFAULT nextval('{}')",
+                    self.quote(&oracle_identity_sequence(tname))
+                ));
+            }
             let not_null = !col.nullable && !(col.identity && inline_pk);
-            if self == &DatabaseKind::Oracle {
+            if matches!(self, DatabaseKind::Oracle | DatabaseKind::Db2) {
                 if let Some(part) = &default_part {
                     line.push_str(part);
                 }
@@ -343,6 +669,11 @@ impl DatabaseKind {
         sql.push_str(&lines.join(",\n"));
         sql.push_str("\n)");
 
+        // ClickHouse 建表必须指定表引擎
+        if *self == DatabaseKind::ClickHouse {
+            sql.push_str(" ENGINE = MergeTree() ORDER BY tuple()");
+        }
+
         let mut statements = vec![sql];
 
         // 索引
@@ -370,12 +701,27 @@ impl DatabaseKind {
             ));
         }
 
-        // Oracle：自增列依赖独立序列（XCode 约定 SEQ_{表名}），随建表一并创建
-        if self == &DatabaseKind::Oracle && table.identity().is_some() {
-            statements.push(format!(
-                "CREATE SEQUENCE {} START WITH 1 INCREMENT BY 1 CACHE 20",
-                self.quote(&oracle_identity_sequence(tname))
-            ));
+        // 独立序列（XCode 约定 SEQ_{表名}）：Oracle/DB2/Firebird/DuckDB 的自增回写依赖它
+        if table.identity().is_some() {
+            let sequence = oracle_identity_sequence(tname);
+            match self {
+                DatabaseKind::Oracle => statements.push(format!(
+                    "CREATE SEQUENCE {} START WITH 1 INCREMENT BY 1 CACHE 20",
+                    self.quote(&sequence)
+                )),
+                // DB2（Oracle 兼容模式）：序列名不加引号（未引号折为大写）
+                DatabaseKind::Db2 => statements.push(format!(
+                    "CREATE SEQUENCE {sequence} START WITH 1 INCREMENT BY 1"
+                )),
+                DatabaseKind::Firebird => {
+                    statements.push(format!("CREATE SEQUENCE {}", self.quote(&sequence)))
+                }
+                // DuckDB 的 DEFAULT nextval 在建表时即引用序列，需先创建（插到表之前）
+                DatabaseKind::DuckDb => {
+                    statements.insert(0, format!("CREATE SEQUENCE {}", self.quote(&sequence)))
+                }
+                _ => {}
+            }
         }
 
         statements
@@ -388,15 +734,16 @@ impl DatabaseKind {
     pub fn add_column_sql(&self, table: &TableMeta, col: &ColumnMeta) -> String {
         let tname = self.quote(table.effective_table_name());
         let cname = self.quote(table.effective_column_name(col));
-        // 自增列在部分方言中需要改写类型（PostgreSQL 的 serial/serial8）
+        // 自增列在部分方言中需要改写类型（PostgreSQL 的 serial/serial8、Access 的 COUNTER）
         let type_name = self
             .identity_type(col)
             .unwrap_or_else(|| self.field_type(col));
-        // SQL Server / Oracle 的 ADD 子句不带 COLUMN 关键字
+        // SQL Server / Oracle 的 ADD 子句不带 COLUMN 关键字；HANA 要求加括号
         let mut sql = match self {
             DatabaseKind::SqlServer | DatabaseKind::Oracle => {
                 format!("ALTER TABLE {tname} ADD {cname} {type_name}")
             }
+            DatabaseKind::Hana => format!("ALTER TABLE {tname} ADD ({cname} {type_name})"),
             _ => format!("ALTER TABLE {tname} ADD COLUMN {cname} {type_name}"),
         };
 
@@ -409,7 +756,7 @@ impl DatabaseKind {
 
         // 无默认值时不追加 NOT NULL：存量数据无法满足约束
         let not_null = !col.nullable && default_sql.is_some();
-        if self == &DatabaseKind::Oracle {
+        if matches!(self, DatabaseKind::Oracle | DatabaseKind::Db2) {
             if let Some(d) = &default_sql {
                 sql.push_str(&format!(" DEFAULT {d}"));
             }
@@ -436,23 +783,34 @@ impl DatabaseKind {
     /// - SQL Server：`OFFSET n ROWS FETCH NEXT m ROWS ONLY`（无排序时补 `ORDER BY (SELECT NULL)`）
     /// - Oracle：ROWNUM 双层包装（兼容 11g，与 DH.NCode 的分页思路一致）
     pub fn apply_paging(&self, sql: &str, order_sql: &str, offset: usize, size: usize) -> String {
+        let with_order = |s: &mut String| {
+            if !order_sql.is_empty() {
+                s.push(' ');
+                s.push_str(order_sql);
+            }
+        };
         match self {
-            DatabaseKind::Sqlite | DatabaseKind::MySql | DatabaseKind::PostgreSql => {
+            DatabaseKind::Sqlite
+            | DatabaseKind::MySql
+            | DatabaseKind::PostgreSql
+            | DatabaseKind::DuckDb
+            | DatabaseKind::ClickHouse
+            | DatabaseKind::TDengine
+            | DatabaseKind::InfluxDb
+            | DatabaseKind::Hana
+            | DatabaseKind::DaMeng
+            | DatabaseKind::Iris => {
                 let mut s = sql.to_string();
-                if !order_sql.is_empty() {
-                    s.push(' ');
-                    s.push_str(order_sql);
-                }
+                with_order(&mut s);
                 s.push_str(&format!(" LIMIT {size} OFFSET {offset}"));
                 s
             }
-            DatabaseKind::SqlServer => {
+            DatabaseKind::SqlServer | DatabaseKind::Db2 => {
                 let mut s = sql.to_string();
                 if !order_sql.is_empty() {
-                    s.push(' ');
-                    s.push_str(order_sql);
+                    with_order(&mut s);
                 } else {
-                    // SQL Server 分页要求 ORDER BY，缺失时给出语法合法的兜底
+                    // SQL Server 分页要求 ORDER BY，缺失时给出语法合法的兜底（DB2 同样接受）
                     s.push_str(" ORDER BY (SELECT NULL)");
                 }
                 s.push_str(&format!(" OFFSET {offset} ROWS FETCH NEXT {size} ROWS ONLY"));
@@ -460,15 +818,42 @@ impl DatabaseKind {
             }
             DatabaseKind::Oracle => {
                 let mut inner = sql.to_string();
-                if !order_sql.is_empty() {
-                    inner.push(' ');
-                    inner.push_str(order_sql);
-                }
+                with_order(&mut inner);
                 let upper = offset + size;
                 format!(
                     "SELECT * FROM (SELECT T0.*, ROWNUM AS rowNumber FROM ({inner}) T0) \
                      WHERE rowNumber > {offset} AND rowNumber <= {upper}"
                 )
+            }
+            // Firebird：ROWS a TO b（1 基，含两端）
+            DatabaseKind::Firebird => {
+                let mut s = sql.to_string();
+                with_order(&mut s);
+                s.push_str(&format!(" ROWS {} TO {}", offset + 1, offset + size));
+                s
+            }
+            // Access：无 OFFSET，用双层 TOP 实现（需要排序，无排序时由调用方保证主键兜底）
+            DatabaseKind::Access => {
+                if order_sql.is_empty() {
+                    // 无排序无法保证双层 TOP 结果正确，退化为首页 TOP
+                    return format!("SELECT TOP {size} * FROM ({sql}) AS T");
+                }
+                if offset == 0 {
+                    format!("SELECT TOP {size} * FROM ({sql}) AS T {order_sql}")
+                } else {
+                    let reversed = reverse_order(order_sql);
+                    let skip = offset + size;
+                    format!(
+                        "SELECT * FROM (SELECT TOP {size} * FROM (SELECT TOP {skip} * FROM ({sql}) AS T1 {order_sql}) AS T2 {reversed}) AS T3 {order_sql}"
+                    )
+                }
+            }
+            // 文档库：跳过/限制由驱动翻译器解析 SQL 文本中的 LIMIT/OFFSET
+            DatabaseKind::MongoDb => {
+                let mut s = sql.to_string();
+                with_order(&mut s);
+                s.push_str(&format!(" LIMIT {size} OFFSET {offset}"));
+                s
             }
         }
     }
@@ -489,7 +874,7 @@ fn column_default_sql(kind: &DatabaseKind, col: &ColumnMeta) -> Option<String> {
     {
         return Some(render_default(kind, default, col));
     }
-    if *kind == DatabaseKind::Oracle
+    if matches!(*kind, DatabaseKind::Oracle | DatabaseKind::Db2)
         && col.data_type == DataType::DateTime
         && !col.nullable
         && !col.identity
@@ -497,6 +882,27 @@ fn column_default_sql(kind: &DatabaseKind, col: &ColumnMeta) -> Option<String> {
         return Some("To_Date('0001-01-01','yyyy-mm-dd')".into());
     }
     None
+}
+
+/// 反转 `ORDER BY` 各排序项的方向（Access 双层 TOP 分页需要）。
+fn reverse_order(order_sql: &str) -> String {
+    let Some((prefix, terms)) = order_sql.split_at_checked("ORDER BY".len()) else {
+        return order_sql.to_string();
+    };
+    let items: Vec<String> = terms
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            if item.to_ascii_uppercase().ends_with(" DESC") {
+                item[..item.len() - 5].trim().to_string()
+            } else if item.to_ascii_uppercase().ends_with(" ASC") {
+                format!("{} DESC", item[..item.len() - 4].trim())
+            } else {
+                format!("{item} DESC")
+            }
+        })
+        .collect();
+    format!("{prefix} {}", items.join(", "))
 }
 
 /// MySQL DECIMAL 精度规则（对齐 DH.NCode：Length 有值时覆盖 Precision，上限 255）。
@@ -529,14 +935,14 @@ fn render_default(kind: &DatabaseKind, default: &str, col: &ColumnMeta) -> Strin
     if col.data_type == DataType::Boolean {
         return match trimmed.to_ascii_lowercase().as_str() {
             "true" | "1" => {
-                if *kind == DatabaseKind::PostgreSql {
+                if matches!(*kind, DatabaseKind::PostgreSql | DatabaseKind::DuckDb) {
                     "TRUE".into()
                 } else {
                     "1".into()
                 }
             }
             "false" | "0" => {
-                if *kind == DatabaseKind::PostgreSql {
+                if matches!(*kind, DatabaseKind::PostgreSql | DatabaseKind::DuckDb) {
                     "FALSE".into()
                 } else {
                     "0".into()
@@ -579,7 +985,10 @@ mod tests {
         assert_eq!(DatabaseKind::from_provider("mysql").unwrap(), DatabaseKind::MySql);
         assert_eq!(DatabaseKind::from_provider("SqlServer").unwrap(), DatabaseKind::SqlServer);
         assert_eq!(DatabaseKind::from_provider("postgresql").unwrap(), DatabaseKind::PostgreSql);
-        assert!(DatabaseKind::from_provider("dameng").is_err());
+        assert_eq!(DatabaseKind::from_provider("dameng").unwrap(), DatabaseKind::DaMeng);
+        assert_eq!(DatabaseKind::from_provider("nova").unwrap(), DatabaseKind::MySql);
+        assert_eq!(DatabaseKind::from_provider("kingbase").unwrap(), DatabaseKind::PostgreSql);
+        assert!(DatabaseKind::from_provider("network").is_err());
     }
 
     #[test]
@@ -709,6 +1118,7 @@ mod tests {
             data_scale: None,
             map: None,
             show_in: None,
+            model: None,
         };
 
         let sql = DatabaseKind::Sqlite.add_column_sql(&table, &col);

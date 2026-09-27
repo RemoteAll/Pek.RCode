@@ -209,6 +209,10 @@ pub fn parse_datetime(text: &str) -> Option<NaiveDateTime> {
             return Some(v);
         }
     }
+    // 带 Z / 时区偏移的 ISO8601（InfluxDB、ClickHouse 等常见输出）
+    if let Ok(v) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(v.naive_utc());
+    }
     // 纯日期需要补零点
     chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
         .ok()

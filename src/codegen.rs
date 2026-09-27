@@ -4,6 +4,7 @@
 //! 供迁移期两边共用同一份数据模型文件。
 
 use crate::model::{ColumnMeta, EntityModel, TableMeta};
+use crate::show_in::{ShowInOption, TriState};
 use crate::types::DataType;
 
 /// Rust 关键字（作为字段名时需要加 `r#` 前缀）。
@@ -294,6 +295,367 @@ fn clean_doc(text: &str) -> String {
     text.replace(['\r', '\n'], " ").trim().to_string()
 }
 
+/// 列的 Rust 字段类型（可空则包裹 `Option<...>`；与实体生成规则一致）。
+fn column_rust_type(col: &ColumnMeta) -> String {
+    let mut ty = col.data_type.rust_type().to_string();
+    if col.nullable {
+        ty = format!("Option<{ty}>");
+    }
+    ty
+}
+
+/// 是否跳过模型类/接口生成（`Model="False"`，对应 DH.NCode 的 `Properties["Model"]`）。
+fn model_excluded(col: &ColumnMeta) -> bool {
+    col.model.as_deref() == Some("False")
+}
+
+/// 首字母小写（参数名用）。
+fn lower_first(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+// ================= 搜索条件（对应 DH.NCode 的 `Code/SearchBuilder.cs`） =================
+
+/// 搜索参数（对应 DH.NCode 的 `ParameterModel`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchParameter {
+    /// 字段名（模型列名）
+    pub name: String,
+    /// 参数名（小驼峰）
+    pub parameter_name: String,
+    /// 类型名（`extend` 为 false 时去掉路径前缀）
+    pub type_name: String,
+    /// 是否可空（布尔恒为可空，与 C# 一致）
+    pub nullable: bool,
+}
+
+/// 搜索功能构建器（对应 DH.NCode 的 `SearchBuilder`）。
+///
+/// 提供“可用于搜索的字段列表”（[`Self::columns`]）与“搜索参数列表”（[`Self::parameters`]），
+/// 供搜索表单 / 高级查询模板使用；字段筛选规则与 C# 版一致：
+/// - 索引列参与（按表字段顺序，跳过主键/自增/Master）
+/// - `ShowIn` 的 `Search` 三态可显式 Show/Hide
+/// - `DataScale`（数据时间）、整数枚举/映射、布尔（`enable`/`isDeleted` 置尾）自动参与
+/// - 选中数据时间字段（雪花 ID 优先）后由 `start`/`end` 参数承担，本身从列表移除
+pub struct SearchBuilder<'a> {
+    /// 数据表
+    pub table: &'a TableMeta,
+    /// 可空模式（可选文本列生成 `Option<...>`）
+    pub nullable: bool,
+}
+
+impl<'a> SearchBuilder<'a> {
+    /// 创建（默认启用可空模式）。
+    pub fn new(table: &'a TableMeta) -> Self {
+        Self {
+            table,
+            nullable: true,
+        }
+    }
+
+    /// 获取可用于搜索的字段列表（对齐 C# `GetColumns()`）。
+    pub fn columns(&self) -> Vec<&'a ColumnMeta> {
+        self.analyze().0
+    }
+
+    /// 数据时间字段（雪花 ID 优先，其次时间列；用于 `start`/`end` 参数）。
+    pub fn data_time(&self) -> Option<&'a ColumnMeta> {
+        self.analyze().1
+    }
+
+    /// 获取搜索参数列表（对齐 C# `GetParameters()`；`extend` 控制类型名是否含路径前缀）。
+    pub fn parameters(&self, extend: bool) -> Vec<SearchParameter> {
+        let mut result = Vec::new();
+        for col in self.columns() {
+            let mut type_name = col.data_type.rust_type().to_string();
+            if !extend {
+                type_name = type_name.rsplit("::").next().unwrap_or(&type_name).to_string();
+            }
+            result.push(SearchParameter {
+                name: col.name.clone(),
+                parameter_name: lower_first(&col.name),
+                type_name,
+                nullable: col.nullable || col.data_type == DataType::Boolean,
+            });
+        }
+        // 数据时间字段由 start/end 参数承担（对应 C# 的 includeTime）
+        if self.data_time().is_some() {
+            for name in ["start", "end"] {
+                result.push(SearchParameter {
+                    name: name.to_string(),
+                    parameter_name: name.to_string(),
+                    type_name: "NaiveDateTime".to_string(),
+                    nullable: true,
+                });
+            }
+        }
+        result
+    }
+
+    /// 统一分析：返回（搜索字段、数据时间字段）。
+    fn analyze(&self) -> (Vec<&'a ColumnMeta>, Option<&'a ColumnMeta>) {
+        let table = self.table;
+        let mut columns: Vec<&ColumnMeta> = Vec::new();
+
+        // 1) 索引列参与（按表字段顺序）
+        let mut index_columns: Vec<&str> = Vec::new();
+        for index in &table.indexes {
+            for name in &index.columns {
+                if !index_columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                    index_columns.push(name);
+                }
+            }
+        }
+        if !index_columns.is_empty() {
+            for col in &table.columns {
+                if col.primary_key || col.identity || col.master {
+                    continue;
+                }
+                let show = ShowInOption::parse(col.show_in.as_deref().unwrap_or_default());
+                if show.search_hide() {
+                    continue;
+                }
+                let matched = index_columns.iter().any(|n| n.eq_ignore_ascii_case(&col.name))
+                    || col
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|cn| index_columns.iter().any(|n| n.eq_ignore_ascii_case(cn)));
+                if matched {
+                    columns.push(col);
+                }
+            }
+        }
+
+        // 2) 特殊字段（ShowIn 显式 / 数据时间 / 整数枚举与映射 / 布尔）
+        for col in &table.columns {
+            if columns.iter().any(|c| c.name.eq_ignore_ascii_case(&col.name)) {
+                continue;
+            }
+            let show = ShowInOption::parse(col.show_in.as_deref().unwrap_or_default());
+            match show.search {
+                TriState::Show => {
+                    columns.push(col);
+                    continue;
+                }
+                TriState::Hide => continue,
+                TriState::Auto => {}
+            }
+            if col.data_scale.as_deref().is_some_and(|v| !v.is_empty()) {
+                // 数据时间字段
+                columns.push(col);
+            } else if col.data_type.is_integer() && (col.enum_type.is_some() || col.map.is_some()) {
+                // 整数枚举 / 带 Type 属性 / 有映射
+                columns.push(col);
+            } else if col.data_type == DataType::Boolean
+                && !col.name.eq_ignore_ascii_case("enable")
+                && !col.name.eq_ignore_ascii_case("isDeleted")
+            {
+                columns.push(col);
+            }
+        }
+
+        // 3) enable / isDeleted 置于最后
+        for col in &table.columns {
+            if columns.iter().any(|c| c.name.eq_ignore_ascii_case(&col.name)) {
+                continue;
+            }
+            if col.data_type == DataType::Boolean
+                && (col.name.eq_ignore_ascii_case("enable") || col.name.eq_ignore_ascii_case("isDeleted"))
+            {
+                columns.push(col);
+            }
+        }
+
+        if columns.is_empty() {
+            return (columns, None);
+        }
+
+        // 4) 数据时间字段：DataScale(time*) > DateTime > UpdateTime/CreateTime；雪花 ID 优先
+        let time_column = columns
+            .iter()
+            .find(|c| {
+                c.data_scale
+                    .as_deref()
+                    .is_some_and(|v| v.to_ascii_lowercase().starts_with("time"))
+            })
+            .copied()
+            .or_else(|| columns.iter().find(|c| c.data_type == DataType::DateTime).copied())
+            .or_else(|| {
+                table.columns.iter().find(|c| {
+                    c.name.eq_ignore_ascii_case("UpdateTime") || c.name.eq_ignore_ascii_case("CreateTime")
+                })
+            });
+        let snow_column = columns
+            .iter()
+            .find(|c| c.primary_key && !c.identity && c.data_type == DataType::Int64)
+            .copied();
+
+        if let Some(time) = time_column {
+            columns.retain(|c| !c.name.eq_ignore_ascii_case(&time.name));
+        }
+        columns.retain(|c| !c.name.eq_ignore_ascii_case("key") && !c.name.eq_ignore_ascii_case("page"));
+        if snow_column.is_some() || time_column.is_some() {
+            columns.retain(|c| !c.name.eq_ignore_ascii_case("start") && !c.name.eq_ignore_ascii_case("end"));
+        }
+
+        (columns, snow_column.or(time_column))
+    }
+}
+
+// ================= 模型类（对应 DH.NCode 的 `Code/ModelBuilder.cs`） =================
+
+/// 模型类文件名（`OrderItem` → `order_item_model.rs`）。
+pub fn model_file_name(table: &TableMeta) -> String {
+    format!("{}_model.rs", to_snake_case(&table.name))
+}
+
+/// 接口文件名（`OrderItem` → `order_item_interface.rs`）。
+pub fn interface_file_name(table: &TableMeta) -> String {
+    format!("{}_interface.rs", to_snake_case(&table.name))
+}
+
+/// 生成单表的简易模型类（对应 `ModelBuilder`；跳过 `Model="False"` 的列）。
+///
+/// 模型类用于数据传输（与实体结构体分离），提供 `new()`/`Default` 与 `from_row()`。
+pub fn generate_model(table: &TableMeta) -> String {
+    let display = if table.description.is_empty() {
+        &table.name
+    } else {
+        &table.description
+    };
+    let table_name = table.effective_table_name();
+    let columns: Vec<&ColumnMeta> = table.columns.iter().filter(|c| !model_excluded(c)).collect();
+
+    let mut out = String::with_capacity(2048);
+    out.push_str(&format!(
+        "//! {display}（{table_name}）模型类。\n//!\n//! 由 pek-rcode 从 Model.xml 自动生成，请勿手工修改；修改模型后重新生成。\n\n"
+    ));
+    out.push_str("use chrono::NaiveDateTime;\nuse rust_decimal::Decimal;\nuse pek_rcode::session::DbRow;\nuse pek_rcode::value::DbValue;\n\n");
+    out.push_str(&format!(
+        "/// {display} 模型（数据传输用）\n#[derive(Debug, Clone, PartialEq)]\npub struct {}Model {{\n",
+        table.name
+    ));
+    for col in &columns {
+        let field = safe_field_name(&to_snake_case(&col.name));
+        let ty = column_rust_type(col);
+        let doc = if col.description.is_empty() {
+            format!("{} 列", col.name)
+        } else {
+            clean_doc(&col.description)
+        };
+        out.push_str(&format!("    /// {doc}\n    pub {field}: {ty},\n"));
+    }
+    out.push_str("}\n\n");
+
+    out.push_str(&format!(
+        "impl {name}Model {{\n    /// 按列类型默认值创建。\n    pub fn new() -> Self {{\n        Self {{\n",
+        name = table.name
+    ));
+    for col in &columns {
+        let field = safe_field_name(&to_snake_case(&col.name));
+        out.push_str(&format!("            {field}: {},\n", default_expr(col)));
+    }
+    out.push_str("        }\n    }\n\n    /// 从数据行填充。\n    pub fn from_row(row: &DbRow) -> Self {\n        Self {\n");
+    for col in &columns {
+        let field = safe_field_name(&to_snake_case(&col.name));
+        let name = table.effective_column_name(col);
+        out.push_str(&format!("            {field}: {},\n", from_row_expr(col, name)));
+    }
+    out.push_str("        }\n    }\n}\n\n");
+    out.push_str(&format!(
+        "impl Default for {name}Model {{\n    fn default() -> Self {{\n        Self::new()\n    }}\n}}\n",
+        name = table.name
+    ));
+    out
+}
+
+/// 全量生成模型类（文件名 → 代码）。
+pub fn generate_all_models(model: &EntityModel) -> Vec<(String, String)> {
+    model
+        .tables
+        .iter()
+        .map(|table| (model_file_name(table), generate_model(table)))
+        .collect()
+}
+
+// ================= 实体接口（对应 DH.NCode 的 `Code/InterfaceBuilder.cs`） =================
+
+/// 生成单表的实体接口 trait（对应 `InterfaceBuilder`；跳过 `Model="False"` 的列）。
+///
+/// 生成 `pub trait I{Name}`（每列一对 getter/setter）及对实体结构体的实现。
+pub fn generate_interface(table: &TableMeta) -> String {
+    let display = if table.description.is_empty() {
+        &table.name
+    } else {
+        &table.description
+    };
+    let table_name = table.effective_table_name();
+    let columns: Vec<&ColumnMeta> = table.columns.iter().filter(|c| !model_excluded(c)).collect();
+
+    let mut out = String::with_capacity(2048);
+    out.push_str(&format!(
+        "//! {display}（{table_name}）实体接口。\n//!\n//! 由 pek-rcode 从 Model.xml 自动生成，请勿手工修改。\n\n"
+    ));
+    out.push_str("use chrono::NaiveDateTime;\nuse rust_decimal::Decimal;\n\n");
+    out.push_str(&format!("/// {display} 实体接口\npub trait I{name} {{\n", name = table.name));
+    for col in &columns {
+        let field = safe_field_name(&to_snake_case(&col.name));
+        let setter = format!("set_{}", to_snake_case(&col.name));
+        let ty = column_rust_type(col);
+        let doc = if col.description.is_empty() {
+            format!("{} 列", col.name)
+        } else {
+            clean_doc(&col.description)
+        };
+        out.push_str(&format!(
+            "    /// 获取 {doc}\n    fn {field}(&self) -> &{ty};\n    /// 设置 {doc}\n    fn {setter}(&mut self, value: {ty});\n"
+        ));
+    }
+    out.push_str("}\n\n");
+
+    out.push_str(&format!("impl I{name} for {name} {{\n", name = table.name));
+    for col in &columns {
+        let field = safe_field_name(&to_snake_case(&col.name));
+        let setter = format!("set_{}", to_snake_case(&col.name));
+        let ty = column_rust_type(col);
+        out.push_str(&format!(
+            "    fn {field}(&self) -> &{ty} {{\n        &self.{field}\n    }}\n    fn {setter}(&mut self, value: {ty}) {{\n        self.{field} = value;\n    }}\n"
+        ));
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// 全量生成实体接口（文件名 → 代码）。
+pub fn generate_all_interfaces(model: &EntityModel) -> Vec<(String, String)> {
+    model
+        .tables
+        .iter()
+        .map(|table| (interface_file_name(table), generate_interface(table)))
+        .collect()
+}
+
+// ================= 代码生成插件（对应 DH.NCode 的 `Code/ICodePlugin.cs`） =================
+
+/// 代码生成插件：生成前可修正模型数据表（增删改表与列定义）。
+pub trait CodePlugin {
+    /// 修正数据表（默认空实现）。
+    fn fix_tables(&self, tables: &mut Vec<TableMeta>) {
+        let _ = tables;
+    }
+}
+
+/// 依次应用插件修正（对齐 XCodeTool 的 `plugin.FixTables` 流程）。
+pub fn apply_plugins(tables: &mut Vec<TableMeta>, plugins: &[&dyn CodePlugin]) {
+    for plugin in plugins {
+        plugin.fix_tables(tables);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +736,103 @@ mod tests {
         let files = generate_all(&model);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, "order_item.rs");
+    }
+
+    #[test]
+    fn search_builder_columns_and_parameters() {
+        const SEARCH_MODEL: &str = r#"<EntityModel><Tables><Table Name="SearchOrder" TableName="DH_SearchOrder">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            <Column Name="Code" DataType="String" Length="50" />
+            <Column Name="Status" DataType="Int32" Type="Dto.Status" />
+            <Column Name="Ok" DataType="Boolean" />
+            <Column Name="Visible" DataType="String" ShowIn="Search" />
+            <Column Name="Secret" DataType="String" ShowIn="-Search" />
+            <Column Name="Enable" DataType="Boolean" />
+            <Column Name="CreateTime" DataType="DateTime" />
+          </Columns>
+          <Indexes><Index Columns="Code" Unique="True" /></Indexes>
+        </Table></Tables></EntityModel>"#;
+        let model = EntityModel::parse(SEARCH_MODEL).unwrap();
+        let table = &model.tables[0];
+        let builder = SearchBuilder::new(table);
+
+        let names: Vec<&str> = builder.columns().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Code", "Status", "Ok", "Visible", "Enable"],
+            "搜索字段筛选与顺序：{names:?}"
+        );
+        assert_eq!(
+            builder.data_time().map(|c| c.name.as_str()),
+            Some("CreateTime"),
+            "数据时间字段应为 CreateTime"
+        );
+
+        let params = builder.parameters(false);
+        let param_names: Vec<&str> = params.iter().map(|p| p.parameter_name.as_str()).collect();
+        assert_eq!(param_names, vec!["code", "status", "ok", "visible", "enable", "start", "end"]);
+        let status = params.iter().find(|p| p.name == "Status").unwrap();
+        assert_eq!(status.type_name, "i32");
+        let ok = params.iter().find(|p| p.name == "Ok").unwrap();
+        assert!(ok.nullable, "布尔参数恒为可空");
+        assert_eq!(params.last().unwrap().type_name, "NaiveDateTime");
+    }
+
+    #[test]
+    fn generate_model_and_interface() {
+        const MODEL_WITH_FLAGS: &str = r#"<EntityModel><Tables><Table Name="OrderItem" TableName="DH_OrderItem">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            <Column Name="Code" DataType="String" Length="50" />
+            <Column Name="Remark" DataType="String" Nullable="True" />
+            <Column Name="CreateUser" DataType="String" Model="False" />
+            <Column Name="CreateTime" DataType="DateTime" />
+          </Columns>
+        </Table></Tables></EntityModel>"#;
+        let model = EntityModel::parse(MODEL_WITH_FLAGS).unwrap();
+        let table = &model.tables[0];
+
+        // 模型类
+        let code = generate_model(table);
+        assert!(code.contains("pub struct OrderItemModel {"), "{code}");
+        assert!(code.contains("pub code: String,"), "{code}");
+        assert!(code.contains("pub remark: Option<String>,"), "{code}");
+        assert!(code.contains("pub fn from_row(row: &DbRow) -> Self {"), "{code}");
+        assert!(!code.contains("create_user"), "Model=False 的列不应进入模型类：{code}");
+
+        // 接口
+        let code = generate_interface(table);
+        assert!(code.contains("pub trait IOrderItem {"), "{code}");
+        assert!(code.contains("fn code(&self) -> &String;"), "{code}");
+        assert!(code.contains("fn set_code(&mut self, value: String);"), "{code}");
+        assert!(code.contains("impl IOrderItem for OrderItem {"), "{code}");
+        assert!(!code.contains("create_user"), "Model=False 的列不应进入接口：{code}");
+
+        // 全量生成文件名
+        assert_eq!(generate_all_models(&model)[0].0, "order_item_model.rs");
+        assert_eq!(
+            generate_all_interfaces(&model)[0].0,
+            "order_item_interface.rs"
+        );
+    }
+
+    #[test]
+    fn code_plugin_fixes_tables() {
+        struct AddTablePlugin;
+        impl CodePlugin for AddTablePlugin {
+            fn fix_tables(&self, tables: &mut Vec<TableMeta>) {
+                let mut table = tables[0].clone();
+                table.name = "Extra".into();
+                table.table_name = "DH_Extra".into();
+                tables.push(table);
+            }
+        }
+
+        let mut model = EntityModel::parse(MODEL).unwrap();
+        let plugins: Vec<&dyn CodePlugin> = vec![&AddTablePlugin];
+        apply_plugins(&mut model.tables, &plugins);
+        assert_eq!(model.tables.len(), 2);
+        assert_eq!(model.tables[1].name, "Extra");
     }
 }

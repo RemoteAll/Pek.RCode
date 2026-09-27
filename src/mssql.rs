@@ -23,7 +23,6 @@
 //! 自签名证书场景请保持 `TrustServerCertificate=true`（默认）。
 
 use std::borrow::Cow;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
@@ -31,12 +30,12 @@ use tiberius::{
     AuthMethod, Client, ColumnData, Config as MssqlConfig, EncryptionLevel, ToSql,
 };
 use tokio::net::TcpStream;
-use tokio::runtime::Runtime;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::dal::ConnectionString;
 use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
+use crate::rt::runtime;
 use crate::session::{RowSet, SqlSession};
 use crate::value::DbValue;
 
@@ -44,31 +43,6 @@ use crate::value::DbValue;
 pub struct MssqlSession {
     /// tiberius 连接（基于 Compat 包装的 tokio 流）
     client: Client<Compat<TcpStream>>,
-}
-
-/// 内部专用 tokio 运行时（tiberius 为异步实现，这里统一以 block_on 暴露同步接口）。
-fn runtime() -> Result<&'static Runtime> {
-    // 在异步上下文中同步等待会死锁，提前给出明确提示
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(Error::Unsupported(
-            "SQL Server 驱动为同步接口，不能在 tokio 异步上下文中调用（会死锁）；\
-             请在独立线程或同步代码中调用"
-                .into(),
-        ));
-    }
-
-    static RUNTIME: OnceLock<std::result::Result<Runtime, String>> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("pek-rcode-mssql")
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())
-        })
-        .as_ref()
-        .map_err(|e| Error::Db(format!("初始化 SQL Server 运行时失败：{e}")))
 }
 
 impl MssqlSession {
