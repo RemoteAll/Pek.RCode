@@ -184,6 +184,10 @@ pub struct Dal {
 
 /// 直接创建会话（不走连接池；供 `Pooling=false` 与池工厂使用）。
 fn create_session(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    // network：SQL 转发到远端 XCode/DbServer（远端类型由 `Dal::open` 登录探明）
+    if crate::network::is_network(conn_str) {
+        return Ok(Box::new(crate::network::NetworkSession::new(conn_str, kind)?));
+    }
     match kind {
         DatabaseKind::Sqlite => {
             let path = conn_str.data_source().ok_or_else(|| {
@@ -228,7 +232,12 @@ impl Dal {
     /// 仅按连接串创建（不加载模型，不做任何连接）。
     pub fn open(conn_str: &str) -> Result<Self> {
         let conn_str = ConnectionString::parse(conn_str);
-        let kind = conn_str.kind()?;
+        // network 驱动：远端类型登录后才能确定（对齐 XCode Network 的 Login → RawType）
+        let kind = if crate::network::is_network(&conn_str) {
+            crate::network::probe_remote_kind(&conn_str)?
+        } else {
+            conn_str.kind()?
+        };
         let show_sql = conn_str.show_sql();
         // 连接池默认开启；`Pooling=false` 关闭（对齐 XCode 的连接池默认行为）
         let pool_enabled = conn_str
@@ -360,6 +369,11 @@ impl Dal {
 
         // 时序/文档库无建表 DDL（measurement/collection 写入时自动创建）
         if !self.kind.supports_ddl() {
+            return Ok(report);
+        }
+
+        // 网络库不在本端建表/改表（对齐 C# `NetworkMetaData.OnSetTables` 空实现：远端结构由远端维护）
+        if crate::network::is_network(&self.conn_str) {
             return Ok(report);
         }
 
@@ -835,11 +849,14 @@ impl<'a> TableRef<'a> {
         }
 
         self.dal.log_sql(&sql);
-        session.execute(&sql, &params)?;
-
         let id = if identity.is_some() {
-            session.last_identity_of(self.table.effective_table_name())?
+            session.insert_and_get_identity(
+                &sql,
+                &params,
+                Some(self.table.effective_table_name()),
+            )?
         } else {
+            session.execute(&sql, &params)?;
             0
         };
         // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）

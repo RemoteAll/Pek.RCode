@@ -92,6 +92,20 @@ pub trait Entity: Sized {
     /// 从查询行装载实体。
     fn from_row(row: &DbRow) -> Result<Self>;
 
+    /// 由查询行集合装载实体集合（对应 C# `DataRowEntityAccessor.LoadData`）。
+    /// <param name="rows">数据行</param>
+    /// <returns>实体集合</returns>
+    fn from_rows(rows: &[DbRow]) -> Result<Vec<Self>> {
+        rows.iter().map(Self::from_row).collect()
+    }
+
+    /// 由结果集装载实体集合（行集 → 实体集合，无数据时返回空集合）。
+    /// <param name="set">结果集</param>
+    /// <returns>实体集合</returns>
+    fn load(set: &crate::session::RowSet) -> Result<Vec<Self>> {
+        Self::from_rows(&set.rows)
+    }
+
     /// 插入后回写自增主键（由生成代码实现；无自增实体无需覆盖）。
     fn set_identity(&mut self, value: i64) -> Result<()> {
         let _ = value;

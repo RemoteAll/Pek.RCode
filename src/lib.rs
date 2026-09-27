@@ -39,7 +39,8 @@
 //! | MongoDB | ✅ | ✅（SQL 子集翻译为文档操作；无 DDL） |
 //! | NovaDb | ✅ | ✅（复用 MySQL 驱动） |
 //!
-//! `network` 与 `sqlce` 明确不支持（拆返回可操作提示）。
+//! `network` 为远程驱动（登录远端探明类型后转发 SQL，见 `network` 模块）；
+//! `sqlce` 明确不支持（SSCE 运行时已停更）。
 //!
 //! ## 快速开始
 //!
@@ -78,6 +79,7 @@ compile_error!(
 );
 
 pub mod async_dal;
+pub mod backup;
 pub mod batch;
 pub mod cache;
 pub mod catalog;
@@ -101,10 +103,13 @@ pub mod http;
 pub mod influxdb;
 pub mod interceptor;
 pub mod membership;
+pub mod meta;
 pub mod model;
 pub mod mongodb;
 pub mod mssql;
 pub mod mysql;
+pub mod navigation;
+pub mod network;
 pub mod odbc;
 pub mod oracle;
 pub mod pool;

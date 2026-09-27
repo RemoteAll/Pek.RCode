@@ -152,6 +152,27 @@ pub trait SqlSession: Send {
         self.last_identity()
     }
 
+    /// 插入并返回自增主键（组合操作，对应 C# `DbSession.InsertAndGetIdentity`）。
+    ///
+    /// 默认实现为 `execute + last_identity_of(table)`；`network` 等需要把
+    /// "插入 + 取主键"整体转发给远端的驱动可覆写本方法。
+    /// <param name="sql">INSERT 语句</param>
+    /// <param name="params">参数</param>
+    /// <param name="table">表名（供 Oracle 序列等场景；`None` 表示用会话级自增函数）</param>
+    /// <returns>自增主键值</returns>
+    fn insert_and_get_identity(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+        table: Option<&str>,
+    ) -> Result<i64> {
+        self.execute(sql, params)?;
+        match table {
+            Some(table) => self.last_identity_of(table),
+            None => self.last_identity(),
+        }
+    }
+
     /// 表是否存在。
     fn table_exists(&mut self, table: &str) -> Result<bool>;
 

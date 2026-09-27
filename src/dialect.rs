@@ -114,7 +114,8 @@ impl DatabaseKind {
     /// 与 DH.NCode 支持的库对应关系：
     /// - HighGo（瀚高）/KingBase（金仓）/VastBase（海量）与 PostgreSQL 同协议，驱动直接复用
     /// - NovaDb 为 MySQL 系协议（端口 3306/反引号/`LAST_INSERT_ID()`），复用 MySQL 驱动
-    /// - `network`（XCode 远程服务协议）与 `sqlce`（已停更的 SQL Server Compact 运行时）不在数据库驱动范畴
+    /// - `network`（XCode 远程服务协议）由 `Dal::open`/`crate::network` 处理（类型需登录远端探明）；
+    ///   `sqlce`（已停更的 SQL Server Compact 运行时）不在数据库驱动范畴
     pub fn from_provider(name: &str) -> Result<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "sqlite" | "sqlite3" | "system.data.sqlite" | "microsoft.data.sqlite" => {
@@ -143,9 +144,9 @@ impl DatabaseKind {
             "dameng" | "dm" => Ok(DatabaseKind::DaMeng),
             "iris" | "iris.data.irisclient" => Ok(DatabaseKind::Iris),
             "access" | "microsoft.jet.oledb" | "oledb" | "ace" => Ok(DatabaseKind::Access),
+            // network 为远程驱动：类型需登录远端探明，由 `Dal::open` 优先处理（见 crate::network）
             "network" | "net" => Err(Error::Unsupported(
-                "provider=network 是 XCode 远程服务协议（转发 SQL 到远端 XCode 节点），不是数据库驱动；\
-                 请在目标节点上直接使用对应数据库的 provider"
+                "provider=network 的类型需登录远端探明：请通过 Dal::open 打开连接串（见 crate::network）"
                     .into(),
             )),
             "sqlce" => Err(Error::Unsupported(
@@ -157,6 +158,77 @@ impl DatabaseKind {
                 "未知的数据库类型 provider={other}\n支持：sqlite/mysql(nova)/sqlserver/postgresql(highgo/kingbase/vastbase)/oracle/\
                  duckdb/firebird/clickhouse/tdengine/influxdb/hana/mongodb/db2/dameng/iris/access"
             ))),
+        }
+    }
+
+    /// 由远端的类型名解析（兼容 C# `DatabaseType` 枚举名与 Rust `DatabaseKind` 调试名）。
+    ///
+    /// 用于 `provider=network`：登录远端后按其返回的数据库类型名确定本地方言。
+    /// 国产/衍生库归并到协议族：KingBase/HighGo/VastBase → PostgreSQL，NovaDb → MySQL。
+    /// <param name="name">远端类型名（如 `SQLite`/`MySql`/`PostgreSQL`/`Sqlite`）</param>
+    /// <returns>数据库类型</returns>
+    pub fn from_remote_name(name: &str) -> Result<Self> {
+        let lower = name.trim().to_ascii_lowercase();
+
+        // 兼容 C# `DatabaseType` 枚举的数值序列（NewLife JSON 可能序列化为数字）
+        if let Ok(code) = lower.parse::<i32>() {
+            let mapped = match code {
+                1 => "access",
+                2 => "sqlserver",
+                3 => "oracle",
+                4 => "mysql",
+                5 => "sqlce",
+                6 => "sqlite",
+                8 => "postgresql",
+                9 => "dameng",
+                10 => "db2",
+                11 => "tdengine",
+                12 => "hana",
+                13 => "kingbase",
+                14 => "highgo",
+                15 => "iris",
+                16 => "vastbase",
+                17 => "influxdb",
+                18 => "novadb",
+                19 => "clickhouse",
+                20 => "duckdb",
+                21 => "mongodb",
+                100 => "network",
+                _ => {
+                    return Err(Error::Unsupported(format!(
+                        "未知的远端数据库类型编号：{code}"
+                    )));
+                }
+            };
+            return Self::from_remote_name(mapped);
+        }
+
+        match lower.as_str() {
+            "sqlite" => Ok(DatabaseKind::Sqlite),
+            "mysql" | "mariadb" | "novadb" | "nova" => Ok(DatabaseKind::MySql),
+            "sqlserver" | "mssql" => Ok(DatabaseKind::SqlServer),
+            "oracle" => Ok(DatabaseKind::Oracle),
+            "postgresql" | "postgres" | "kingbase" | "highgo" | "vastbase" => {
+                Ok(DatabaseKind::PostgreSql)
+            }
+            "duckdb" => Ok(DatabaseKind::DuckDb),
+            "firebird" | "fb" => Ok(DatabaseKind::Firebird),
+            "clickhouse" => Ok(DatabaseKind::ClickHouse),
+            "tdengine" => Ok(DatabaseKind::TDengine),
+            "influxdb" => Ok(DatabaseKind::InfluxDb),
+            "hana" => Ok(DatabaseKind::Hana),
+            "db2" => Ok(DatabaseKind::Db2),
+            "dameng" | "da_meng" => Ok(DatabaseKind::DaMeng),
+            "iris" => Ok(DatabaseKind::Iris),
+            "access" => Ok(DatabaseKind::Access),
+            "mongodb" | "mongo" => Ok(DatabaseKind::MongoDb),
+            "network" | "net" => Err(Error::Unsupported(
+                "远端类型仍为 network（不支持多级转发）".into(),
+            )),
+            "sqlce" => Err(Error::Unsupported(
+                "远端为 SqlCe：SSCE 运行时已停更，本端无法使用".into(),
+            )),
+            other => Err(Error::Unsupported(format!("未知的远端数据库类型：{other}"))),
         }
     }
 

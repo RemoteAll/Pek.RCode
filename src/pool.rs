@@ -274,6 +274,19 @@ impl SqlSession for PooledSession {
         result
     }
 
+    fn insert_and_get_identity(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+        table: Option<&str>,
+    ) -> Result<i64> {
+        let result = self
+            .inner_mut()
+            .insert_and_get_identity(sql, params, table);
+        self.note(&result);
+        result
+    }
+
     fn table_exists(&mut self, table: &str) -> Result<bool> {
         let result = self.inner_mut().table_exists(table);
         self.note(&result);

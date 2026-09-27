@@ -12,6 +12,10 @@
 //!
 //! # Oracle（需 Instant Client；ServiceName 指向测试服务）
 //! $env:RCODE_ORACLE = "Server=127.0.0.1;Port=1521;ServiceName=xepdb1;Uid=rcode;Pwd=***;provider=oracle"
+//!
+//! # network（SQL 转发到远端 XCode DbServer；服务端可为 C# `DbServer` 或本仓 examples/dbserver）
+//! cargo run --example dbserver -- "Data Source=demo.db;Provider=SQLite" 3305 tk123
+//! $env:RCODE_NETWORK = "Server=http://127.0.0.1:3305;Database=Demo;Password=tk123;provider=network"
 //! ```
 //!
 //! 安全说明：测试只创建/删除带 `rcode_test_` 前缀的专用表（Oracle 另含 `SEQ_rcode_test_item` 序列），
@@ -346,4 +350,117 @@ fn oracle_roundtrip_when_configured() {
     let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
     assert_eq!(dal.kind(), DatabaseKind::Oracle);
     run_roundtrip(&dal);
+}
+
+/// network 驱动全链路（不包含建表迁移与事务：网络协议未提供，语义对齐 C# `Network.cs`）。
+fn run_network_roundtrip(dal: &Dal) {
+    let mut session = dal.open_session().unwrap();
+
+    // 1) 插入：自增主键由远端 `Db/InsertAndGetIdentity` 返回（经连接池会话转发）
+    let base = chrono::NaiveDate::from_ymd_opt(2026, 9, 27)
+        .unwrap()
+        .and_hms_micro_opt(10, 30, 0, 123_000)
+        .unwrap();
+    let mut item1 = RCodeTestItem {
+        code: "A-001".into(),
+        amount: "12.3400".parse().unwrap(),
+        ok: true,
+        s_id: Some(9_000_000_001),
+        create_time: base,
+        data: None, // BLOB 参数经 JSON 文本传递（本端十六进制），跨语言编码可能不同，故跳过
+        ..RCodeTestItem::new()
+    };
+    let id1 = item1.insert(dal, session.as_mut()).unwrap();
+    assert!(id1 > 0, "自增主键应回写，实际 {id1}");
+    assert_eq!(i64::from(item1.id), id1);
+
+    // 2) find：全字段往返（中文/布尔/DECIMAL/Int64/时间）
+    let loaded = RCodeTestItem::find(dal, session.as_mut(), &[id1.into()])
+        .unwrap()
+        .expect("按主键应能查到");
+    assert_eq!(loaded.code, "A-001");
+    assert_eq!(loaded.amount, "12.3400".parse().unwrap());
+    assert!(loaded.ok);
+    assert_eq!(loaded.s_id, Some(9_000_000_001));
+    let delta = (loaded.create_time - base).num_microseconds().unwrap().abs();
+    assert!(delta < 1_000, "时间应精确到毫秒以内，实际偏差 {delta}us");
+
+    // 3) save：新增与更新分支
+    let mut item2 = RCodeTestItem {
+        code: "你好，远端".into(),
+        ..RCodeTestItem::new()
+    };
+    item2.save(dal, session.as_mut()).unwrap();
+    assert!(item2.id > 0, "save 新增应回写主键");
+    item2.code = "已更新".into();
+    item2.save(dal, session.as_mut()).unwrap();
+    let reloaded = RCodeTestItem::find(dal, session.as_mut(), &[i64::from(item2.id).into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.code, "已更新");
+    assert_eq!(reloaded.s_id, None, "NULL 字段应往返为 None");
+
+    // 4) count / 条件查询 / 分页（分页按远端类型套用）
+    assert_eq!(RCodeTestItem::count(dal, session.as_mut(), None).unwrap(), 2);
+    let filtered = RCodeTestItem::query(
+        dal,
+        session.as_mut(),
+        &Query::new().filter(Where::new().like("Code", "A-%")),
+    )
+    .unwrap();
+    assert_eq!(filtered.len(), 1);
+    let paged = RCodeTestItem::query(dal, session.as_mut(), &Query::new().page(1, 1)).unwrap();
+    assert_eq!(paged.len(), 1);
+    assert_eq!(RCodeTestItem::all(dal, session.as_mut()).unwrap().len(), 2);
+
+    // 5) 字符串主键：insert + 更新分支 save
+    let mut kv = RCodeTestKey {
+        key: "k-001".into(),
+        value: Some("v1".into()),
+    };
+    kv.save(dal, session.as_mut()).unwrap();
+    kv.value = Some("v2".into());
+    kv.save(dal, session.as_mut()).unwrap();
+    let loaded_key = RCodeTestKey::find(dal, session.as_mut(), &["k-001".into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded_key.value.as_deref(), Some("v2"));
+
+    // 6) delete
+    assert_eq!(reloaded.delete(dal, session.as_mut()).unwrap(), 1);
+
+    // 7) 事务：网络协议未提供，明确报错（对齐 C# `Network` 无法真正生效的事务）
+    assert!(session.begin().is_err(), "network 驱动应明确拒绝事务");
+}
+
+#[test]
+fn network_roundtrip_when_configured() {
+    let Some(conn) = std::env::var("RCODE_NETWORK").ok() else {
+        eprintln!("跳过：未设置 RCODE_NETWORK（参见文件头运行说明）");
+        return;
+    };
+    let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
+    eprintln!("network 远端数据库类型：{:?}", dal.kind());
+
+    // 网络驱动不在本端做结构迁移（对齐 C# NetworkMetaData 空实现）：显式建表供测试
+    cleanup(&dal);
+    {
+        let model = dal.model().unwrap();
+        let mut session = dal.open_session().unwrap();
+        for table in &model.tables {
+            for sql in dal.kind().create_table_sql(table) {
+                session.execute(&sql, &[]).unwrap();
+            }
+        }
+        let exists = session.table_exists(RCodeTestItem::TABLE_NAME).unwrap_or(false);
+        eprintln!("远端 table_exists({}) = {exists}", RCodeTestItem::TABLE_NAME);
+    }
+    assert!(
+        dal.sync_schema().unwrap().is_empty(),
+        "网络驱动不应执行本地结构迁移"
+    );
+
+    run_network_roundtrip(&dal);
+
+    cleanup(&dal);
 }

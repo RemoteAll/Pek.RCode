@@ -16,14 +16,16 @@
 //!   `{code, data, msg}`（与 C# `ApiHelper.ProcessResponse` 兼容，无 `code` 时按原样返回）；
 //! - C# 的 `DbServer`/`DbController` 绑定 NewLife.Http/MVC；Rust 版提供不绑定框架的
 //!   [`DbService`]，路由参数到方法的映射由宿主完成；
-//! - Rust 服务端按参数字典的字母序绑定占位符（serde_json Map 语义），详见 [`DbService::query`]。
+//! - 参数绑定对齐 C#：命名占位符（`@p0`/`:p0`/`?p0`）**按名绑定**；无命名占位符时
+//!   按字典键序（字母序）兼容绑定（见 `bind_forwarded`）。
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::dal::Dal;
+use crate::dal::{ConnectionString, Dal};
+use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
 use crate::http;
 use crate::model::TableMeta;
@@ -38,7 +40,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct DbRequest {
     /// SQL 语句。
     pub sql: Option<String>,
-    /// SQL 参数字典（按字母序绑定占位符）。
+    /// SQL 参数字典（命名占位符 `p0`/`p1`… 按名绑定；否则按字典键序绑定）。
     pub parameters: BTreeMap<String, Value>,
 }
 
@@ -111,8 +113,7 @@ impl DbService {
 
     /// 执行 SQL 查询，返回结果集（对齐 `Query`）。
     ///
-    /// 参数按 [`BTreeMap`] 的键序（字母序）绑定到 SQL 的位置占位符；
-    /// 跨语言调用建议使用命名占位符的方言（如 SQL Server `@name`）。
+    /// 参数绑定：命名占位符（`@p0`/`:p0`/`?p0`）按名绑定；否则按字典键序兼容绑定。
     /// <param name="dal">数据访问层</param>
     /// <param name="sql">SQL 语句</param>
     /// <param name="parameters">参数字典</param>
@@ -121,9 +122,9 @@ impl DbService {
         if sql.is_empty() {
             return Err(Error::Argument("SQL不能为空".into()));
         }
-        let params = to_params(parameters);
+        let (sql, params) = bind_forwarded(dal.kind(), sql, parameters);
         let mut session = dal.open_session()?;
-        session.query(sql, &params)
+        session.query(&sql, &params)
     }
 
     /// 执行 SQL 查询并返回 **DbTable v3 二进制报文**（对齐 C# `DbController.Query` 的 `rs.ToPacket()`）。
@@ -153,9 +154,9 @@ impl DbService {
         if sql.is_empty() {
             return Err(Error::Argument("SQL不能为空".into()));
         }
-        let params = to_params(parameters);
+        let (sql, params) = bind_forwarded(dal.kind(), sql, parameters);
         let mut session = dal.open_session()?;
-        session.execute(sql, &params)
+        session.execute(&sql, &params)
     }
 
     /// 执行插入语句并返回自增标识（对齐 `InsertAndGetIdentity`）。
@@ -172,10 +173,9 @@ impl DbService {
         if sql.is_empty() {
             return Err(Error::Argument("SQL不能为空".into()));
         }
-        let params = to_params(parameters);
+        let (sql, params) = bind_forwarded(dal.kind(), sql, parameters);
         let mut session = dal.open_session()?;
-        session.execute(sql, &params)?;
-        session.last_identity()
+        session.insert_and_get_identity(&sql, &params, None)
     }
 
     /// 快速查询单表记录数（对齐 `QueryCount`）。
@@ -237,6 +237,20 @@ impl DbClient {
             token: token.map(str::to_string),
             timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// 从 XCode 风格连接串构造（`Server`/`Database`/`Password` 三键；供 `provider=network` 驱动）。
+    /// <param name="conn_str">连接串</param>
+    /// <returns>HTTP 客户端</returns>
+    pub fn from_connection_string(conn_str: &ConnectionString) -> Result<Self> {
+        let server = conn_str
+            .get("server")
+            .ok_or_else(|| Error::Model("network 连接串缺少 Server 地址".into()))?;
+        let database = conn_str
+            .get("database")
+            .ok_or_else(|| Error::Model("network 连接串缺少 Database 名称".into()))?;
+        let token = conn_str.get("password").or(conn_str.get("token"));
+        Ok(Self::new(server, database, token))
     }
 
     /// 登录到远端数据库服务（对齐 `LoginAsync`）。
@@ -363,13 +377,91 @@ impl DbClient {
     }
 }
 
-/// 参数转换：JSON 字典 → 位置参数数组（按字母序，对齐 `DbService` 的绑定说明）。
+/// 参数绑定（对齐 C# `DbService.ConvertToDictionary` + `CreateParameters` 的**按名绑定**）。
+///
+/// - 请求 SQL 含命名占位符（`@p0`/`:p0`/`?p0`，由 `provider=network` 驱动或
+///   C# `DbClient` 转发产生）时：按出现顺序替换为本地方言占位符并取对应值；
+///   字典键兼容带前缀形式（C# `ConvertParameters` 用 `IDataParameter.ParameterName` 作键，
+///   如 `@p0`；本端发送时使用同名键）；
+/// - SQL 不含命名占位符时（JSON 客户端的位置占位符 `?`）：保持兼容，按字典键序（字母序）绑定。
+/// <param name="kind">本地数据库类型（决定替换后的占位符风格）</param>
+/// <param name="sql">SQL 语句</param>
 /// <param name="parameters">参数字典</param>
-/// <returns>数据库值数组</returns>
-fn to_params(parameters: Option<&BTreeMap<String, Value>>) -> Vec<DbValue> {
-    parameters
-        .map(|ps| ps.values().map(json_to_db_value).collect())
-        .unwrap_or_default()
+/// <returns>重写后的 SQL 与按序参数</returns>
+fn bind_forwarded(
+    kind: DatabaseKind,
+    sql: &str,
+    parameters: Option<&BTreeMap<String, Value>>,
+) -> (String, Vec<DbValue>) {
+    let Some(ps) = parameters.filter(|p| !p.is_empty()) else {
+        return (sql.to_string(), Vec::new());
+    };
+
+    // 占位符名 → 值（键兼容带前缀：@p0/:p0/?p0）
+    let mut by_name: BTreeMap<&str, &Value> = BTreeMap::new();
+    for (k, v) in ps {
+        let stripped = k.trim_start_matches(['@', ':', '?']);
+        by_name.entry(stripped).or_insert(v);
+    }
+
+    // 扫描命名占位符（跳过字符串字面量与 `::` 类型转换）
+    let bytes = sql.as_bytes();
+    let mut hits: Vec<(usize, usize, Value)> = Vec::new();
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            // 字符串内的 '' 转义
+            if in_string && bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            i += 1;
+            continue;
+        }
+        if b == b':' && bytes.get(i + 1) == Some(&b':') {
+            i += 2;
+            continue;
+        }
+        if matches!(b, b'@' | b':' | b'?') {
+            let mut j = i + 1;
+            if j < bytes.len() && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'_') {
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                let name = &sql[i + 1..j];
+                if let Some(value) = by_name.get(name) {
+                    hits.push((i, j, (*value).clone()));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if hits.is_empty() {
+        // 兼容路径：无命名占位符时按字典键序绑定（既有 JSON 客户端行为）
+        return (sql.to_string(), ps.values().map(json_to_db_value).collect());
+    }
+
+    let mut out = String::with_capacity(sql.len() + hits.len() * 2);
+    let mut values = Vec::with_capacity(hits.len());
+    let mut last = 0usize;
+    for (index, (start, end, value)) in hits.iter().enumerate() {
+        out.push_str(&sql[last..*start]);
+        out.push_str(&kind.placeholder(index));
+        values.push(json_to_db_value(value));
+        last = *end;
+    }
+    out.push_str(&sql[last..]);
+    (out, values)
 }
 
 /// JSON 值转换为数据库值。
@@ -602,6 +694,67 @@ mod tests {
         assert!(svc.execute(&dal, "", None).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forwarded_parameters_bind_by_name() {
+        // 命名占位符 + 不带前缀键（Rust network 客户端）
+        let mut ps = BTreeMap::new();
+        ps.insert("p0".to_string(), json!(7));
+        ps.insert("p1".to_string(), json!("a"));
+        let (sql, values) = bind_forwarded(
+            DatabaseKind::Sqlite,
+            "SELECT * FROM T WHERE A=@p0 AND B=:p1",
+            Some(&ps),
+        );
+        assert_eq!(sql, "SELECT * FROM T WHERE A=? AND B=?");
+        assert_eq!(values, vec![DbValue::Int(7), DbValue::Text("a".into())]);
+
+        // 命名占位符 + 带前缀键（C# DbClient `ConvertParameters` 风格）
+        let mut ps = BTreeMap::new();
+        ps.insert("@p0".to_string(), json!(7));
+        ps.insert(":p1".to_string(), json!("a"));
+        let (sql, values) = bind_forwarded(
+            DatabaseKind::PostgreSql,
+            "SELECT * FROM T WHERE A=@p0 AND B=:p1",
+            Some(&ps),
+        );
+        assert_eq!(sql, "SELECT * FROM T WHERE A=$1 AND B=$2");
+        assert_eq!(values, vec![DbValue::Int(7), DbValue::Text("a".into())]);
+
+        // 顺序按占位符出现次序（而非键序）
+        let mut ps = BTreeMap::new();
+        ps.insert("p2".to_string(), json!("x"));
+        ps.insert("p0".to_string(), json!(1));
+        let (sql, values) = bind_forwarded(
+            DatabaseKind::SqlServer,
+            "SELECT * FROM T WHERE A=@p2 AND B=@p0",
+            Some(&ps),
+        );
+        assert_eq!(sql, "SELECT * FROM T WHERE A=@p0 AND B=@p1");
+        assert_eq!(values, vec![DbValue::Text("x".into()), DbValue::Int(1)]);
+
+        // 字符串字面量中的占位符不替换
+        let mut ps = BTreeMap::new();
+        ps.insert("p0".to_string(), json!(1));
+        let (sql, values) = bind_forwarded(
+            DatabaseKind::Sqlite,
+            "SELECT '@p0', * FROM T WHERE A=@p0",
+            Some(&ps),
+        );
+        assert_eq!(sql, "SELECT '@p0', * FROM T WHERE A=?");
+        assert_eq!(values, vec![DbValue::Int(1)]);
+
+        // 无命名占位符：按字典键序兼容绑定
+        let mut ps = BTreeMap::new();
+        ps.insert("Name".to_string(), json!("n"));
+        let (sql, values) = bind_forwarded(
+            DatabaseKind::Sqlite,
+            "SELECT * FROM T WHERE A=?",
+            Some(&ps),
+        );
+        assert_eq!(sql, "SELECT * FROM T WHERE A=?");
+        assert_eq!(values, vec![DbValue::Text("n".into())]);
     }
 
     #[test]

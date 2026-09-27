@@ -48,13 +48,13 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `cache` | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | ✅ 整表实体缓存 + 单对象缓存（默认 60s 过期；写入自动失效）；✅ Redis 版本号（feature `redis`，底层为 **Pek.RRedis** 自研客户端） |
 | `reverse` | `DAL.GetTables`（反向工程） | ✅ 数据库 → `EntityModel` / `Model.xml`（**全部驱动**、含索引/唯一约束；`rcodegen --conn`） |
 | `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count`；`AuditExt` 审计字段访问；`#[derive(Entity)]` 宏 |
-| `db_service` | `Services`（`DbServer` / `DbClient`） | ✅ 远程服务层 + HTTP 客户端；`/Db/Query` 为 **DbTable v3 二进制**（与 C# `DbClient` 双向互通，黄金样本逐字节验证） |
+| `db_service` | `Services`（`DbServer` / `DbClient`） | ✅ 远程服务层 + HTTP 客户端；`/Db/Query` 为 **DbTable v3 二进制**（与 C# `DbClient` 双向互通，黄金样本逐字节验证）；配套 `provider=network` 驱动与 `examples/dbserver` 参考宿主 |
 | `simulation` | `Common/DataSimulation` | ✅ 造数压测（随机整型/字符串/时间 + 分批事务 + TPS） |
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`） |
 
-测试：**216 项全部通过**（库单测 193 + 集成 16 + 文档测试 7；`--features duckdb` 全量 223 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 217 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 216 项（rustls TLS 后端）；
-MySQL / PostgreSQL / SQL Server / Oracle 端到端用例在有真实库时自动启用），
+测试：**220 项全部通过**（库单测 196 + 集成 17 + 文档测试 7；`--features duckdb` 全量 227 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 221 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 220 项（rustls TLS 后端）；
+MySQL / PostgreSQL / SQL Server / Oracle / network 端到端用例在有真实库/服务时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
 （远端库侧用与 `rcodegen` 输出同构的实体，覆盖 insert/save 新增与更新双分支/find/query/count/delete/事务）、
@@ -71,8 +71,8 @@ DH.NCode 内置的全部数据库驱动均已接入（provider 名称与 XCode �
 
 | 状态 | 数据库 |
 |------|--------|
-| ✅ 已接入驱动 | SQLite、MySQL/MariaDB、SQL Server、PostgreSQL（含 HighGo/瀚高、KingBase/金仓、VastBase/海量）、Oracle、DuckDB、ClickHouse、TDengine、InfluxDB、SAP HANA、Firebird、DB2、达梦（DaMeng）、IRIS、Access、MongoDB、NovaDb（复用 MySQL 协议） |
-| ⚠️ 明确不支持 | `network`（并非数据库，为网络接入占位）、`sqlce`（SSCE 已停止维护且无可行运行时） |
+| ✅ 已接入驱动 | SQLite、MySQL/MariaDB、SQL Server、PostgreSQL（含 HighGo/瀚高、KingBase/金仓、VastBase/海量）、Oracle、DuckDB、ClickHouse、TDengine、InfluxDB、SAP HANA、Firebird、DB2、达梦（DaMeng）、IRIS、Access、MongoDB、NovaDb（复用 MySQL 协议）、**network**（XCode 远程服务协议：SQL 转发到远端 DbServer，服务端可为 C# `DbServer` 或本仓 `examples/dbserver`） |
+| ⚠️ 边界 | `sqlce`（SSCE 已停止维护且无可行运行时；建议迁移 SQLite） |
 
 ---
 
@@ -254,13 +254,17 @@ DH.NCode 内置的其余数据库均已接入，按 `provider` 分发：
 | `db2` / `dameng` / `iris` / `access` | `Driver={...};...` 直通 ODBC；或 XCode 风格模板（缺省巴适） | 经 odbc-api 桥接本机 ODBC 驱动 |
 | `mongodb` | `Server=..;Port=27017;Database=..`（或 `Uri=mongodb://...`） | SQL 子集翻译为文档操作；无 DDL（`sync_schema` 自动跳过） |
 | `nova` | 同 MySQL | NovaDb 走 MySQL 协议（声明为 MySql 驱动） |
-| `network` / `sqlce` | — | 明确不支持（拆返回可操作提示：前者非数据库，后者 SSCE 已停止维护） |
+| `network` | `Server=http://..;Database=连接名;Password=令牌` | SQL 转发到远端 XCode DbServer（C# `DbServer` 或本仓 `examples/dbserver`）；打开即登录探明远端类型（占位符/分页按远端方言）；无事务转发、无本地结构迁移 |
+| `sqlce` | — | 明确不支持（SSCE 已停止维护） |
 
 - 这些库的方言（类型/DDL/分页/自增/引用）与连接串解析均已有单测；网络型驱动另单测覆盖值转换与语句翻译
 - DuckDB 使用提示：① `:memory:` 内存库为“每连接独立”，多连接流程（先 `sync_schema` 再 `open_session`）请用**文件库**；
   ② 文件库同一文件不允许并存两个连接（含同进程），操作需串行（与 SQLite 的多进程并发方案不同）
 - DuckDB 因内嵌无需外部实例，直接在每台机器跑 `cargo test --features duckdb` 即可（含内嵌引擎全链路用例）
 - 其余网络库的端到端用例在本机有实例时可按环境变量门控启用（见 `tests/remote_e2e.rs`）
+- **`network`** 端到端（Rust ↔ Rust 或 C# ↕ Rust）：先 `cargo run --example dbserver -- "Data Source=demo.db;Provider=SQLite" 3305 tk123`，
+  再设 `RCODE_NETWORK="Server=http://127.0.0.1:3305;Database=Demo;Password=tk123;provider=network"` 跑 `cargo test --test remote_e2e network`；
+  服务端也可换成 C# `DbServer`（`Service.Tokens["tk123"] = ["Demo"]`）
 
 ### 实体生成工具（对应 C# 的 `xcode` 命令）
 
@@ -374,17 +378,20 @@ Pek.RCode/
 │   ├── reverse.rs    反向工程：数据库结构 → EntityModel / Model.xml（对应 DAL.GetTables）
 │   ├── entity.rs     Entity trait（对象实体的 CRUD/查询默认实现）
 │   ├── db_service.rs 远程服务层 + HTTP 客户端（DbServer/DbClient，DbTable v3 二进制互通）
+│   ├── network.rs    provider=network 驱动（转发 SQL、登录探明远端类型、远端表结构探测）
 │   ├── codegen.rs    Model.xml → Rust 对象实体
 │   ├── bin/
 │   │   └── rcodegen.rs   实体生成命令行工具
 │   └── error.rs      统一错误
+├── examples/
+│   └── dbserver.rs   参考服务端宿主（DbService → 极简 HTTP，对齐 C# DbServer）
 └── tests/
     ├── fixtures/wms_model_sample.xml   生产模型快照固件（7 张表 / 8 种类型）
     ├── fixtures/dbtable_v3_sample.bin  DbTable v3 二进制黄金样本（真实 C# NewLife.Core 生成）
     ├── entity_layer.rs                 对象实体端到端（insert/save/update/delete）
     ├── model_e2e.rs                    固件端到端（方言 DDL / SQLite CRUD / 代码生成）
     ├── mysql_e2e.rs                    MySQL 真实库端到端（RCODE_MYSQL 门控）
-    ├── remote_e2e.rs                   PostgreSQL / SQL Server / Oracle 端到端（环境变量门控）
+    ├── remote_e2e.rs                   PostgreSQL / SQL Server / Oracle / network 端到端（环境变量门控）
     ├── reverse_e2e.rs                  反向工程 roundtrip（固件建库 → 反向 → 逐列对比 → 再生成实体）
     └── live_sqlite_e2e.rs              真实 SQLite 历史库副本兼容性验证（RCODE_LIVE_DB + RCODE_MODEL 门控）
 ```
@@ -405,6 +412,13 @@ Pek.RCode/
 8. **基础库下沉** ✅ 时间文本格式/解析、MD5 摘要、文本文件读写（BOM 兼容）等基础方法下沉到 **DH.RustBase**（crate `dhrust` 0.1.4）；Pek.RCode 与 Pek.RRedis 均已 path 依赖复用（不再各自内联实现）
 9. **远程服务协议互通** ✅ `/Db/Query` 采用 NewLife **DbTable v3 二进制**（`dbtable` 模块：7 位压缩整数、大端浮点、Decimal 四元组、DateTime 刻度、`System.Byte[]`/`Guid`）；`DbService::query_packet` 输出报文、`DbClient::query_rowset` 自动识别二进制（C# `DbServer`）与 JSON（Rust 宿主）应答；黄金样本由**真实 C# NewLife.Core** 生成，编码**逐字节一致**、双向互读验证通过
 10. **MSPageSplit（可选能力）** ✅ `PageStyle::RowNumber`（`Query::page_style`）：SQL Server 2005/2008 的 `ROW_NUMBER()` 双层分页（对齐 `MSPageSplit.RowNumber`，含无排序兜底）；DH.NCode 现行默认仍为 2012+ `OFFSET..FETCH`，Rust 默认行为与其保持一致
+11. **`provider=network` 远程驱动** ✅ `network` 模块（对齐 `Database/Network.cs`：`Server`/`Database`/`Password` → `DbClient`，`Dal::open` 登录探明远端类型后委托其格式化/分页）；SQL 转发占位符改写为远端命名式（`@p0`/`:p0`/`?p0`，与 C# `FormatParameterName`/`ConvertParameters` 一致）、插入走远端 `Db/InsertAndGetIdentity`、`sync_schema` 不建表（对齐 `NetworkMetaData` 空实现）、事务明确拒绝；另附 `examples/dbserver` 参考宿主（Rust ↔ Rust 全链路实机验证通过，C# `DbServer` 亦可作为服务端）
+
+**完整性审计新发现（待补，2026-09-27 文件级抽查）**：
+
+1. **`DAL_Backup`**：表数据备份/恢复（文件）与跨库同步（`Sync`/`SyncAll`）尚未迁移
+2. **`DbMetaData` 在线库管理**：建库/删库/库列表等（`sync_schema` 仅覆盖结构同步）
+3. **实体导航属性**（`Navigation*`）与 `DataRowEntityAccessor`：现为链式/映射近似（语义近似，非对等）
 
 **边界确认（非待办）**：
 
