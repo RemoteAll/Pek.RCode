@@ -47,7 +47,10 @@ pub struct DbRequest {
 /// 登录信息（对齐 `LoginInfo`；服务端返回给客户端的数据库信息）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LoginInfo {
-    /// 数据库类型名（Rust 枚举调试名，如 `Sqlite`/`MySql`/`SqlServer`）。
+    /// 数据库类型名（C# `DatabaseType` 规范枚举名，如 `SQLite`/`MySql`/`SqlServer`）。
+    ///
+    /// 必须与 C# 枚举名逐字一致：NewLife 反序列化枚举区分大小写，`Sqlite` 等 Rust
+    /// 调试名会导致 C# `DbClient` 登录失败（实测）；Rust 客户端解析不区分大小写。
     pub db_type: String,
     /// 服务端数据库版本（Rust 版不主动连接探测，通常为空）。
     pub version: String,
@@ -106,7 +109,8 @@ impl DbService {
     /// <returns>登录信息</returns>
     pub fn login_info(&self, dal: &Dal) -> LoginInfo {
         LoginInfo {
-            db_type: format!("{:?}", dal.kind()),
+            // 用 C# `DatabaseType` 规范名（而非 Rust 调试名），保证 C# 客户端可反序列化
+            db_type: dal.kind().name().to_string(),
             version: String::new(),
         }
     }
@@ -179,15 +183,31 @@ impl DbService {
     }
 
     /// 快速查询单表记录数（对齐 `QueryCount`）。
+    ///
+    /// 有模型时走 [`crate::dal::TableRef::count`]；无模型/模型缺表时退化为
+    /// 原始 `SELECT COUNT(*)`——Rust `DbServer` 宿主可不加载 Model.xml
+    /// 直接服务 C# `Network` 驱动的 `QueryCountFast`。
     /// <param name="dal">数据访问层</param>
-    /// <param name="table">表名（模型名）</param>
+    /// <param name="table">表名</param>
     /// <returns>记录数</returns>
     pub fn query_count(&self, dal: &Dal, table: &str) -> Result<i64> {
         if table.is_empty() {
             return Err(Error::Argument("表名不能为空".into()));
         }
         let mut session = dal.open_session()?;
-        dal.table(table)?.count(session.as_mut(), None)
+        match dal.table(table) {
+            Ok(t) => t.count(session.as_mut(), None),
+            Err(_) => {
+                let sql = format!("SELECT COUNT(*) FROM {}", dal.kind().quote(table));
+                let set = session.query(&sql, &[])?;
+                Ok(set
+                    .rows
+                    .first()
+                    .and_then(|row| row.get(0))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0))
+            }
+        }
     }
 
     /// 获取远端数据库的表结构（对齐 `GetTables`）。
@@ -661,9 +681,9 @@ mod tests {
         let (dal, dir) = temp_dal("crud");
         let svc = DbService::new();
 
-        // 登录信息
+        // 登录信息（C# 规范枚举名）
         let info = svc.login_info(&dal);
-        assert_eq!(info.db_type, "Sqlite");
+        assert_eq!(info.db_type, "SQLite");
         assert!(info.version.is_empty());
 
         // 执行插入（无参数）
@@ -701,6 +721,41 @@ mod tests {
         // 空 SQL 报错
         assert!(svc.query(&dal, "", None).is_err());
         assert!(svc.execute(&dal, "", None).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_count_falls_back_without_model() {
+        // 无模型宿主（Rust DbServer 常见形态）也要能服务 C# 的 QueryCountFast
+        let stamp = chrono::Local::now()
+            .format("%H%M%S%.6f")
+            .to_string()
+            .replace('.', "");
+        let dir = std::env::temp_dir().join(format!("rcode-qc-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("raw.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+        let dal = Dal::open(&conn).unwrap();
+        {
+            let mut session = dal.open_session().unwrap();
+            session
+                .execute(
+                    "CREATE TABLE raw_t(id integer primary key autoincrement, name text)",
+                    &[],
+                )
+                .unwrap();
+            session
+                .execute("INSERT INTO raw_t(name) VALUES('a')", &[])
+                .unwrap();
+            session
+                .execute("INSERT INTO raw_t(name) VALUES('b')", &[])
+                .unwrap();
+        }
+
+        let svc = DbService::new();
+        assert_eq!(svc.query_count(&dal, "raw_t").unwrap(), 2);
+        assert!(svc.query_count(&dal, "").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

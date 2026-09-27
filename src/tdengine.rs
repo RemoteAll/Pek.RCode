@@ -11,7 +11,7 @@
 //! - TDengine 无事务：`begin/commit/rollback` 为空操作
 //!
 //! 建表说明：TDengine 3.x 要求首列必须是 TIMESTAMP，方言在生成 DDL 时会把
-//! 第一个时间列调整到首列（见 [`crate::dialect::create_table_sql`]）。
+//! 第一个时间列调整到首列（见 [`crate::dialect::DatabaseKind::create_table_sql`]）。
 
 use std::time::Duration;
 

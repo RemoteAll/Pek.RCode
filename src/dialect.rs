@@ -73,6 +73,10 @@ impl DatabaseKind {
     ];
 
     /// 显示名称。
+    ///
+    /// 与 C# `DatabaseType` 枚举名逐字保持一致（如 `SQLite`/`PostgreSQL`/`DuckDB`/`IRIS`），
+    /// 供 [`crate::db_service::DbService::login_info`] 返回给 C# `DbClient` 反序列化
+    /// （NewLife 枚举解析区分大小写，不能返回 `Sqlite` 这类 Rust 调试名）。
     pub fn name(&self) -> &'static str {
         match self {
             DatabaseKind::Sqlite => "SQLite",
@@ -85,7 +89,7 @@ impl DatabaseKind {
             DatabaseKind::ClickHouse => "ClickHouse",
             DatabaseKind::TDengine => "TDengine",
             DatabaseKind::InfluxDb => "InfluxDB",
-            DatabaseKind::Hana => "HANA",
+            DatabaseKind::Hana => "Hana",
             DatabaseKind::MongoDb => "MongoDB",
             DatabaseKind::Db2 => "DB2",
             DatabaseKind::DaMeng => "DaMeng",

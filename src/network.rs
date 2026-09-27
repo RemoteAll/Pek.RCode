@@ -25,6 +25,10 @@
 //! - C# 服务端已知缺陷：`DbController.Query` 的 `ToPacket()`（C# 源码已标注“暂时有问题”）
 //!   遇到同一列跨行存储类型不一致（如 SQLite decimal 列整数值行存 INTEGER、小数值行存 REAL）
 //!   会抛 `InvalidCastException`（HTTP 500）；Rust 服务端无此问题，联调时避开混用即可；
+//! - C# **客户端**已知缺陷：`DbClient.GetTablesAsync` 以 `GetAsync<String>` 请求 `Db/GetTables`，
+//!   而 C#/Rust 服务端应答均为 JSON 数组（实测 C#↔C# 对拍亦抛
+//!   `Unable to convert to type [System.String]!`），该接口经此客户端 API 不可用；
+//!   Rust 服务端返回形状与 C# 服务端一致（含 `Name`/`Columns`），本端表结构走探测查询不受影响；
 //!
 //! 与 C# 的差异：
 //! - C# 首次使用时惰性登录；Rust 在 `Dal::open` 即登录（配置错误快速暴露）；
@@ -195,6 +199,7 @@ impl NetworkSession {
     /// 探测远端表的列（`SELECT * FROM 表 WHERE 1=0`；表不存在时报错）。
     ///
     /// 不用远端 `GET Db/GetTables`：C# `IDataTable` 的 JSON 序列化不含列信息（实测），
+    /// 且 C# 客户端 `GetTablesAsync` 自身无法解析该接口（C#↔C# 对拍同败）。
     /// 探测查询在 C# 与 Rust 服务端下都可用，且能同时充当存在性判断。
     fn probe_columns(&mut self, table: &str) -> Result<Vec<String>> {
         let sql = format!("SELECT * FROM {} WHERE 1=0", self.kind.quote(table));
