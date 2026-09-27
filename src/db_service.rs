@@ -573,15 +573,24 @@ fn parse_envelope_i64(text: &str) -> Result<i64> {
         .ok_or_else(|| Error::Db("响应不是整数".into()))
 }
 
-/// 读取字符串字段（兼容多种大小写写法）。
+/// 读取字段文本（兼容多种大小写写法；数字枚举转为十进制文本）。
+///
+/// NewLife JSON 会把枚举序列化为**数字**（如 `DatabaseType.SQLite` → `"DbType":6`），
+/// 因此这里同时接受字符串与数字两种形式。
 /// <param name="data">JSON 对象</param>
 /// <param name="keys">候选键</param>
 /// <returns>字段值（缺失时为空字符串）</returns>
 fn get_str_field(data: &Value, keys: &[&str]) -> String {
     keys.iter()
-        .find_map(|k| data.get(*k).and_then(Value::as_str))
+        .find_map(|k| {
+            data.get(*k).and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            })
+        })
         .unwrap_or_default()
-        .to_string()
 }
 
 /// 对查询串参数做百分号编码（unreserved 字符不编码）。
@@ -694,6 +703,23 @@ mod tests {
         assert!(svc.execute(&dal, "", None).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn login_field_accepts_numeric_enum() {
+        // C# NewLife JSON：DatabaseType.SQLite → 数字 6
+        let data = json!({ "DbType": 6, "Version": "3.53.3" });
+        let db_type = get_str_field(&data, &["dbType", "DbType"]);
+        assert_eq!(db_type, "6");
+        assert_eq!(
+            crate::dialect::DatabaseKind::from_remote_name(&db_type).unwrap(),
+            crate::dialect::DatabaseKind::Sqlite
+        );
+        assert_eq!(get_str_field(&data, &["version", "Version"]), "3.53.3");
+
+        // Rust 服务端：枚举调试名（字符串）
+        let data = json!({ "DbType": "MySql" });
+        assert_eq!(get_str_field(&data, &["dbType", "DbType"]), "MySql");
     }
 
     #[test]

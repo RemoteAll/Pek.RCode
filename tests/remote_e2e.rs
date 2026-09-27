@@ -386,8 +386,12 @@ fn run_network_roundtrip(dal: &Dal) {
     assert!(delta < 1_000, "时间应精确到毫秒以内，实际偏差 {delta}us");
 
     // 3) save：新增与更新分支
+    // 注意：Amount 用小数（非整数值）——SQLite 的 NUMERIC 亲和性会把整数值 decimal 存成
+    // INTEGER、小数值存成 REAL；C# 服务端 `DbController.Query` 的 `ToPacket()`（C# 源码已
+    // 标注“暂时有问题”）遇同一列跨行存储类型不一致会抛 InvalidCastException，故联调避开。
     let mut item2 = RCodeTestItem {
         code: "你好，远端".into(),
+        amount: "3.5".parse().unwrap(),
         ..RCodeTestItem::new()
     };
     item2.save(dal, session.as_mut()).unwrap();
@@ -398,7 +402,13 @@ fn run_network_roundtrip(dal: &Dal) {
         .unwrap()
         .unwrap();
     assert_eq!(reloaded.code, "已更新");
-    assert_eq!(reloaded.s_id, None, "NULL 字段应往返为 None");
+    // NULL 经 DbTable 通道折叠为类型默认值（C# 服务端按列声明类型 → 0；
+    // Rust 服务端整列皆 NULL 时按空文本折叠 → None），与 C# 客户端↔C# 服务端行为一致
+    assert!(
+        reloaded.s_id.is_none() || reloaded.s_id == Some(0),
+        "NULL 字段应折叠为类型默认值，实际 {:?}",
+        reloaded.s_id
+    );
 
     // 4) count / 条件查询 / 分页（分页按远端类型套用）
     assert_eq!(RCodeTestItem::count(dal, session.as_mut(), None).unwrap(), 2);
@@ -452,8 +462,22 @@ fn network_roundtrip_when_configured() {
                 session.execute(&sql, &[]).unwrap();
             }
         }
-        let exists = session.table_exists(RCodeTestItem::TABLE_NAME).unwrap_or(false);
-        eprintln!("远端 table_exists({}) = {exists}", RCodeTestItem::TABLE_NAME);
+        // 建表后应能探测到（`SELECT * FROM 表 WHERE 1=0`）；缺表探测为 false
+        assert!(
+            session.table_exists(RCodeTestItem::TABLE_NAME).unwrap(),
+            "建表后远端应能探测到表"
+        );
+        assert!(
+            !session.table_exists("rcode_test_missing").unwrap(),
+            "不存在的表应探测为 false"
+        );
+        assert!(
+            !session
+                .table_columns(RCodeTestItem::TABLE_NAME)
+                .unwrap()
+                .is_empty(),
+            "应能取到远端列名"
+        );
     }
     assert!(
         dal.sync_schema().unwrap().is_empty(),

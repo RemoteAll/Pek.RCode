@@ -16,9 +16,15 @@
 //! - 事务：**不支持转发**（远端 `DbServer` 未提供事务接口，C# 侧同样无法真正生效）——
 //!   `begin`/`commit`/`rollback` 返回 [`Error::Unsupported`]；
 //! - 表结构：不在本端建表（对齐 C# `NetworkMetaData.OnSetTables` 空实现，`sync_schema` 返回空清单）；
-//!   `table_exists`/`table_columns` 通过远端 `GET Db/GetTables` 探测（结果缓存）；
+//!   `table_exists`/`table_columns` 用探测查询 `SELECT * FROM 表 WHERE 1=0`（C#/Rust 服务端通用）；
+//! - 参数：值为 NULL 的占位符**内联为 `NULL` 字面量**（C# 服务端会丢弃 NULL 参数，保留占位符会报缺少参数）；
+//! - 结果：查询值经 DbTable v3 通道传输，NULL 会折叠为类型默认值（C# 语义：
+//!   按列声明类型→ 0/空串；Rust 服务端整列皆 NULL 时按空文本折叠）；
 //! - 限制：二进制**参数**经 JSON 字符串传递（本端按十六进制），与 C# 的编码可能不同，
-//!   跨语言时建议避免传 BLOB 参数；二进制**结果列**走 DbTable 二进制通道不受影响。
+//!   跨语言时建议避免传 BLOB 参数；二进制**结果列**走 DbTable 二进制通道不受影响；
+//! - C# 服务端已知缺陷：`DbController.Query` 的 `ToPacket()`（C# 源码已标注“暂时有问题”）
+//!   遇到同一列跨行存储类型不一致（如 SQLite decimal 列整数值行存 INTEGER、小数值行存 REAL）
+//!   会抛 `InvalidCastException`（HTTP 500）；Rust 服务端无此问题，联调时避开混用即可；
 //!
 //! 与 C# 的差异：
 //! - C# 首次使用时惰性登录；Rust 在 `Dal::open` 即登录（配置错误快速暴露）；
@@ -66,16 +72,39 @@ fn remote_prefix(kind: DatabaseKind) -> char {
 
 /// 把本地方言 SQL 改写为远端命名占位符形式，并生成参数字典。
 ///
-/// - `?` → `{prefix}p{顺序号}`（按出现顺序消耗位置参数）；
-/// - `$N` / `:N`（1 基）→ `{prefix}p{N-1}`；
-/// - `@pN`（SqlServer 本地风格）原样保留；
+/// - `?` → `{prefix}p{新序号}`（按出现顺序消耗位置参数）；
+/// - `$N` / `:N`（1 基）与 `@pN`（SqlServer 本地风格）→ 按下标映射（同一下标重复引用复用同名）；
+/// - **NULL 值内联为 `NULL` 字面量**（不进字典）：C# 服务端 `DbService.ConvertToDictionary`
+///   会丢弃 NULL 参数，若占位符仍保留将报“缺少参数”；
 /// - 字符串字面量内的占位符不转换。
 fn translate(sql: &str, params: &[DbValue], kind: DatabaseKind) -> (String, BTreeMap<String, Value>) {
     let prefix = remote_prefix(kind);
     let mut out = String::with_capacity(sql.len() + params.len() * 5);
-    let mut index = 0usize;
+    let mut dict: BTreeMap<String, Value> = BTreeMap::new();
+    let mut assigned: Vec<Option<String>> = vec![None; params.len()];
+    let mut next = 0usize;
+    let mut sequential = 0usize;
     let mut chars = sql.char_indices().peekable();
     let mut in_string = false;
+
+    // 取某下标对应的占位符文本：NULL 内联、同名复用、新名登记
+    let mut placeholder = |idx: usize, out: &mut String| {
+        if let Some(name) = assigned.get(idx).and_then(|v| v.clone()) {
+            out.push_str(&name);
+            return;
+        }
+        if params.get(idx).map(|v| v.is_null()).unwrap_or(true) {
+            out.push_str("NULL");
+            return;
+        }
+        let name = format!("{prefix}p{next}");
+        next += 1;
+        dict.insert(name.clone(), db_value_to_json(&params[idx]));
+        if idx < assigned.len() {
+            assigned[idx] = Some(name.clone());
+        }
+        out.push_str(&name);
+    };
 
     while let Some((pos, ch)) = chars.next() {
         if ch == '\'' {
@@ -89,9 +118,8 @@ fn translate(sql: &str, params: &[DbValue], kind: DatabaseKind) -> (String, BTre
         }
         match ch {
             '?' => {
-                out.push(prefix);
-                out.push_str(&format!("p{index}"));
-                index += 1;
+                placeholder(sequential, &mut out);
+                sequential += 1;
             }
             '$' | ':' => {
                 // 跳过 PostgreSQL 的 `::` 类型转换
@@ -111,19 +139,32 @@ fn translate(sql: &str, params: &[DbValue], kind: DatabaseKind) -> (String, BTre
                     chars.next();
                 }
                 if let Ok(n) = digits.parse::<usize>() {
-                    let idx = n.saturating_sub(1);
-                    out.push(prefix);
-                    out.push_str(&format!("p{idx}"));
-                    index = index.max(idx + 1);
+                    placeholder(n.saturating_sub(1), &mut out);
+                }
+            }
+            '@' => {
+                // SqlServer 本地风格 `@pN`：按下标映射（NULL 同样内联）
+                let rest = &sql[pos + 1..];
+                let digits: String = rest
+                    .strip_prefix('p')
+                    .map(|r| r.chars().take_while(char::is_ascii_digit).collect())
+                    .unwrap_or_default();
+                if digits.is_empty() {
+                    out.push(ch);
+                    continue;
+                }
+                chars.next(); // 消耗 'p'
+                for _ in 0..digits.len() {
+                    chars.next();
+                }
+                if let Ok(n) = digits.parse::<usize>() {
+                    placeholder(n, &mut out);
                 }
             }
             _ => out.push(ch),
         }
     }
 
-    let dict: BTreeMap<String, Value> = (0..params.len())
-        .map(|i| (format!("{prefix}p{i}"), db_value_to_json(&params[i])))
-        .collect();
     (out, dict)
 }
 
@@ -133,8 +174,6 @@ pub struct NetworkSession {
     client: DbClient,
     /// 远端数据库类型（本地套用其方言规则）
     kind: DatabaseKind,
-    /// 远端表结构缓存（首次访问时拉取，对应远端 `GET Db/GetTables`）
-    tables: Option<Value>,
 }
 
 impl NetworkSession {
@@ -145,7 +184,6 @@ impl NetworkSession {
         Ok(Self {
             client: DbClient::from_connection_string(conn_str)?,
             kind,
-            tables: None,
         })
     }
 
@@ -154,59 +192,20 @@ impl NetworkSession {
         &self.client
     }
 
-    /// 远端表结构 JSON（首次访问拉取并缓存）。
-    fn remote_tables(&mut self) -> Result<&Value> {
-        if self.tables.is_none() {
-            self.tables = Some(self.client.get_tables()?);
-        }
-        Ok(self.tables.as_ref().expect("tables 已填充"))
+    /// 探测远端表的列（`SELECT * FROM 表 WHERE 1=0`；表不存在时报错）。
+    ///
+    /// 不用远端 `GET Db/GetTables`：C# `IDataTable` 的 JSON 序列化不含列信息（实测），
+    /// 探测查询在 C# 与 Rust 服务端下都可用，且能同时充当存在性判断。
+    fn probe_columns(&mut self, table: &str) -> Result<Vec<String>> {
+        let sql = format!("SELECT * FROM {} WHERE 1=0", self.kind.quote(table));
+        let set = self.query(&sql, &[])?;
+        Ok(set.columns.as_ref().clone())
     }
 }
 
 /// 事务不支持的统一错误。
 fn tx_unsupported() -> Error {
     Error::Unsupported("network 驱动不支持事务转发：远端 DbServer 未提供事务接口".into())
-}
-
-/// 从远端表结构 JSON 提取列表（兼容裸数组、`{data:[...]}`、`{items:[...]}` 信封）。
-fn table_items(value: &Value) -> Vec<&Value> {
-    value
-        .as_array()
-        .or_else(|| value.get("data").and_then(Value::as_array))
-        .or_else(|| value.get("items").and_then(Value::as_array))
-        .map(|a| a.iter().collect())
-        .unwrap_or_default()
-}
-
-/// 表名（兼容 `Name`/`name`/`TableName`/`tableName` 与字符串元素）。
-fn item_name(item: &Value) -> Option<&str> {
-    if let Some(s) = item.as_str() {
-        return Some(s);
-    }
-    ["Name", "name", "TableName", "tableName"]
-        .iter()
-        .find_map(|k| item.get(*k).and_then(Value::as_str))
-}
-
-/// 列名（兼容 `Columns`/`columns` 数组，元素为字符串或含 Name 的对象）。
-fn item_columns(item: &Value) -> Vec<String> {
-    let Some(cols) = item
-        .get("Columns")
-        .or_else(|| item.get("columns"))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-    cols.iter()
-        .filter_map(|c| {
-            c.as_str().map(str::to_string).or_else(|| {
-                ["Name", "name", "ColumnName", "columnName"]
-                    .iter()
-                    .find_map(|k| c.get(*k).and_then(Value::as_str))
-                    .map(str::to_string)
-            })
-        })
-        .collect()
 }
 
 impl SqlSession for NetworkSession {
@@ -256,22 +255,11 @@ impl SqlSession for NetworkSession {
     }
 
     fn table_exists(&mut self, table: &str) -> Result<bool> {
-        let exists = table_items(self.remote_tables()?)
-            .iter()
-            .any(|item| item_name(item).map(|n| n.eq_ignore_ascii_case(table)).unwrap_or(false));
-        Ok(exists)
+        Ok(self.probe_columns(table).is_ok())
     }
 
     fn table_columns(&mut self, table: &str) -> Result<Vec<String>> {
-        for item in table_items(self.remote_tables()?) {
-            if item_name(item)
-                .map(|n| n.eq_ignore_ascii_case(table))
-                .unwrap_or(false)
-            {
-                return Ok(item_columns(item));
-            }
-        }
-        Ok(Vec::new())
+        self.probe_columns(table)
     }
 }
 
@@ -308,27 +296,63 @@ mod tests {
         let (sql, _) = translate("SELECT * FROM T WHERE A=:1", &params, DatabaseKind::Oracle);
         assert_eq!(sql, "SELECT * FROM T WHERE A=:p0");
 
-        // SQL Server 本地风格已是命名占位符，保持原样
+        // SQL Server 本地风格 `@pN` 按下标映射；仅被引用的参数进字典
         let (sql, dict) = translate(
             "SELECT * FROM T WHERE A=@p0",
             &params,
             DatabaseKind::SqlServer,
         );
         assert_eq!(sql, "SELECT * FROM T WHERE A=@p0");
-        assert_eq!(dict.len(), 2);
+        assert_eq!(dict.len(), 1);
 
         // 字符串字面量内的 `?` 不转换
         let (sql, _) = translate("SELECT '?' AS A, B=? FROM T", &params, DatabaseKind::Sqlite);
         assert_eq!(sql, "SELECT '?' AS A, B=@p0 FROM T");
+
+        // NULL 值内联为 NULL 字面量（C# 服务端会丢弃 NULL 参数）
+        let mixed = vec![DbValue::Int(1), DbValue::Null, DbValue::Text("x".into())];
+        let (sql, dict) = translate(
+            "INSERT INTO T(A,B,C) VALUES(?,?,?)",
+            &mixed,
+            DatabaseKind::Sqlite,
+        );
+        assert_eq!(sql, "INSERT INTO T(A,B,C) VALUES(@p0,NULL,@p1)");
+        assert_eq!(dict.len(), 2);
+
+        let (sql, dict) = translate(
+            "SELECT * FROM T WHERE A=$1 AND B=$2",
+            &[DbValue::Int(5), DbValue::Null],
+            DatabaseKind::PostgreSql,
+        );
+        assert_eq!(sql, "SELECT * FROM T WHERE A=@p0 AND B=NULL");
+        assert_eq!(dict.len(), 1);
+
+        // 同一下标重复引用复用同名占位符
+        let (sql, dict) = translate(
+            "SELECT * FROM T WHERE A=$1 OR B=$1",
+            &[DbValue::Int(5)],
+            DatabaseKind::PostgreSql,
+        );
+        assert_eq!(sql, "SELECT * FROM T WHERE A=@p0 OR B=@p0");
+        assert_eq!(dict.len(), 1);
+
+        // SqlServer 风格中的 NULL 同样内联
+        let (sql, dict) = translate(
+            "SELECT * FROM T WHERE A=@p0 AND B=@p1",
+            &[DbValue::Null, DbValue::Text("b".into())],
+            DatabaseKind::SqlServer,
+        );
+        assert_eq!(sql, "SELECT * FROM T WHERE A=NULL AND B=@p0");
+        assert_eq!(dict.len(), 1);
     }
 
-    /// 模拟远端 DbServer：按 5 次请求（Login/Query/Execute/InsertAndGetIdentity/GetTables）依次应答。
+    /// 模拟远端 DbServer：按 7 次请求（Login/Query/Execute/InsertAndGetIdentity/表探测×3）依次应答。
     fn spawn_mock_server() -> (u16, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..7 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -360,29 +384,40 @@ mod tests {
                 }
                 let request = String::from_utf8_lossy(&raw).to_string();
 
-                let (content_type, body): (&str, Vec<u8>) = if request.contains("/Db/Login") {
-                    (
-                        "application/json",
-                        br#"{"DbType":"SQLite","Version":"3.45.0"}"#.to_vec(),
-                    )
-                } else if request.contains("/Db/Query") {
-                    let mut set = RowSet::new(vec!["Id".into()]);
-                    set.push(vec![DbValue::Int(7)]);
-                    ("application/octet-stream", dbtable::encode_rowset(&set))
-                } else if request.contains("/Db/GetTables") {
-                    (
-                        "application/json",
-                        br#"[{"Name":"DH_User","Columns":[{"Name":"Id"},{"Name":"Name"}]}]"#
-                            .to_vec(),
-                    )
-                } else if request.contains("/Db/InsertAndGetIdentity") {
-                    ("application/json", br#"{"data": 9}"#.to_vec())
-                } else {
-                    ("application/json", br#"{"data": 3}"#.to_vec())
-                };
+                let (status, content_type, body): (u16, &str, Vec<u8>) =
+                    if request.contains("/Db/Login") {
+                        (
+                            200,
+                            "application/json",
+                            br#"{"DbType":"SQLite","Version":"3.45.0"}"#.to_vec(),
+                        )
+                    } else if request.contains("/Db/Query") {
+                        if request.contains("WHERE 1=0") {
+                            // 表探测（`SELECT * FROM 表 WHERE 1=0`）：NotExists 模拟缺表错误
+                            if request.contains("NotExists") {
+                                (
+                                    500,
+                                    "application/json",
+                                    br#"{"code":500,"msg":"no such table: NotExists"}"#.to_vec(),
+                                )
+                            } else {
+                                let set = RowSet::new(vec!["Id".into(), "Name".into()]);
+                                (200, "application/octet-stream", dbtable::encode_rowset(&set))
+                            }
+                        } else {
+                            let mut set = RowSet::new(vec!["Id".into()]);
+                            set.push(vec![DbValue::Int(7)]);
+                            (200, "application/octet-stream", dbtable::encode_rowset(&set))
+                        }
+                    } else if request.contains("/Db/InsertAndGetIdentity") {
+                        (200, "application/json", br#"{"data": 9}"#.to_vec())
+                    } else {
+                        (200, "application/json", br#"{"data": 3}"#.to_vec())
+                    };
 
+                let reason = if status == 200 { "OK" } else { "Internal Server Error" };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).unwrap();
@@ -430,7 +465,7 @@ mod tests {
             .unwrap();
         assert_eq!(id, 9);
 
-        // 表结构探测：远端 GetTables（仅首次请求，之后走缓存）
+        // 表结构探测：`SELECT * FROM 表 WHERE 1=0`（缺表时远端报错 → false）
         assert!(session.table_exists("dh_user").unwrap(), "表名匹配应忽略大小写");
         assert_eq!(session.table_columns("DH_User").unwrap(), vec!["Id", "Name"]);
         assert!(!session.table_exists("NotExists").unwrap());
@@ -452,6 +487,9 @@ mod tests {
             "{}",
             requests[3]
         );
-        assert!(requests[4].contains("GET /Db/GetTables"), "{}", requests[4]);
+        // 表探测：3 次查询（存在/列/不存在），均为 `WHERE 1=0` 探测
+        assert!(requests[4].contains("WHERE 1=0"), "{}", requests[4]);
+        assert!(requests[5].contains("DH_User"), "{}", requests[5]);
+        assert!(requests[6].contains("NotExists"), "{}", requests[6]);
     }
 }

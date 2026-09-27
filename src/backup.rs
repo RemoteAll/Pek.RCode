@@ -686,6 +686,66 @@ mod tests {
         assert!(dal.restore_all(dir.join("none.zip"), None, true).unwrap().is_empty());
     }
 
+    /// 跨语言互认（C# `DbPackage` 备份文件 → Rust 恢复）：
+    /// 设置 `RCODE_BACKUP_IMPORT=<cs.table>` 时执行（文件由 C# `dal.Backup` 生成）。
+    #[test]
+    fn import_foreign_backup_when_env_set() {
+        let Some(file) = std::env::var("RCODE_BACKUP_IMPORT")
+            .ok()
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let (dal, dir) = temp_dal("import");
+        let rows = dal.restore("Item", &file, true).unwrap();
+        assert_eq!(rows, 2, "C# 备份应恢复 2 行");
+
+        let mut session = dal.open_session().unwrap();
+        let set = session
+            .query(
+                "SELECT Name, Amount, Ok, CreateTime, dh_sid FROM DH_Item ORDER BY Id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(set.rows[0].get(0).unwrap().as_str(), Some("alpha"));
+        assert_eq!(
+            set.rows[0].get(1).unwrap().as_decimal().unwrap(),
+            "12.34".parse::<rust_decimal::Decimal>().unwrap()
+        );
+        assert_eq!(set.rows[0].get(2).unwrap().as_bool(), Some(true));
+        assert_eq!(
+            set.rows[0].get(3).unwrap().as_str(),
+            Some("2026-09-27 10:30:00.123")
+        );
+        assert_eq!(set.rows[0].get(4).unwrap().as_i64(), Some(9_000_000_001));
+        assert_eq!(set.rows[1].get(0).unwrap().as_str(), Some("beta"));
+        // NULL 经 DbTable 通道折叠为类型默认值（C# 语义）→ SId 为 0
+        assert_eq!(set.rows[1].get(4).unwrap().as_i64(), Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 跨语言互认（Rust 备份 → C# `DbPackage` 恢复）：
+    /// 设置 `RCODE_BACKUP_EXPORT=<路径>` 时写出备份文件（供 C# 宿主 `restore` 使用）。
+    #[test]
+    fn export_backup_when_env_set() {
+        let Some(file) = std::env::var("RCODE_BACKUP_EXPORT")
+            .ok()
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let (dal, dir) = temp_dal("export");
+        insert_items(
+            &dal,
+            &[
+                item_row("alpha", "12.34", true, Some(9_000_000_001)),
+                item_row("beta", "3.5", false, None),
+            ],
+        );
+        assert_eq!(dal.backup("Item", &file).unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn sync_table_and_sync_all_to_another_db() {
         let (source, dir1) = temp_dal("src");
