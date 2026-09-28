@@ -1093,11 +1093,14 @@ dependencies = [
 
 [[package]]
 name = "dhrust"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "md-5 0.10.6",
+ "quick-xml",
  "rand 0.8.8",
+ "serde",
+ "serde_json",
  "sha1 0.10.7",
 ]
 
@@ -3171,6 +3174,7 @@ dependencies = [
  "chrono",
  "dhrust",
  "rand 0.8.8",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",
@@ -3406,6 +3410,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.36.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
