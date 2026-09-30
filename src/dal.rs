@@ -195,10 +195,10 @@ fn create_session(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Box
             })?;
             Ok(Box::new(SqliteSession::open(path)?))
         }
-        DatabaseKind::MySql => Ok(Box::new(crate::mysql::MysqlSession::open(conn_str)?)),
-        DatabaseKind::SqlServer => Ok(Box::new(crate::mssql::MssqlSession::open(conn_str)?)),
-        DatabaseKind::PostgreSql => Ok(Box::new(crate::postgres::PostgresSession::open(conn_str)?)),
-        DatabaseKind::Oracle => Ok(Box::new(crate::oracle::OracleSession::open(conn_str)?)),
+        DatabaseKind::MySql => open_mysql(conn_str),
+        DatabaseKind::SqlServer => open_sqlserver(conn_str),
+        DatabaseKind::PostgreSql => open_postgres(conn_str),
+        DatabaseKind::Oracle => open_oracle(conn_str),
         DatabaseKind::DuckDb => {
             #[cfg(feature = "duckdb")]
             {
@@ -213,19 +213,126 @@ fn create_session(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Box
                 ))
             }
         }
-        DatabaseKind::Firebird => Ok(Box::new(crate::firebird::FirebirdSession::open(conn_str)?)),
-        DatabaseKind::ClickHouse => Ok(Box::new(crate::clickhouse::ClickHouseSession::open(
-            conn_str,
-        )?)),
-        DatabaseKind::TDengine => Ok(Box::new(crate::tdengine::TDengineSession::open(conn_str)?)),
-        DatabaseKind::InfluxDb => Ok(Box::new(crate::influxdb::InfluxDbSession::open(conn_str)?)),
-        DatabaseKind::Hana => Ok(Box::new(crate::hana::HanaSession::open(conn_str)?)),
-        DatabaseKind::MongoDb => Ok(Box::new(crate::mongodb::MongoSession::open(conn_str)?)),
+        DatabaseKind::Firebird => open_firebird(conn_str),
+        DatabaseKind::ClickHouse => open_clickhouse(conn_str),
+        DatabaseKind::TDengine => open_tdengine(conn_str),
+        DatabaseKind::InfluxDb => open_influxdb(conn_str),
+        DatabaseKind::Hana => open_hana(conn_str),
+        DatabaseKind::MongoDb => open_mongodb(conn_str),
         // ODBC 桥：DB2 / 达梦 / IRIS / Access 共用一套通用驱动
         DatabaseKind::Db2 | DatabaseKind::DaMeng | DatabaseKind::Iris | DatabaseKind::Access => {
-            Ok(Box::new(crate::odbc::OdbcSession::open(kind, conn_str)?))
+            open_odbc(kind, conn_str)
         }
     }
+}
+
+// ———— 驱动打开辅助：未编译的驱动返回可操作的提示（对应 driver-* 特性）————
+
+/// 未启用某驱动时的统一错误提示。
+#[allow(dead_code)]
+fn driver_missing(driver: &str, feature: &str) -> Error {
+    Error::Unsupported(format!(
+        "本构建未包含 {driver} 驱动：请在 Cargo.toml 启用 Pek.RCode 特性 `{feature}`（或 `all-drivers`）后重新构建"
+    ))
+}
+
+#[cfg(feature = "driver-mysql")]
+fn open_mysql(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::mysql::MysqlSession::open(conn_str)?))
+}
+#[cfg(not(feature = "driver-mysql"))]
+fn open_mysql(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("MySQL", "driver-mysql"))
+}
+
+#[cfg(feature = "driver-sqlserver")]
+fn open_sqlserver(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::mssql::MssqlSession::open(conn_str)?))
+}
+#[cfg(not(feature = "driver-sqlserver"))]
+fn open_sqlserver(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("SQL Server", "driver-sqlserver"))
+}
+
+#[cfg(feature = "driver-postgresql")]
+fn open_postgres(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::postgres::PostgresSession::open(conn_str)?))
+}
+#[cfg(not(feature = "driver-postgresql"))]
+fn open_postgres(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("PostgreSQL", "driver-postgresql"))
+}
+
+#[cfg(feature = "driver-oracle")]
+fn open_oracle(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::oracle::OracleSession::open(conn_str)?))
+}
+#[cfg(not(feature = "driver-oracle"))]
+fn open_oracle(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("Oracle", "driver-oracle"))
+}
+
+#[cfg(feature = "driver-firebird")]
+fn open_firebird(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::firebird::FirebirdSession::open(conn_str)?))
+}
+#[cfg(not(feature = "driver-firebird"))]
+fn open_firebird(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("Firebird", "driver-firebird"))
+}
+
+#[cfg(feature = "driver-clickhouse")]
+fn open_clickhouse(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::clickhouse::ClickHouseSession::open(conn_str)?))
+}
+#[cfg(not(feature = "driver-clickhouse"))]
+fn open_clickhouse(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("ClickHouse", "driver-clickhouse"))
+}
+
+#[cfg(feature = "driver-tdengine")]
+fn open_tdengine(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::tdengine::TDengineSession::open(conn_str)?))
+}
+#[cfg(not(feature = "driver-tdengine"))]
+fn open_tdengine(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("TDengine", "driver-tdengine"))
+}
+
+#[cfg(feature = "driver-influxdb")]
+fn open_influxdb(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::influxdb::InfluxDbSession::open(conn_str)?))
+}
+#[cfg(not(feature = "driver-influxdb"))]
+fn open_influxdb(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("InfluxDB", "driver-influxdb"))
+}
+
+#[cfg(feature = "driver-hana")]
+fn open_hana(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::hana::HanaSession::open(conn_str)?))
+}
+#[cfg(not(feature = "driver-hana"))]
+fn open_hana(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("SAP HANA", "driver-hana"))
+}
+
+#[cfg(feature = "driver-mongodb")]
+fn open_mongodb(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::mongodb::MongoSession::open(conn_str)?))
+}
+#[cfg(not(feature = "driver-mongodb"))]
+fn open_mongodb(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("MongoDB", "driver-mongodb"))
+}
+
+#[cfg(feature = "driver-odbc")]
+fn open_odbc(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Ok(Box::new(crate::odbc::OdbcSession::open(kind, conn_str)?))
+}
+#[cfg(not(feature = "driver-odbc"))]
+fn open_odbc(_kind: DatabaseKind, _conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
+    Err(driver_missing("ODBC（DB2/达梦/IRIS/Access）", "driver-odbc"))
 }
 
 impl Dal {

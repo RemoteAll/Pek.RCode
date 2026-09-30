@@ -120,10 +120,12 @@ println!("共 {total} 条，本页 {} 条", page.len());
 
 ```powershell
 cd G:\Code\Pek.Rust\Pek.RCode
-cargo test          # 默认测试（含 SQLite + 固件回归 + 对象实体端到端）
+cargo test          # 默认测试（含 SQLite + 固件回归 + 对象实体端到端；默认全驱动 + tls-native）
 cargo test --features duckdb   # 额外交付 DuckDB 内嵌引擎的完整用例
 cargo test --features redis    # 分布式缓存版本号（基于 Pek.RRedis；RCODE_REDIS 指向真实 Redis 时实机验证）
-cargo test --no-default-features --features tls-rustls   # rustls TLS 后端（PEM 客户端证书）
+cargo test --no-default-features --features "tls-rustls,all-drivers"   # rustls TLS 后端（PEM 客户端证书）
+# 轻量消费方（如 tcp-scanner-server 仅用 SQLite+MySQL）：按驱动裁剪，构建更小更快
+cargo check --no-default-features --features "driver-mysql,tls-native"
 cargo clippy        # 零警告
 ```
 

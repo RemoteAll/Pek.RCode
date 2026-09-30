@@ -83,6 +83,7 @@ pub mod backup;
 pub mod batch;
 pub mod cache;
 pub mod catalog;
+#[cfg(feature = "driver-clickhouse")]
 pub mod clickhouse;
 pub mod codegen;
 pub mod common;
@@ -97,22 +98,31 @@ pub mod duckdb;
 pub mod entity;
 pub mod entity_queue;
 mod error;
+#[cfg(feature = "driver-firebird")]
 pub mod firebird;
+#[cfg(feature = "driver-hana")]
 pub mod hana;
 pub mod http;
+#[cfg(feature = "driver-influxdb")]
 pub mod influxdb;
 pub mod interceptor;
 pub mod membership;
 pub mod meta;
 pub mod model;
+#[cfg(feature = "driver-mongodb")]
 pub mod mongodb;
+#[cfg(feature = "driver-sqlserver")]
 pub mod mssql;
+#[cfg(feature = "driver-mysql")]
 pub mod mysql;
 pub mod navigation;
 pub mod network;
+#[cfg(feature = "driver-odbc")]
 pub mod odbc;
+#[cfg(feature = "driver-oracle")]
 pub mod oracle;
 pub mod pool;
+#[cfg(feature = "driver-postgresql")]
 pub mod postgres;
 pub mod query;
 pub mod reverse;
@@ -124,6 +134,7 @@ pub mod sqlbuild;
 pub mod sqlite;
 pub mod sql_template;
 pub mod statistics;
+#[cfg(feature = "driver-tdengine")]
 pub mod tdengine;
 pub mod transaction;
 pub mod transform;
@@ -131,6 +142,8 @@ pub mod tree;
 pub mod types;
 pub mod value;
 
+// 同步驱动共用 tokio 运行时的桥接（tiberius/mongodb 的 block_on）：仅在对应驱动启用时编译
+#[cfg(any(feature = "driver-sqlserver", feature = "driver-mongodb"))]
 mod rt;
 
 pub use error::{Error, Result};
