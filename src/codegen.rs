@@ -583,6 +583,98 @@ impl<'a> SearchBuilder<'a> {
     }
 }
 
+// ================= 业务扩展（对应 DH.NCode 的 `{Entity}.Biz.cs` 双文件模式） =================
+
+/// 业务扩展文件名（`OrderItem` → `order_item_biz.rs`）。
+///
+/// 与实体文件（[`file_name`]）成对：实体每次生成全量覆盖，业务扩展**永不覆盖**、只做分析合并。
+pub fn biz_file_name(table: &TableMeta) -> String {
+    format!("{}_biz.rs", to_snake_case(&table.name))
+}
+
+/// 生成单表的业务扩展骨架（`{snake}_biz.rs`）。
+///
+/// 对应 DH.NCode 的 `{Entity}.Biz.cs`：生成器只负责创建骨架与补齐缺失区块，
+/// **绝不覆盖已有内容**（分析合并见 [`merge_biz`]）。
+pub fn generate_biz(table: &TableMeta) -> String {
+    let display = if table.description.is_empty() {
+        &table.name
+    } else {
+        &table.description
+    };
+    let table_name = table.effective_table_name();
+    let snake = to_snake_case(&table.name);
+    let name = &table.name;
+
+    let mut out = String::with_capacity(1024);
+    out.push_str(&format!(
+        "//! {display}业务扩展（{table_name}）—— 本文件不会被 rcodegen 覆盖。\n//!\n//! 重新生成只做“分析合并”：已有内容全部保留，缺失的区块（// #region）自动补回。\n//! 自定义方法请写在区块内；生成器不会删除或重写任何手写内容。\n//! 文件头的 use 导入如暂时用不到可自行删除（合并只维护区块）。\n\n"
+    ));
+    out.push_str(&format!("use super::{snake}::{name};\n\n"));
+
+    // 区块 1：扩展方法
+    out.push_str(&format!(
+        "// #region 扩展方法\n/// 自定义业务方法（示例代码已注释，可删除本段注释后编写）。\nimpl {name} {{\n    // /// 按业务编码查询（示例，取消注释即可使用；返回首个匹配）。\n    // pub fn find_by_code(\n    //     dal: &pek_rcode::Dal,\n    //     session: &mut dyn pek_rcode::SqlSession,\n    //     code: &str,\n    // ) -> pek_rcode::Result<Option<Self>> {{\n    //     let query = pek_rcode::Query::new().filter(pek_rcode::Where::new().eq(\"Code\", code)).take(1);\n    //     Ok(Self::query(dal, session, &query)?.into_iter().next())\n    // }}\n}}\n// #endregion 扩展方法\n\n"
+    ));
+
+    // 区块 2：扩展查询
+    out.push_str(
+        "// #region 扩展查询\n// 常用条件查询 / 辅助函数（如批量查找、分页封装）。\n// #endregion 扩展查询\n",
+    );
+    out
+}
+
+/// 业务扩展文件的“分析合并”：已有内容全部保留，骨架中缺失的区块自动补回。
+///
+/// 区块以 `// #region 名称` / `// #endregion` 标记（rust-analyzer 支持折叠）：
+/// - 旧文件中已存在的同名区块：**经不修改**（保留手写内容）
+/// - 骨架中新增而旧文件缺失的区块：按骨架顺序追加到文件末尾
+/// - 支持未来骨架升级（新增区块自动补进旧文件，对应 DH.NCode Biz 的 `Merge`）
+/// <param name="existing">旧文件内容</param>
+/// <param name="generated">新生成的骨架</param>
+/// <returns>合并后的内容；无缺失区块时返回 None（无需写盘）</returns>
+pub fn merge_biz(existing: &str, generated: &str) -> Option<String> {
+    let existing_regions = parse_regions(existing);
+    let generated_regions = parse_regions(generated);
+    let missing: Vec<&(String, String)> = generated_regions
+        .iter()
+        .filter(|(name, _)| !existing_regions.iter().any(|(n, _)| n == name))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+
+    let mut out = existing.trim_end().to_string();
+    out.push('\n');
+    for (_, block) in missing {
+        out.push('\n');
+        out.push_str(block.trim_end());
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// 解析 `// #region 名称` … `// #endregion` 区块（扁平结构；未闭合的区块丢弃）。
+fn parse_regions(text: &str) -> Vec<(String, String)> {
+    let mut regions = Vec::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("// #region") {
+            // 出现新的开始标记：丢弃上一个未闭合块
+            current = Some((rest.trim().to_string(), vec![line]));
+        } else if trimmed.starts_with("// #endregion") {
+            if let Some((name, mut lines)) = current.take() {
+                lines.push(line);
+                regions.push((name, lines.join("\n")));
+            }
+        } else if let Some((_, lines)) = current.as_mut() {
+            lines.push(line);
+        }
+    }
+    regions
+}
+
 // ================= 模型类（对应 DH.NCode 的 `Code/ModelBuilder.cs`） =================
 
 /// 模型类文件名（`OrderItem` → `order_item_model.rs`）。
@@ -955,5 +1047,46 @@ mod tests {
         // 未知枚举 → 按整型生成并注明 C# 枚举
         assert!(code.contains("pub custom: i32"), "{code}");
         assert!(code.contains("对应 C# 枚举 My.CustomKind"), "{code}");
+    }
+
+    #[test]
+    fn biz_skeleton_and_merge_keep_handwritten_code() {
+        let model = EntityModel::parse(MODEL).unwrap();
+        let table = &model.tables[0];
+
+        // 骨架：文件头 + 双区块 + 实体导入
+        let skeleton = generate_biz(table);
+        assert_eq!(biz_file_name(table), "order_item_biz.rs");
+        assert!(
+            skeleton.contains("use super::order_item::OrderItem;"),
+            "{skeleton}"
+        );
+        assert!(skeleton.contains("// #region 扩展方法"), "{skeleton}");
+        assert!(skeleton.contains("// #region 扩展查询"), "{skeleton}");
+        assert!(skeleton.contains("impl OrderItem {"), "{skeleton}");
+        assert!(skeleton.contains("// #endregion 扩展方法"), "{skeleton}");
+
+        // 二次生成：无缺失区块 → 无需写盘（幂等）
+        assert_eq!(merge_biz(&skeleton, &skeleton), None);
+
+        // 旧文件缺“扩展查询”区块：手写内容保留，缺失区块自动补回
+        let old = "//! 头注释\n\nuse super::order_item::OrderItem;\n\n// #region 扩展方法\nimpl OrderItem {\n    pub fn custom(&self) -> i32 { 42 }\n}\n// #endregion 扩展方法\n";
+        let merged = merge_biz(old, &skeleton).expect("应补回缺失区块");
+        assert!(
+            merged.contains("pub fn custom(&self) -> i32 { 42 }"),
+            "手写内容不能丢：{merged}"
+        );
+        assert_eq!(
+            merged.matches("// #region 扩展方法").count(),
+            1,
+            "已有区块不重复：{merged}"
+        );
+        assert!(
+            merged.contains("// #region 扩展查询"),
+            "缺失区块应补回：{merged}"
+        );
+
+        // 合并结果再次合并：幂等无变化
+        assert_eq!(merge_biz(&merged, &skeleton), None);
     }
 }

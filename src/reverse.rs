@@ -86,6 +86,7 @@ fn to_table_meta(info: catalog::TableInfo) -> TableMeta {
         table_name: String::new(),
         description: info.description,
         conn_name: None,
+        migration: None,
         columns: info
             .columns
             .into_iter()

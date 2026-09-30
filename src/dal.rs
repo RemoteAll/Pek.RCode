@@ -14,6 +14,7 @@ use std::{
 use crate::cache::{EntityCache, SingleCache};
 use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
+use crate::migration::Migration;
 use crate::model::{EntityModel, TableMeta};
 use crate::pool::{PoolOptions, PoolStats, SessionPool};
 use crate::query::{Query, Where};
@@ -172,6 +173,10 @@ pub struct Dal {
     model: Option<Arc<EntityModel>>,
     /// 是否输出执行的 SQL
     show_sql: bool,
+    /// 迁移档位（生效值：连接串 > 模型 Option > 缺省 On，与 DH.NCode 一致）
+    migration: Migration,
+    /// 连接串显式指定的档位（用于与模型级配置的优先级判定）
+    conn_migration: Option<Migration>,
     /// 实体缓存注册表（按表共享，对应 DH.NCode 的 `Meta.Cache`）
     pub(crate) entity_caches: Mutex<HashMap<String, Arc<EntityCache>>>,
     /// 单对象缓存注册表（按表共享，对应 DH.NCode 的 `Meta.SingleCache`）
@@ -356,11 +361,17 @@ impl Dal {
                 )
             })
             .unwrap_or(true);
+        // 迁移档位：连接串显式值优先（对应 DbBase 从连接串解析 Migration），否则默认 On
+        //（与 XCodeSetting.Migration 默认值一致；模型级配置在 open_with_model 中补充）
+        let conn_migration = conn_str.get("migration").and_then(Migration::parse);
+        let migration = conn_migration.unwrap_or_default();
         Ok(Self {
             conn_str,
             kind,
             model: None,
             show_sql,
+            migration,
+            conn_migration,
             entity_caches: Mutex::new(HashMap::new()),
             single_caches: Mutex::new(HashMap::new()),
             pool: OnceLock::new(),
@@ -371,6 +382,12 @@ impl Dal {
     /// 创建并绑定数据模型（后续可执行建表迁移与表操作）。
     pub fn open_with_model(conn_str: &str, model: EntityModel) -> Result<Self> {
         let mut dal = Self::open(conn_str)?;
+        // 模型级迁移档位：仅当连接串未显式指定时生效（对应 XCodeSetting.Migration）
+        if dal.conn_migration.is_none()
+            && let Some(m) = model.options.migration()
+        {
+            dal.migration = m;
+        }
         dal.model = Some(Arc::new(model));
         Ok(dal)
     }
@@ -398,6 +415,21 @@ impl Dal {
     /// 设置 SQL 输出开关（覆盖连接串中的 `ShowSql`）。
     pub fn set_show_sql(&mut self, value: bool) {
         self.show_sql = value;
+    }
+
+    /// 迁移档位（生效值）。
+    ///
+    /// 来源优先级：连接串 `Migration=...` > 模型 `<Option><Migration>...` > 缺省 [`Migration::On`]。
+    /// 表级档位（`<Table Migration="...">`）只能在此基础上收紧（`min(表级, 全局)`）。
+    /// <returns>生效档位</returns>
+    pub fn migration(&self) -> Migration {
+        self.migration
+    }
+
+    /// 设置迁移档位（覆盖连接串与模型配置）。
+    /// <param name="migration">档位</param>
+    pub fn set_migration(&mut self, migration: Migration) {
+        self.migration = migration;
     }
 
     /// 输出一条 SQL（开启 ShowSql 时）。
@@ -462,17 +494,25 @@ impl Dal {
         Ok(TableRef { dal: self, table })
     }
 
-    /// 按模型同步数据库结构（建表 / 补列），返回本次变更清单。
+    /// 按模型同步数据库结构（建表 / 补列 / 补索引；`Full` 档含修改与删除），返回本次变更清单。
     ///
-    /// 安全策略：只做“增量补齐”，不修改、不删除已有对象（与 XCode 迁移一致）。
+    /// 档位语义（与 DH.NCode 的 [`Migration`] 一致）：
+    /// - `Off`：跳过（返回空报告）
+    /// - `ReadOnly`：只检查、不执行；将 DDL 收集到 [`SchemaReport::pending_sql`] 供人工执行
+    /// - `On`（缺省）：只做创建类（建表 / 补列 / 补索引），不修改、不删除
+    /// - `Full`：在 `On` 基础上允许修改列类型与删除多余列/索引（**删除类动作仅此档允许**）
+    ///
+    /// 表级档位（`<Table Migration="...">`）只能收紧、不能放大：生效档 = `min(表级, 全局)`。
     pub fn sync_schema(&self) -> Result<SchemaReport> {
         let model = self
             .model
             .as_ref()
             .ok_or_else(|| Error::Model("尚未加载数据模型，无法同步结构".into()))?;
 
-        let mut session = self.open_session()?;
-        let mut report = SchemaReport::default();
+        let mut report = SchemaReport {
+            mode: self.migration,
+            ..Default::default()
+        };
 
         // 时序/文档库无建表 DDL（measurement/collection 写入时自动创建）
         if !self.kind.supports_ddl() {
@@ -484,13 +524,25 @@ impl Dal {
             return Ok(report);
         }
 
+        // Off：完全跳过结构检查（对齐 C# `SetTables`：mode == Off 直接返回）
+        if self.migration == Migration::Off {
+            return Ok(report);
+        }
+
+        let mut session = self.open_session()?;
+
         for table in &model.tables {
+            // 表级收紧：只能比全局更保守（对应 XCode ResolveMigration）
+            let mode = self.migration.tighten(table.migration);
+            if mode == Migration::Off {
+                continue;
+            }
+
             let table_name = table.effective_table_name();
 
             if !session.table_exists(table_name)? {
                 for stmt in self.kind.create_table_sql(table) {
-                    self.log_sql(&stmt);
-                    session.execute(&stmt, &[])?;
+                    self.exec_ddl(&mut *session, mode, &mut report, &stmt)?;
                 }
                 report.created_tables.push(table_name.to_string());
                 continue;
@@ -502,8 +554,7 @@ impl Dal {
                 let col_name = table.effective_column_name(col);
                 if !existing.iter().any(|c| c.eq_ignore_ascii_case(col_name)) {
                     let sql = self.kind.add_column_sql(table, col);
-                    self.log_sql(&sql);
-                    session.execute(&sql, &[])?;
+                    self.exec_ddl(&mut *session, mode, &mut report, &sql)?;
                     report
                         .added_columns
                         .push((table_name.to_string(), col_name.to_string()));
@@ -523,8 +574,7 @@ impl Dal {
                                 continue;
                             }
                             if let Some(sql) = self.kind.create_index_sql(table, idx) {
-                                self.log_sql(&sql);
-                                session.execute(&sql, &[])?;
+                                self.exec_ddl(&mut *session, mode, &mut report, &sql)?;
                                 report.added_indexes.push((
                                     table_name.to_string(),
                                     self.kind.index_name(table, idx),
@@ -548,11 +598,138 @@ impl Dal {
                         | DatabaseKind::DuckDb
                 )
             {
-                self.ensure_identity_sequence(&mut *session, &mut report, table_name)?;
+                self.ensure_identity_sequence(&mut *session, mode, &mut report, table_name)?;
             }
         }
 
+        // Full 档：修改列类型 + 删除多余列/索引（删除类动作仅此档允许；对应 C# 的 onlyCreate=false 分支）
+        if self.migration == Migration::Full {
+            self.apply_full_changes(&mut report)?;
+        }
+
         Ok(report)
+    }
+
+    /// 执行（或只读收集）一条 DDL：统一 ShowSql 输出与档位处理。
+    /// <param name="session">会话</param>
+    /// <param name="mode">该表生效档位</param>
+    /// <param name="report">同步报告</param>
+    /// <param name="sql">DDL 语句</param>
+    fn exec_ddl(
+        &self,
+        session: &mut dyn SqlSession,
+        mode: Migration,
+        report: &mut SchemaReport,
+        sql: &str,
+    ) -> Result<()> {
+        self.log_sql(sql);
+        if mode.is_readonly() {
+            // 只读档：不执行，收集“将执行”的 DDL 供人工处理（对齐 C# `DDL模式[ReadOnly]，请手工创建表`）
+            report.pending_sql.push(sql.to_string());
+        } else {
+            session.execute(sql, &[])?;
+        }
+        Ok(())
+    }
+
+    /// `Full` 档的修改/删除执行：基于 [`Dal::diff_schema`] 的预检结果。
+    ///
+    /// 顺序与 XCode 一致：**先删多余索引，再删多余列**（否则索引引用会阻止删列），最后修改列类型。
+    /// 说明：
+    /// - 表级档位收紧到 `Full` 以下的表不动（只能收紧、不能放大）
+    /// - 模型外的多余表**从不自动删除**（与 XCode 相同：迁移只处理模型中声明的表）
+    /// - 单条失败不中断整体（记入 [`SchemaReport::notes`]，对齐 C# `CheckAllTables` 的逐表容错）
+    fn apply_full_changes(&self, report: &mut SchemaReport) -> Result<()> {
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| Error::Model("尚未加载数据模型，无法同步结构".into()))?;
+        let diff = self.diff_schema()?;
+        if diff.extra_indexes.is_empty()
+            && diff.extra_columns.is_empty()
+            && diff.type_mismatches.is_empty()
+        {
+            return Ok(());
+        }
+
+        let mut session = self.open_session()?;
+
+        // 该表生效档位须为 Full（表级只能收紧）
+        let allowed = |tname: &str| -> bool {
+            model
+                .table(tname)
+                .map(|t| self.migration.tighten(t.migration) == Migration::Full)
+                .unwrap_or(false)
+        };
+
+        // 1) 删除多余索引（先删索引，后面才有可能删字段——对齐 XCode 的既有注释）
+        for (tname, iname) in &diff.extra_indexes {
+            if !allowed(tname) || is_primary_index_name(iname) {
+                continue;
+            }
+            let Some(sql) = self.kind.drop_index_sql(iname, Some(tname)) else {
+                report
+                    .notes
+                    .push(format!("{tname}.{iname}：该数据库不支持直接删除索引，请人工处理"));
+                continue;
+            };
+            match self.exec_ddl(&mut *session, Migration::Full, report, &sql) {
+                Ok(()) => report.dropped_indexes.push((tname.clone(), iname.clone())),
+                Err(e) => report
+                    .notes
+                    .push(format!("{tname}.{iname}：删除索引失败（{e}）")),
+            }
+        }
+
+        // 2) 删除多余列（数据库中存在、模型未声明的列）
+        for (tname, cname) in &diff.extra_columns {
+            if !allowed(tname) {
+                continue;
+            }
+            let Some(sql) = self.kind.drop_column_sql(tname, cname) else {
+                report
+                    .notes
+                    .push(format!("{tname}.{cname}：该数据库不支持直接删除列，请人工处理"));
+                continue;
+            };
+            match self.exec_ddl(&mut *session, Migration::Full, report, &sql) {
+                Ok(()) => report.dropped_columns.push((tname.clone(), cname.clone())),
+                Err(e) => report
+                    .notes
+                    .push(format!("{tname}.{cname}：删除列失败（{e}）")),
+            }
+        }
+
+        // 3) 修改列类型（仅基础类型不同时触发；长度/精度差异见 diff_schema 的宽松比较）
+        for mismatch in &diff.type_mismatches {
+            let tname = &mismatch.table;
+            if !allowed(tname) {
+                continue;
+            }
+            let Some(table) = model.table(tname) else {
+                continue;
+            };
+            let Some(col) = table.column(&mismatch.column) else {
+                continue;
+            };
+            let Some(sql) = self.kind.alter_column_sql(table, col) else {
+                report.notes.push(format!(
+                    "{tname}.{}：类型 {} → {} 需人工处理（该数据库不支持直接修改列类型，如 SQLite 需重建表）",
+                    mismatch.column, mismatch.actual, mismatch.expected
+                ));
+                continue;
+            };
+            match self.exec_ddl(&mut *session, Migration::Full, report, &sql) {
+                Ok(()) => report
+                    .altered_columns
+                    .push((tname.clone(), mismatch.column.clone())),
+                Err(e) => report
+                    .notes
+                    .push(format!("{tname}.{}：修改列类型失败（{e}）", mismatch.column)),
+            }
+        }
+
+        Ok(())
     }
 
     /// 结构比对：模型 vs 数据库（只读），并生成可直接执行的 ALTER 脚本（dry-run 输出）。
@@ -597,6 +774,10 @@ impl Dal {
                                     Some(db_col) => {
                                         let expected = self.kind.field_type(col);
                                         if !same_base_type(&expected, &db_col.raw_type) {
+                                            // `Full` 档专用：修改类预检脚本（dry-run 导出；执行前请确认数据影响）
+                                            if let Some(sql) = self.kind.alter_column_sql(table, col) {
+                                                diff.full_sql.push(sql);
+                                            }
                                             diff.type_mismatches.push(ColumnTypeMismatch {
                                                 table: tname.to_string(),
                                                 column: cname.to_string(),
@@ -609,6 +790,10 @@ impl Dal {
                             }
                             for db_col in &db.columns {
                                 if table.column(&db_col.name).is_none() {
+                                    // `Full` 档专用：删除类预检脚本
+                                    if let Some(sql) = self.kind.drop_column_sql(tname, &db_col.name) {
+                                        diff.full_sql.push(sql);
+                                    }
                                     diff.extra_columns
                                         .push((tname.to_string(), db_col.name.clone()));
                                 }
@@ -638,6 +823,13 @@ impl Dal {
                                         .iter()
                                         .any(|idx| same_index(&idx.columns, &e.columns));
                                     if !in_model {
+                                        // `Full` 档专用：删除类预检脚本（主键/自动索引不可删）
+                                        if !is_primary_index_name(&e.name)
+                                            && let Some(sql) =
+                                                self.kind.drop_index_sql(&e.name, Some(tname))
+                                        {
+                                            diff.full_sql.push(sql);
+                                        }
                                         diff.extra_indexes
                                             .push((tname.to_string(), e.name.clone()));
                                     }
@@ -684,6 +876,7 @@ impl Dal {
     fn ensure_identity_sequence(
         &self,
         session: &mut dyn SqlSession,
+        mode: Migration,
         report: &mut SchemaReport,
         table_name: &str,
     ) -> Result<()> {
@@ -728,8 +921,7 @@ impl Dal {
             .unwrap_or(0)
             > 0;
         if !exists {
-            self.log_sql(&create);
-            session.execute(&create, &[])?;
+            self.exec_ddl(session, mode, report, &create)?;
             report.created_sequences.push(sequence);
         }
         Ok(())
@@ -739,7 +931,9 @@ impl Dal {
 /// 结构同步结果。
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct SchemaReport {
-    /// 新建的表
+    /// 本次生效的迁移档位（对应 DH.NCode 的 `Db.Migration`）
+    pub mode: Migration,
+    /// 新建的表（只读档为“将新建”）
     pub created_tables: Vec<String>,
     /// 补充的列（表名, 列名）
     pub added_columns: Vec<(String, String)>,
@@ -747,15 +941,30 @@ pub struct SchemaReport {
     pub created_sequences: Vec<String>,
     /// 补充的索引（表名, 索引名）
     pub added_indexes: Vec<(String, String)>,
+    /// 修改的列（`Full` 档：表名, 列名）
+    pub altered_columns: Vec<(String, String)>,
+    /// 删除的多余列（`Full` 档：表名, 列名）
+    pub dropped_columns: Vec<(String, String)>,
+    /// 删除的多余索引（`Full` 档：表名, 索引名）
+    pub dropped_indexes: Vec<(String, String)>,
+    /// 只读档（`ReadOnly`）收集的“将执行”DDL，供人工执行
+    pub pending_sql: Vec<String>,
+    /// 无法自动处理项的说明（如某数据库不支持修改列类型）
+    pub notes: Vec<String>,
 }
 
 impl SchemaReport {
-    /// 是否没有任何变更。
+    /// 是否没有任何变更（只读档含待执行 DDL 时同样视为有变更）。
+    /// <returns>是否为空报告</returns>
     pub fn is_empty(&self) -> bool {
         self.created_tables.is_empty()
             && self.added_columns.is_empty()
             && self.created_sequences.is_empty()
             && self.added_indexes.is_empty()
+            && self.altered_columns.is_empty()
+            && self.dropped_columns.is_empty()
+            && self.dropped_indexes.is_empty()
+            && self.pending_sql.is_empty()
     }
 }
 
@@ -771,6 +980,22 @@ impl fmt::Display for SchemaReport {
             self.added_columns.len(),
             self.added_indexes.len()
         )?;
+        if !self.altered_columns.is_empty() {
+            write!(f, "，修改列 {} 个", self.altered_columns.len())?;
+        }
+        if !self.dropped_columns.is_empty() {
+            write!(f, "，删除列 {} 个", self.dropped_columns.len())?;
+        }
+        if !self.dropped_indexes.is_empty() {
+            write!(f, "，删除索引 {} 个", self.dropped_indexes.len())?;
+        }
+        if !self.pending_sql.is_empty() {
+            write!(
+                f,
+                "（只读档：另有 {} 条待执行 DDL 见 pending_sql）",
+                self.pending_sql.len()
+            )?;
+        }
         if !self.created_tables.is_empty() {
             write!(f, "；新建：{}", self.created_tables.join(", "))?;
         }
@@ -797,6 +1022,33 @@ impl fmt::Display for SchemaReport {
                 self.created_sequences.join(", ")
             )?;
         }
+        if !self.altered_columns.is_empty() {
+            let list: Vec<String> = self
+                .altered_columns
+                .iter()
+                .map(|(t, c)| format!("{t}.{c}"))
+                .collect();
+            write!(f, "；改列：{}", list.join(", "))?;
+        }
+        if !self.dropped_columns.is_empty() {
+            let list: Vec<String> = self
+                .dropped_columns
+                .iter()
+                .map(|(t, c)| format!("{t}.{c}"))
+                .collect();
+            write!(f, "；删列：{}", list.join(", "))?;
+        }
+        if !self.dropped_indexes.is_empty() {
+            let list: Vec<String> = self
+                .dropped_indexes
+                .iter()
+                .map(|(t, i)| format!("{t}.{i}"))
+                .collect();
+            write!(f, "；删索引：{}", list.join(", "))?;
+        }
+        for note in &self.notes {
+            write!(f, "；注意：{note}")?;
+        }
         Ok(())
     }
 }
@@ -818,8 +1070,10 @@ pub struct SchemaDiff {
     pub extra_indexes: Vec<(String, String)>,
     /// 类型差异（只报告，不生成 DDL）
     pub type_mismatches: Vec<ColumnTypeMismatch>,
-    /// 可直接执行的 ALTER/DDL 脚本（只包含补齐类操作）
+    /// 可直接执行的补齐类脚本（建表 / 加列 / 建索引；任何非 `Off` 档均可用）
     pub alter_sql: Vec<String>,
+    /// 修改/删除类脚本（**仅 `Full` 档可执行**：改列类型、删多余列/索引；dry-run 预览用，执行前请确认数据影响）
+    pub full_sql: Vec<String>,
 }
 
 impl SchemaDiff {
@@ -846,6 +1100,16 @@ pub struct ColumnTypeMismatch {
     pub expected: String,
     /// 数据库实际原始类型
     pub actual: String,
+}
+
+/// 是否为主键/自动索引名（不允许删除：SQLite 的 `sqlite_autoindex_*`、PostgreSQL 的 `*_pkey`、
+/// MySQL/SQLServer 的 `PRIMARY` 等——这些由主键约束隐式维护）。
+fn is_primary_index_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("sqlite_autoindex")
+        || lower.ends_with("_pkey")
+        || lower == "primary"
+        || lower.starts_with("primary_key")
 }
 
 /// 索引列集合是否一致（同列且同序，忽略大小写）。
@@ -1366,6 +1630,205 @@ mod tests {
         assert!(m.actual.eq_ignore_ascii_case("int"), "diff={diff:?}");
         // 类型差异只报告，不生成 ALTER
         assert!(diff.alter_sql.is_empty());
+
+        dal.clear_pool();
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_off_skips_and_readonly_collects() {
+        let dir = temp_dir("migration-off");
+        let db = dir.join("test.db");
+
+        // Off：完全跳过——新库不会建表（对齐 C# `SetTables`：mode == Off 直接返回）
+        let conn = format!("Data Source={};Provider=SQLite;Migration=Off", db.display());
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
+        assert_eq!(dal.migration(), Migration::Off);
+        let report = dal.sync_schema().unwrap();
+        assert!(report.is_empty());
+        assert_eq!(report.mode, Migration::Off);
+        let mut session = dal.open_session().unwrap();
+        assert!(!session.table_exists("DH_Order").unwrap(), "Off 档不应建表");
+        drop(session);
+        dal.clear_pool();
+        drop(dal);
+
+        // ReadOnly：只收集待执行 DDL，不执行（对齐 C# `DDL模式[ReadOnly]，请手工创建表`）
+        let conn = format!("Data Source={};Provider=SQLite;Migration=ReadOnly", db.display());
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
+        assert_eq!(dal.migration(), Migration::ReadOnly);
+        let report = dal.sync_schema().unwrap();
+        assert_eq!(report.created_tables, vec!["DH_Order"], "只读档应报告“将新建”");
+        assert!(
+            report.pending_sql.iter().any(|s| s.starts_with("CREATE TABLE")),
+            "只读档应收集待执行 DDL：{report:?}"
+        );
+        let mut session = dal.open_session().unwrap();
+        assert!(!session.table_exists("DH_Order").unwrap(), "只读档不应执行 DDL");
+        drop(session);
+        dal.clear_pool();
+        drop(dal);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_option_and_table_level_migration() {
+        let dir = temp_dir("migration-levels");
+        let db = dir.join("test.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+
+        // 模型级 Migration 作为缺省（对应 XCodeSetting.Migration）
+        let mut model = EntityModel::parse(MODEL).unwrap();
+        model.options.raw.insert("Migration".into(), "ReadOnly".into());
+        let dal = Dal::open_with_model(&conn, model).unwrap();
+        assert_eq!(dal.migration(), Migration::ReadOnly, "模型级档位应生效");
+        drop(dal);
+
+        // 连接串显式指定优先于模型级（对应 DbBase 从连接串解析 Migration）
+        let conn2 = format!("Data Source={};Provider=SQLite;Migration=Off", db.display());
+        let mut model = EntityModel::parse(MODEL).unwrap();
+        model.options.raw.insert("Migration".into(), "ReadOnly".into());
+        let dal = Dal::open_with_model(&conn2, model).unwrap();
+        assert_eq!(dal.migration(), Migration::Off, "连接串优先于模型级");
+
+        // 表级只能收紧、不能放大：全局 Off + 表级 Full → 实际 Off
+        let xml = r#"<EntityModel><Tables><Table Name="Order" TableName="DH_Order" Migration="Full">
+          <Columns><Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" /></Columns>
+        </Table></Tables></EntityModel>"#;
+        let model = EntityModel::parse(xml).unwrap();
+        assert_eq!(model.tables[0].migration, Some(Migration::Full));
+        assert_eq!(
+            dal.migration().tighten(model.tables[0].migration),
+            Migration::Off,
+            "表级只能收紧"
+        );
+
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn table_level_off_blocks_schema_sync() {
+        let dir = temp_dir("migration-table");
+        let db = dir.join("test.db");
+        // 全局 Full + 表级 Off：该表完全跳过
+        let xml = r#"<EntityModel><Tables><Table Name="Order" TableName="DH_Order" Migration="Off">
+          <Columns><Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" /></Columns>
+        </Table></Tables></EntityModel>"#;
+        let conn = format!("Data Source={};Provider=SQLite;Migration=Full", db.display());
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(xml).unwrap()).unwrap();
+        let report = dal.sync_schema().unwrap();
+        assert!(report.is_empty(), "表级 Off 不应做任何变更：{report:?}");
+        let mut session = dal.open_session().unwrap();
+        assert!(!session.table_exists("DH_Order").unwrap(), "表级 Off 不应建表");
+        drop(session);
+        dal.clear_pool();
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_drops_extra_column_and_index_but_keeps_other_tables() {
+        let dir = temp_dir("migration-full");
+        let db = dir.join("test.db");
+        let plain = format!("Data Source={};Provider=SQLite", db.display());
+
+        // 先 On 档建库
+        let setup = Dal::open_with_model(&plain, EntityModel::parse(MODEL).unwrap()).unwrap();
+        setup.sync_schema().unwrap();
+        setup.clear_pool();
+        drop(setup);
+
+        // 手工制造“多余物”：多余列 Extra、多余索引 ix_extra、模型外表 DH_Other
+        let raw = Dal::open(&plain).unwrap();
+        let mut session = raw.open_session().unwrap();
+        session
+            .execute("ALTER TABLE \"DH_Order\" ADD COLUMN \"Extra\" text", &[])
+            .unwrap();
+        session
+            .execute("CREATE INDEX \"ix_extra\" ON \"DH_Order\" (\"Status\")", &[])
+            .unwrap();
+        session
+            .execute("CREATE TABLE \"DH_Other\" (\"X\" int)", &[])
+            .unwrap();
+        drop(session);
+        raw.clear_pool();
+        drop(raw);
+
+        // Full 档同步：删多余列与索引；模型外表保留（对齐 XCode：从不触碰模型未声明的表）
+        let conn = format!("Data Source={};Provider=SQLite;Migration=Full", db.display());
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
+        let report = dal.sync_schema().unwrap();
+        assert_eq!(report.mode, Migration::Full);
+        assert_eq!(
+            report.dropped_columns,
+            vec![("DH_Order".to_string(), "Extra".to_string())],
+            "{report:?}"
+        );
+        assert!(
+            report
+                .dropped_indexes
+                .contains(&("DH_Order".to_string(), "ix_extra".to_string())),
+            "{report:?}"
+        );
+        assert_eq!(report.dropped_indexes.len(), 1, "{report:?}");
+        assert!(report.notes.is_empty(), "{report:?}");
+
+        // 库中确认
+        let mut session = dal.open_session().unwrap();
+        let cols = session.table_columns("DH_Order").unwrap();
+        assert!(!cols.iter().any(|c| c.eq_ignore_ascii_case("Extra")));
+        assert!(session.table_exists("DH_Other").unwrap(), "模型外的表从不自动删除");
+        drop(session);
+
+        // 再次同步无变更
+        assert!(dal.sync_schema().unwrap().is_empty());
+
+        dal.clear_pool();
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_reports_unsupported_column_type_change() {
+        const TT: &str = r#"<EntityModel><Tables><Table Name="T2" TableName="DH_T2">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            <Column Name="Code" DataType="String" Length="50" />
+          </Columns>
+        </Table></Tables></EntityModel>"#;
+
+        let dir = temp_dir("migration-full-type");
+        let db = dir.join("test.db");
+        let plain = format!("Data Source={};Provider=SQLite", db.display());
+
+        // 手工建一张与模型类型不符的表（Code 为 int，模型为 nvarchar(50)）
+        let setup = Dal::open(&plain).unwrap();
+        let mut session = setup.open_session().unwrap();
+        session
+            .execute(
+                "CREATE TABLE \"DH_T2\" (\"Id\" integer PRIMARY KEY AUTOINCREMENT, \"Code\" int)",
+                &[],
+            )
+            .unwrap();
+        drop(session);
+        setup.clear_pool();
+        drop(setup);
+
+        // Full 档：SQLite 不支持直接改列类型 → 记入 notes 并继续，不中断
+        let conn = format!("Data Source={};Provider=SQLite;Migration=Full", db.display());
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(TT).unwrap()).unwrap();
+        let report = dal.sync_schema().unwrap();
+        assert!(report.altered_columns.is_empty());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("不支持直接修改列类型")),
+            "{report:?}"
+        );
 
         dal.clear_pool();
         drop(dal);

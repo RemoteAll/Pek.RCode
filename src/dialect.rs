@@ -670,6 +670,82 @@ impl DatabaseKind {
         ))
     }
 
+    /// 生成删除索引的语句（`Full` 档专用；`None` 表示该数据库不支持独立删索引）。
+    /// <param name="index_name">索引名</param>
+    /// <param name="table_name">所属表（MySQL/SQL Server 语法需要）</param>
+    /// <returns>DROP INDEX 语句（与 DH.NCode 各驱动 `DropIndexSQL` 对齐）</returns>
+    pub fn drop_index_sql(&self, index_name: &str, table_name: Option<&str>) -> Option<String> {
+        let name = self.quote(index_name);
+        match self {
+            // SQL Server：`Drop Index 表.索引`
+            DatabaseKind::SqlServer => {
+                table_name.map(|t| format!("Drop Index {}.{name}", self.quote(t)))
+            }
+            // MySQL：`Drop Index 索引 On 表`
+            DatabaseKind::MySql => {
+                table_name.map(|t| format!("Drop Index {name} On {}", self.quote(t)))
+            }
+            // 列式/时序库的索引为表内定义：不支持独立删索引
+            DatabaseKind::ClickHouse | DatabaseKind::TDengine => None,
+            _ => Some(format!("Drop Index {name}")),
+        }
+    }
+
+    /// 生成删除列的语句（`Full` 档专用；`None` 表示该数据库不支持直接删除列）。
+    /// <param name="table_name">表名</param>
+    /// <param name="column_name">列名</param>
+    /// <returns>DROP COLUMN 语句（与 DH.NCode 各驱动 `DropColumnSQL` 对齐）</returns>
+    pub fn drop_column_sql(&self, table_name: &str, column_name: &str) -> Option<String> {
+        let t = self.quote(table_name);
+        let c = self.quote(column_name);
+        match self {
+            // 文档库与 Access（JET/ACE）不支持列级删除
+            DatabaseKind::MongoDb | DatabaseKind::InfluxDb | DatabaseKind::Access => None,
+            // 其余统一 `Alter Table 表 Drop Column 列`
+            _ => Some(format!("Alter Table {t} Drop Column {c}")),
+        }
+    }
+
+    /// 生成删除表的语句（自动迁移**从不**调用——模型外的表不删，与 XCode 相同；供人工/工具使用）。
+    /// <param name="table_name">表名</param>
+    /// <returns>DROP TABLE 语句</returns>
+    pub fn drop_table_sql(&self, table_name: &str) -> String {
+        format!("Drop Table {}", self.quote(table_name))
+    }
+
+    /// 生成修改列类型的语句（`Full` 档专用；`None` 表示该数据库不支持直接改类型——如 SQLite 需重建表）。
+    /// <param name="table">表</param>
+    /// <param name="col">列</param>
+    /// <returns>ALTER COLUMN 语句（与 DH.NCode 各驱动 `AlterColumnSQL` 对齐）</returns>
+    pub fn alter_column_sql(&self, table: &TableMeta, col: &ColumnMeta) -> Option<String> {
+        let t = self.quote(table.effective_table_name());
+        let c = self.quote(table.effective_column_name(col));
+        let ty = self.field_type(col);
+        match self {
+            // SQL Server：Alter Column（显式可空性）
+            DatabaseKind::SqlServer => {
+                let null_sql = if col.nullable { "NULL" } else { "NOT NULL" };
+                Some(format!("Alter Table {t} Alter Column {c} {ty} {null_sql}"))
+            }
+            // Oracle / 达梦 / DB2（Oracle 兼容模式）：Modify 列定义
+            DatabaseKind::Oracle | DatabaseKind::DaMeng | DatabaseKind::Db2 => {
+                Some(format!("Alter Table {t} Modify {c} {ty}"))
+            }
+            // MySQL / HANA / IRIS / TDengine / ClickHouse：Modify Column
+            DatabaseKind::MySql
+            | DatabaseKind::Hana
+            | DatabaseKind::Iris
+            | DatabaseKind::TDengine
+            | DatabaseKind::ClickHouse => Some(format!("Alter Table {t} Modify Column {c} {ty}")),
+            // PG 系（含 KingBase/VastBase/HighGo/DuckDB）：ALTER COLUMN .. TYPE ..
+            DatabaseKind::PostgreSql | DatabaseKind::DuckDb => {
+                Some(format!("ALTER TABLE {t} ALTER COLUMN {c} TYPE {ty}"))
+            }
+            // SQLite（需重建表）、Firebird、Access、文档库：不支持直接改列
+            _ => None,
+        }
+    }
+
     /// 生成建表语句（表 + 索引）。
     ///
     /// 说明：
@@ -1184,6 +1260,76 @@ mod tests {
         let ok = table.column("Ok").unwrap();
         assert_eq!(DatabaseKind::MySql.field_type(ok), "TINYINT");
         assert_eq!(DatabaseKind::Sqlite.field_type(ok), "bit");
+    }
+
+    #[test]
+    fn drop_and_alter_sql_by_dialect() {
+        let table = sample_table();
+        let code = table.column("Code").unwrap();
+
+        // 删除列（Full 档）：与 DH.NCode 各驱动 DropColumnSQL 对齐
+        assert_eq!(
+            DatabaseKind::Sqlite.drop_column_sql("DH_Order", "Extra").unwrap(),
+            "Alter Table \"DH_Order\" Drop Column \"Extra\""
+        );
+        assert_eq!(
+            DatabaseKind::MySql.drop_column_sql("DH_Order", "Extra").unwrap(),
+            "Alter Table `DH_Order` Drop Column `Extra`"
+        );
+        // 文档库与 Access 不支持列级删除
+        assert!(DatabaseKind::MongoDb.drop_column_sql("DH_Order", "Extra").is_none());
+        assert!(DatabaseKind::Access.drop_column_sql("DH_Order", "Extra").is_none());
+
+        // 删除索引（Full 档）：SQL Server 用 `Drop Index 表.索引`；MySQL 带 On；其余独立语句
+        assert_eq!(
+            DatabaseKind::SqlServer.drop_index_sql("ix_a", Some("DH_Order")).unwrap(),
+            "Drop Index [DH_Order].[ix_a]"
+        );
+        assert_eq!(
+            DatabaseKind::MySql.drop_index_sql("ix_a", Some("DH_Order")).unwrap(),
+            "Drop Index `ix_a` On `DH_Order`"
+        );
+        assert_eq!(
+            DatabaseKind::Sqlite.drop_index_sql("ix_a", None).unwrap(),
+            "Drop Index \"ix_a\""
+        );
+        assert_eq!(
+            DatabaseKind::PostgreSql.drop_index_sql("ix_a", Some("DH_Order")).unwrap(),
+            "Drop Index \"ix_a\""
+        );
+        assert!(DatabaseKind::ClickHouse.drop_index_sql("ix_a", None).is_none());
+
+        // 删除表（供人工/工具使用；自动迁移从不调用）
+        assert_eq!(
+            DatabaseKind::Sqlite.drop_table_sql("DH_Order"),
+            "Drop Table \"DH_Order\""
+        );
+
+        // 修改列类型（Full 档）：四组方言与 DH.NCode 各驱动 AlterColumnSQL 对齐
+        assert_eq!(
+            DatabaseKind::MySql.alter_column_sql(&table, code).unwrap(),
+            "Alter Table `DH_Order` Modify Column `Code` varchar(50)"
+        );
+        assert_eq!(
+            DatabaseKind::SqlServer.alter_column_sql(&table, code).unwrap(),
+            "Alter Table [DH_Order] Alter Column [Code] nvarchar(50) NOT NULL"
+        );
+        assert_eq!(
+            DatabaseKind::PostgreSql.alter_column_sql(&table, code).unwrap(),
+            "ALTER TABLE \"DH_Order\" ALTER COLUMN \"Code\" TYPE varchar(50)"
+        );
+        assert_eq!(
+            DatabaseKind::Oracle.alter_column_sql(&table, code).unwrap(),
+            "Alter Table \"DH_Order\" Modify \"Code\" varchar2(50)"
+        );
+        assert_eq!(
+            DatabaseKind::Db2.alter_column_sql(&table, code).unwrap(),
+            "Alter Table \"DH_Order\" Modify \"Code\" VARCHAR2(50)"
+        );
+        // SQLite 不支持直接改列类型（需重建表）——由人工处理
+        assert!(DatabaseKind::Sqlite.alter_column_sql(&table, code).is_none());
+        // Firebird 亦不支持（C# 端 AlterColumnSQL 已注释）
+        assert!(DatabaseKind::Firebird.alter_column_sql(&table, code).is_none());
     }
 
     #[test]

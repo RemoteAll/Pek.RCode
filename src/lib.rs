@@ -15,7 +15,7 @@
 //! | `InsertBuilder` / `SelectBuilder` | [`sqlbuild`] |
 //! | `WhereExpression` | [`query::Where`] |
 //! | `PageParameter` | [`query::Query`]（`page` / `take`） |
-//! | 迁移 Migration（建表/加列） | [`Dal::sync_schema`](dal::Dal::sync_schema) |
+//! | 迁移 Migration（`Off`/`ReadOnly`/`On`/`Full` 四档） | [`migration::Migration`] + [`Dal::sync_schema`](dal::Dal::sync_schema) |
 //! | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | [`cache::EntityCache`] / [`cache::SingleCache`]（写入自动失效） |
 //! | `DAL.GetTables`（反向工程） | [`reverse`]（[`Dal::read_model`](dal::Dal::read_model)） |
 //! | `xcode` 命令（XCodeTool 代码生成） | [`codegen`]（`generate` / `generate_all`） |
@@ -71,7 +71,8 @@
 //! ## 安全说明
 //!
 //! - 所有查询/写入均使用参数绑定；列名、表名经方言引用转义
-//! - `sync_schema` 只做增量补齐（建表/加列），不修改、不删除已有对象
+//! - `sync_schema` 默认（`On`）只做增量补齐（建表/加列/补索引）；修改列类型与删除多余列/索引
+//!   仅 [`Migration::Full`] 档允许，且模型外的表从不自动删除（档位语义与 DH.NCode 一致）
 
 #[cfg(all(feature = "tls-native", feature = "tls-rustls"))]
 compile_error!(
@@ -108,6 +109,7 @@ pub mod influxdb;
 pub mod interceptor;
 pub mod membership;
 pub mod meta;
+pub mod migration;
 pub mod model;
 #[cfg(feature = "driver-mongodb")]
 pub mod mongodb;
@@ -152,6 +154,7 @@ pub use error::{Error, Result};
 pub use dal::Dal;
 pub use dialect::DatabaseKind;
 pub use entity::Entity;
+pub use migration::Migration;
 pub use model::{ColumnMeta, EntityModel, IndexMeta, TableMeta};
 pub use query::{Query, Where};
 pub use session::{DbRow, RowSet, SqlSession};

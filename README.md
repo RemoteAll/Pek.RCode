@@ -41,7 +41,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `http` / `rt` | — | 内部公共层：HTTP 驱动共用传输层、异步驱动共用 tokio 运行时 |
 | `sqlbuild` | `InsertBuilder` / `SelectBuilder` | ✅ INSERT/UPDATE/DELETE/SELECT/COUNT |
 | `query` | `WhereExpression` / `PageParameter` | ✅ 链式条件 + 分页/取前 N |
-| `dal` | `DAL` / 迁移 Migration | ✅ 连接串解析、结构同步（建表/补列/**补索引**）、结构比对 `diff_schema`（差异报告 + ALTER 导出）、实体表操作 |
+| `dal` | `DAL` / 迁移 Migration | ✅ 连接串解析、结构同步按档位（`Off`/`ReadOnly`/`On`/`Full`，**Full 才允许修改/删除**）、结构比对 `diff_schema`（差异报告 + 补齐/改删脚本导出）、实体表操作 |
 | `pool` | `ConnectionPool` | ✅ 会话连接池（按连接串共享；Min=CPU(2–8)/Max=1000/空闲 30s；`Pooling=false` 关闭） |
 | `async_dal` | `IAsyncDbSession` / `*Async` | ✅ 异步门面（tokio `spawn_blocking` 包装全驱动；`run`/`with_session` 覆盖全部同步 API） |
 | `catalog` | 各 `DbBase.OnGetTables` 元数据 | ✅ 全驱动目录读取（表/列/索引；MongoDB 除外；Access 走 ODBC 元数据） |
@@ -54,9 +54,9 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `navigation` | `Navigation*` / `DataRowEntityAccessor` | ✅ 导航注册表（HasOne/HasMany）+ 装载 `load_one`/`load_many` + 行集→实体（`Entity::load`，同一能力面） |
 | `simulation` | `Common/DataSimulation` | ✅ 造数压测（随机整型/字符串/时间 + 分批事务 + TPS） |
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
-| `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`） |
+| `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --kind entity,model,interface,biz / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`；`biz` 业务扩展**永不覆盖**、只合并缺失区块） |
 
-测试：**238 项全部通过**（库单测 211 + 集成 17 + 文档测试 10；`--features duckdb` 全量 245 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 239 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 238 项（rustls TLS 后端），`--no-default-features` 全量 236 项（完全不含 TLS 依赖）；
+测试：**250 项全部通过**（库单测 223 + 集成 17 + 文档测试 10；`--features duckdb` 全量 257 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 251 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 250 项（rustls TLS 后端），`--no-default-features` 全量 248 项（完全不含 TLS 依赖）；
 MySQL / PostgreSQL / SQL Server / Oracle / network 端到端用例在有真实库/服务时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -289,6 +289,29 @@ cargo run --bin rcodegen -- --model <你的项目>\Entity\Model.xml --out src\en
 - 默认**只覆盖带标记的文件**，手写代码不会被误删（需 `--force` 才能覆盖其它文件）
 - 内容不变的不会重写（重复执行无副作用，适合进 CI）
 
+#### 双文件模式：实体 + 业务扩展（对应 DH.NCode 的 `{Entity}.cs` + `{Entity}.Biz.cs`）
+
+`--kind entity,biz` 会为每张表生成两个文件：
+
+| 文件 | 覆盖策略 | 对应 C# |
+|------|---------|---------|
+| `ji_li_yu.rs` | 生成器**全量覆盖**（带标记保护） | `JiLiYu.cs` |
+| `ji_li_yu_biz.rs` | **永不覆盖**；已存在时只做“分析合并” | `JiLiYu.Biz.cs` |
+
+业务扩展文件以 `// #region 名称` / `// #endregion` 划分区块（rust-analyzer 可折叠），重新生成时（与 DH.NCode 的 `EntityBuilder.Merge` 同语义）：
+
+- 已存在的区块：**终不修改**，全部手写内容保留
+- 骨架中新增而旧文件缺失的区块：自动补回（支持未来骨架升级）
+- 无缺失区块时不写盘（幂等，适合进 CI）
+
+```powershell
+# 首次生成实体 + 业务扩展
+cargo run --bin rcodegen -- --model <你的项目>\Entity\Model.xml --out src\entities --kind entity,biz
+
+# 之后只刷新业务扩展（补齐缺失区块，不动手写内容）
+cargo run --bin rcodegen -- --model <你的项目>\Entity\Model.xml --out src\entities --kind biz
+```
+
 ### 对象实体用法（与 C# 侧 Entity 一致）
 
 生成文件自带 `Entity` 实现（对象化增删改查），用法与 C# 的 `entity.Save()` 对应：
@@ -307,6 +330,35 @@ order.delete(&dal, session.as_mut())?;
 ```
 
 > 生成产物已用真实模型（`JiLiYu`、`VerifyCode`）做过编译与运行验证。
+
+### 结构迁移档位（对应 DH.NCode 的 `Migration` 枚举）
+
+`Dal::sync_schema()` 按档位执行结构迁移，语义与 DH.NCode 逐档对齐（默认 `On`）：
+
+| 档位 | 行为（对应 C# `DbMetaData.CheckTable` 分支） |
+|------|------|
+| `Off` | 完全跳过（`SetTables` 直接返回） |
+| `ReadOnly` | 只检查、不执行；将 DDL 收集到 `SchemaReport.pending_sql` 供人工执行 |
+| `On`（默认） | 只做创建类：建表 / 补列 / 补索引（`onlyCreate`，不修改、不删除） |
+| `Full` | 新建 + **修改**（列类型）+ **删除**（多余列 / 多余索引）——删除类动作仅此档允许 |
+
+配置来源（优先级从高到低）：
+
+1. 连接串：`Data Source=demo.db;Provider=SQLite;Migration=Full`（对应 `DbBase` 从连接串解析）
+2. 模型级：`<Option><Migration>ReadOnly</Migration></Option>`（对应 `XCodeSetting.Migration`）
+3. 缺省 `On`
+
+- **表级只能收紧、不能放大**：`<Table Name="DH_Order" Migration="Off">`，生效档 = `min(表级, 全局)`（与 `ResolveMigration` 一致）
+- 运行时可用 `dal.set_migration(Migration::Full)` 覆盖；查询 `dal.migration()`
+- 安全边界：模型外的多余表**从不自动删除**（与 XCode 相同）；单条删除/修改失败不中断整体，记入 `SchemaReport.notes` 提示人工处理
+- 预检：`dal.diff_schema()` 只读比对，`alter_sql`（补齐类）与 `full_sql`（修改/删除类）可导出人工审阅
+
+```rust
+// Full 档：修改列类型 + 删除多余列/索引（先删索引再删列，顺序与 XCode 一致）
+let dal = Dal::open_with_model("Data Source=demo.db;Provider=SQLite;Migration=Full", model)?;
+let report = dal.sync_schema()?;
+println!("{report}");   // 新建 0 张，补充列 0 个，…；改列：DH_Order.Amount；删列：DH_Order.Extra
+```
 
 ---
 

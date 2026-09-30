@@ -3,6 +3,9 @@
 //! 从 `Model.xml` 生成 Rust **对象实体**（结构体 + `new()`/`Default` + `Entity` 实现，
 //! 自带 insert/save/update/delete/find/query/count）。
 //!
+//! `--kind biz` 生成业务扩展骨架（`{表}_biz.rs`，对应 DH.NCode 的 `{Entity}.Biz.cs`）：
+//! 该文件**永不覆盖**，已存在时只做“分析合并”（补齐缺失区块，保留手写内容）。
+//!
 //! 用法见 `rcodegen --help`。
 
 use std::{
@@ -35,7 +38,7 @@ struct Options {
     force: bool,
     /// 只显示不写盘
     dry_run: bool,
-    /// 生成类型（entity/model/interface；默认 entity）
+    /// 生成类型（entity/model/interface/biz；默认 entity）
     kind: Vec<String>,
 }
 
@@ -106,8 +109,10 @@ fn run(opts: &Options) -> Result<(), String> {
         opts.kind.clone()
     };
     for kind in &kinds {
-        if !matches!(kind.as_str(), "entity" | "model" | "interface") {
-            return Err(format!("未知生成类型 {kind}（支持 entity/model/interface）"));
+        if !matches!(kind.as_str(), "entity" | "model" | "interface" | "biz") {
+            return Err(format!(
+                "未知生成类型 {kind}（支持 entity/model/interface/biz）"
+            ));
         }
     }
 
@@ -129,23 +134,51 @@ fn run(opts: &Options) -> Result<(), String> {
     let mut skipped: Vec<String> = Vec::new();
 
     for table in tables {
-        let outputs: Vec<(String, String)> = kinds
+        let outputs: Vec<(&str, String, String)> = kinds
             .iter()
             .map(|kind| match kind.as_str() {
-                "model" => (codegen::model_file_name(table), codegen::generate_model(table)),
+                "model" => (
+                    "model",
+                    codegen::model_file_name(table),
+                    codegen::generate_model(table),
+                ),
                 "interface" => (
+                    "interface",
                     codegen::interface_file_name(table),
                     codegen::generate_interface(table),
                 ),
-                _ => (codegen::file_name(table), codegen::generate(table)),
+                // 业务扩展：永不覆盖，只做分析合并（对应 DH.NCode 的 {Entity}.Biz.cs）
+                "biz" => (
+                    "biz",
+                    codegen::biz_file_name(table),
+                    codegen::generate_biz(table),
+                ),
+                _ => ("entity", codegen::file_name(table), codegen::generate(table)),
             })
             .collect();
 
-        for (file_name, code) in outputs {
+        for (kind, file_name, code) in outputs {
             let path = out_dir.join(&file_name);
 
             match dhrust::io::read_all_text(&path) {
                 Ok(existing) => {
+                    // 业务扩展：旧文件永不覆盖，只补齐缺失区块（保留全部手写内容）
+                    if kind == "biz" {
+                        match codegen::merge_biz(&existing, &code) {
+                            Some(merged) => {
+                                if opts.dry_run {
+                                    println!("[将合并] {}", path.display());
+                                } else {
+                                    dhrust::io::write_all_text(&path, &merged)
+                                        .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+                                    println!("[合并] {}", path.display());
+                                }
+                                updated += 1;
+                            }
+                            None => unchanged += 1,
+                        }
+                        continue;
+                    }
                     if existing == code {
                         unchanged += 1;
                         continue;
@@ -336,8 +369,8 @@ fn print_usage() {
   -o, --out <路径>     输出目录（正向，默认取模型 Output 配置，否则 ./entities）
                        或输出文件（反向，默认 ./Model.xml）
   -t, --table <名称>   只生成指定表/实体（逗号分隔，可重复指定）
-  -k, --kind <类型>    生成类型：entity（实体，默认）/ model（模型类）/ interface（接口），
-                       逗号分隔可多选
+  -k, --kind <类型>    生成类型：entity（实体，默认）/ model（模型类）/ interface（接口）/
+                       biz（业务扩展，永不覆盖、只合并缺失区块），逗号分隔可多选
   -c, --conn <串>      反向工程连接串（与 XCode 一致，如 Data Source=x.db;Provider=SQLite），
                        设置后进入反向模式：数据库 → Model.xml
   -l, --list           列出表后退出（正向：模型表；反向：数据库表）

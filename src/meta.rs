@@ -301,13 +301,12 @@ impl Dal {
     pub fn drop_table(&self, table: &str) -> Result<bool> {
         let kind = self.kind();
         let meta = table_meta(self, table)?;
-        let name = kind.quote(meta.effective_table_name());
         if kind == DatabaseKind::Firebird {
-            self.execute_ddl(&format!("Drop Table {name}"))?;
+            self.execute_ddl(&kind.drop_table_sql(meta.effective_table_name()))?;
             let sequence = kind.quote(&oracle_identity_sequence(meta.effective_table_name()));
             self.execute_ddl(&format!("Drop Sequence {sequence}"))?;
         } else {
-            self.execute_ddl(&format!("Drop Table {name}"))?;
+            self.execute_ddl(&kind.drop_table_sql(meta.effective_table_name()))?;
         }
         Ok(true)
     }
@@ -332,41 +331,16 @@ impl Dal {
         let kind = self.kind();
         let meta = table_meta(self, table)?;
         let col = column_meta(meta, column)?;
-        let tname = kind.quote(meta.effective_table_name());
-        let cname = kind.quote(meta.effective_column_name(col));
-        let ctype = kind.field_type(col);
-
-        let sql = match kind {
-            DatabaseKind::Sqlite => {
-                return Err(Error::Unsupported(
+        // SQL 生成统一由 dialect 提供（与 sync_schema 的 Full 档共用同一实现）
+        let sql = kind.alter_column_sql(meta, col).ok_or_else(|| {
+            if kind == DatabaseKind::Sqlite {
+                Error::Unsupported(
                     "SQLite 不支持修改列类型，请重建表（新建列 → 拷贝数据 → 删除旧列）".into(),
-                ));
+                )
+            } else {
+                Error::Unsupported(format!("{} 不支持修改列", kind.name()))
             }
-            // 文档库不支持改列
-            DatabaseKind::MongoDb | DatabaseKind::InfluxDb => {
-                return Err(Error::Unsupported(format!("{kind:?} 不支持修改列")));
-            }
-            // Oracle/DaMeng/DB2：`Alter Table x Modify <列定义>`
-            DatabaseKind::Oracle | DatabaseKind::DaMeng | DatabaseKind::Db2 => {
-                format!("Alter Table {tname} Modify {cname} {ctype}")
-            }
-            // SQL Server：标准 ALTER COLUMN（C# 会在类型/自增变化时重建表）
-            DatabaseKind::SqlServer => {
-                let null_sql = if col.nullable { "NULL" } else { "NOT NULL" };
-                format!("Alter Table {tname} Alter Column {cname} {ctype} {null_sql}")
-            }
-            // MySQL/Hana/IRIS/TDengine/ClickHouse：`Modify Column`
-            DatabaseKind::MySql
-            | DatabaseKind::Hana
-            | DatabaseKind::Iris
-            | DatabaseKind::TDengine
-            | DatabaseKind::ClickHouse => {
-                format!("Alter Table {tname} Modify Column {cname} {ctype}")
-            }
-            // PG 系（含 KingBase/VastBase/HighGo/DuckDB/Firebird）：`ALTER COLUMN .. TYPE ..`
-            _ => format!("ALTER TABLE {tname} ALTER COLUMN {cname} TYPE {ctype}"),
-        };
-
+        })?;
         self.execute_ddl(&sql)?;
         Ok(true)
     }
@@ -379,11 +353,10 @@ impl Dal {
         let kind = self.kind();
         let meta = table_meta(self, table)?;
         let col = column_meta(meta, column)?;
-        let sql = format!(
-            "Alter Table {} Drop Column {}",
-            kind.quote(meta.effective_table_name()),
-            kind.quote(meta.effective_column_name(col))
-        );
+        // SQL 生成统一由 dialect 提供（与 sync_schema 的 Full 档共用同一实现）
+        let sql = kind
+            .drop_column_sql(meta.effective_table_name(), meta.effective_column_name(col))
+            .ok_or_else(|| Error::Unsupported(format!("{} 不支持删除列", kind.name())))?;
         self.execute_ddl(&sql)?;
         Ok(true)
     }
@@ -417,14 +390,10 @@ impl Dal {
             Ok(idx) => kind.index_name(meta, idx),
             Err(_) => index.to_string(),
         };
-        let tname = kind.quote(meta.effective_table_name());
-        let sql = match kind {
-            DatabaseKind::SqlServer => {
-                format!("Drop Index {tname}.{}", kind.quote(&name))
-            }
-            DatabaseKind::MySql => format!("Drop Index {} On {tname}", kind.quote(&name)),
-            _ => format!("Drop Index {}", kind.quote(&name)),
-        };
+        // SQL 生成统一由 dialect 提供（与 sync_schema 的 Full 档共用同一实现）
+        let sql = kind
+            .drop_index_sql(&name, Some(meta.effective_table_name()))
+            .ok_or_else(|| Error::Unsupported(format!("{} 不支持删除索引", kind.name())))?;
         self.execute_ddl(&sql)?;
         Ok(true)
     }

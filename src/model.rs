@@ -32,6 +32,7 @@ use std::path::Path;
 use roxmltree::{Document, Node};
 
 use crate::error::{Error, Result};
+use crate::migration::Migration;
 use crate::types::DataType;
 
 /// 默认的模型命名空间（与当前 XCode 版本一致）。
@@ -87,6 +88,15 @@ impl ModelOptions {
     pub fn base_class(&self) -> Option<&str> {
         self.get("BaseClass")
     }
+
+    /// 模型级迁移档位（`Migration`）。
+    ///
+    /// 对应 DH.NCode 的全局 `XCodeSetting.Migration`（缺省 `On`）；连接串中显式指定
+    /// `Migration=...` 时以连接串为准（与 `DbBase` 从连接串解析一致）。
+    /// <returns>档位；未配置或无法识别时为 None</returns>
+    pub fn migration(&self) -> Option<Migration> {
+        self.get("Migration").and_then(Migration::parse)
+    }
 }
 
 /// 数据表定义（`<Table>`）。
@@ -100,6 +110,9 @@ pub struct TableMeta {
     pub description: String,
     /// 表级连接名覆盖（少见）
     pub conn_name: Option<String>,
+    /// 表级迁移档位（对应 DH.NCode 的 `TableItem.Migration`；只能收紧、不能放大，
+    /// 空值表示继承全局配置）
+    pub migration: Option<Migration>,
     /// 列定义
     pub columns: Vec<ColumnMeta>,
     /// 索引定义
@@ -368,6 +381,7 @@ fn parse_table(node: &Node) -> Result<TableMeta> {
         table_name,
         description: attr_string(node, "Description").unwrap_or_default(),
         conn_name: attr_string(node, "ConnName"),
+        migration: attr_string(node, "Migration").and_then(|v| Migration::parse(&v)),
         columns: Vec::new(),
         indexes: Vec::new(),
     };
@@ -489,6 +503,10 @@ fn write_name_and_table_name(table: &TableMeta) -> String {
     }
     if let Some(conn) = &table.conn_name {
         s.push_str(&format!(" ConnName=\"{}\"", escape_attr(conn)));
+    }
+    // 表级迁移档位（收紧）：仅显式配置时写出，保证解析→写出→解析往返一致
+    if let Some(migration) = table.migration {
+        s.push_str(&format!(" Migration=\"{}\"", migration.name()));
     }
     s
 }
@@ -621,6 +639,36 @@ mod tests {
         let xml = model.to_xml();
         let again = EntityModel::parse(&xml).expect("写出的 XML 应能再次解析");
         assert_eq!(model, again, "解析 → 写出 → 解析 应完全一致");
+    }
+
+    #[test]
+    fn table_migration_attribute_roundtrip() {
+        // 表级迁移档位（收紧）：解析、写出、再解析保持一致
+        let xml = r#"<EntityModel><Tables><Table Name="Order" TableName="DH_Order" Migration="Off">
+          <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+        </Table></Tables></EntityModel>"#;
+        let model = EntityModel::parse(xml).unwrap();
+        assert_eq!(model.tables[0].migration, Some(Migration::Off));
+        let out = model.to_xml();
+        assert!(out.contains("Migration=\"Off\""), "{out}");
+        let again = EntityModel::parse(&out).unwrap();
+        assert_eq!(again.tables[0].migration, Some(Migration::Off));
+
+        // 未配置时不写出属性（保持模型文件干净）
+        let xml2 = r#"<EntityModel><Tables><Table Name="T" TableName="T">
+          <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+        </Table></Tables></EntityModel>"#;
+        let model2 = EntityModel::parse(xml2).unwrap();
+        assert_eq!(model2.tables[0].migration, None);
+        assert!(!model2.to_xml().contains("Migration="));
+
+        // 模型级 Migration 配置（对应 XCodeSetting.Migration）
+        let xml3 = r#"<EntityModel><Option><Migration>Full</Migration></Option><Tables>
+          <Table Name="T" TableName="T">
+          <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+        </Table></Tables></EntityModel>"#;
+        let model3 = EntityModel::parse(xml3).unwrap();
+        assert_eq!(model3.options.migration(), Some(Migration::Full));
     }
 
     #[test]
