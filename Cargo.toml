@@ -46,7 +46,10 @@ mongodb = { version = "3.9.1", optional = true }
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 serde_json = "1"
-ureq = "3.4.2"
+# HTTP 类驱动（ClickHouse/TDengine/InfluxDB）与 network/db_service 共用传输层
+# 默认不含 TLS：https 场景由可选特性 `http-tls` 启用（ureq/rustls）；局域网明文 HTTP 无需 TLS，
+# 纯 SQLite 消费方可因此少编 rustls+ring（构建更小更快）
+ureq = { version = "3.4.2", default-features = false, features = ["gzip"] }
 futures-util = { version = "0.3.34", optional = true }
 # Redis 集成：使用 Pek.RRedis（DH.NRedis 的 Rust 实现，与 C# 端字节级互通）
 pek-rredis = { path = "../Pek.RRedis", optional = true }
@@ -56,8 +59,8 @@ lto = "thin"
 strip = true
 
 [features]
-# 默认 = native-tls + 全部数据库驱动（与既往版本行为完全一致；轻量消费方可按 driver-* 裁剪）
-default = ["tls-native", "all-drivers"]
+# 默认 = native-tls + 全部数据库驱动 + HTTP 传输层 TLS（与既往版本行为完全一致；轻量消费方可按 driver-* 裁剪）
+default = ["tls-native", "all-drivers", "http-tls"]
 duckdb = ["dep:duckdb"]
 # ———— 数据库驱动（按需裁剪：如仅用 SQLite+MySQL 的消费方）————
 # 全部驱动（默认组合）：关闭 default 后可按需只选 driver-* 子集
@@ -113,6 +116,8 @@ tls-rustls = [
     "dep:webpki-roots",
     "mysql?/rustls",
 ]
+# HTTP 传输层 TLS（ureq/rustls）：ClickHouse/TDengine/InfluxDB 与 db_service 的 https 需要
+http-tls = ["ureq/rustls"]
 # Redis 集成（Pek.RRedis）：分布式缓存版本号跨进程失效
 redis = ["dep:pek-rredis"]
 
