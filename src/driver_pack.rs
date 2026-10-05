@@ -23,6 +23,11 @@
 //! - 配置 `pubkey` 非空时**强制验签**（此时允许内网 http 组件源）；为空时仅允许 https 或回环 http。
 //! - https 组件源默认用 rustls **WebPki 内置根**（不读系统证书库）；自签/内网 CA 场景经
 //!   [`DriverManagerConfig::ca_pem`] 指定根证书（PEM，可多张），无需改动系统信任。
+//!   **自签证书要点**：须为叶子证书（`CA:FALSE`）或标准 CA+叶子链（信任 CA）；
+//!   直接用 `CA:TRUE` 证书当服务器证书会被 rustls 拒绝（`CaUsedAsEndEntity`）。
+//!   生成示例（SAN 按实际地址改）：`openssl req -x509 -newkey rsa:2048 -keyout key.pem
+//!   -out ca.pem -days 365 -nodes -subj "/CN=drivers.local" -addext "subjectAltName=IP:127.0.0.1"
+//!   -addext "basicConstraints=critical,CA:FALSE"`
 //! - 相同连接串（文本）复用同一宿主进程；[`DriverManager::ensure_updated`] 会联网检查新版本。
 //!   [`DriverManager::ensure`] 则本地缓存优先（离线可用），仅本地无驱动时才联网。
 //! - [`DriverManager`] 析构时停止全部宿主进程；长驻应用可配置 `idle_timeout` 并用

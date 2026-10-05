@@ -54,6 +54,7 @@ Default = "main"
 # Url = "http://192.168.1.10:5502"
 # PubKey = ""
 # CaFile = "Config/store-ca.pem"   # 组件源为 https 自签/内网 CA 时指定根证书（PEM 文件路径）
+#   自签证书须为叶子（CA:FALSE）或标准 CA+叶子链（信任 CA）；SAN 需含访问地址
 
 # 连接定义（表形态；也支持简写：Connections.main = "Data Source=Data/main.db;Provider=SQLite"）
 # 注：Windows 绝对路径请用**单引号**字符串（如 'Data Source=C:\App\Data\x.db;Provider=SQLite'）
