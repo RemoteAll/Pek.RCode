@@ -121,11 +121,12 @@ tls-rustls = [
 # HTTP 传输层 TLS（ureq/rustls）：ClickHouse/TDengine/InfluxDB 与 db_service 的 https 需要
 http-tls = ["ureq/rustls"]
 # 驱动包按需分发（DriverManager）：从 Pek.RPanlServer 组件源下载 dbserver 驱动包并按需拉起
-# （Ed25519 验签经 dhrust/plugin；Database.toml 约定文件经 dhrust/toml；https 组件源需同时启用 http-tls）
+# （Ed25519 验签经 dhrust/plugin；Database.toml 约定文件经 dhrust/toml；driver-pack 已含 http-tls
+# ——https 组件源开箱可用；自签/内网 CA 源经 Database.toml 的 [DriverStore] CaFile 指定根证书）
 # 数据库连接约定文件（Config/Database.toml）：解析 + 多数据源容器 + SQLite 相对路径解析
 database = ["dhrust/toml", "dep:serde"]
 # 驱动按需分发（组件/network）：在约定文件基础上增加 [DriverStore] 自动下载分发
-driver-pack = ["database", "dhrust/plugin"]
+driver-pack = ["database", "dhrust/plugin", "http-tls"]
 # Redis 集成（Pek.RRedis）：分布式缓存版本号跨进程失效
 redis = ["dep:pek-rredis"]
 
@@ -137,6 +138,8 @@ members = ["derive"]
 pek-rcode-derive = { path = "derive" }
 # TLS 测试：生成自签 PEM 客户端证书（tls-rustls 用例）
 rcgen = "0.13"
+# TLS 测试：自签 https 静态服务（driver-pack https 用例）
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [[example]]
 # 驱动包按需分发演示（下载 → 验签 → 拉起 → network 连接）

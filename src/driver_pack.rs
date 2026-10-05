@@ -21,6 +21,8 @@
 //! - 组件源协议见 Pek.RPanlServer「下载管理」：`/components/catalog.json`（同址 `.sig`
 //!   为 base64 Ed25519 签名，与插件源同一把平台密钥）；公钥为 32 字节裸 hex（或 44 字节 SPKI DER）。
 //! - 配置 `pubkey` 非空时**强制验签**（此时允许内网 http 组件源）；为空时仅允许 https 或回环 http。
+//! - https 组件源默认用 rustls **WebPki 内置根**（不读系统证书库）；自签/内网 CA 场景经
+//!   [`DriverManagerConfig::ca_pem`] 指定根证书（PEM，可多张），无需改动系统信任。
 //! - 相同连接串（文本）复用同一宿主进程；[`DriverManager::ensure_updated`] 会联网检查新版本。
 //!   [`DriverManager::ensure`] 则本地缓存优先（离线可用），仅本地无驱动时才联网。
 //! - [`DriverManager`] 析构时停止全部宿主进程；长驻应用可配置 `idle_timeout` 并用
@@ -99,6 +101,9 @@ pub struct DriverManagerConfig {
     pub store_url: String,
     /// 平台 Ed25519 公钥（32 字节裸 hex 或 44 字节 SPKI DER）。空 = 不验签（仅允许 https/回环 http）。
     pub pubkey: String,
+    /// 组件源 https 自定义根证书（PEM 内容，可含多张；自签/内网 CA 场景）。
+    /// `None` = rustls WebPki 内置根（不读系统证书库）；配置后该组根证书**替换**默认根。
+    pub ca_pem: Option<Vec<u8>>,
     /// 驱动缓存目录；缺省为系统临时目录下 `pek-rcode-drivers`。
     pub cache_dir: Option<PathBuf>,
     /// 宿主空闲回收阈值（配合 [`DriverManager::reap_idle`]；`None` = 不按空闲回收）。
@@ -193,6 +198,8 @@ pub struct DriverManager {
     cfg: DriverManagerConfig,
     cache_dir: PathBuf,
     catalog_url: String,
+    /// 自定义根证书（解析自 `ca_pem`；`None` = WebPki 默认根）
+    ca_certs: Option<ureq::tls::RootCerts>,
     hosts: Mutex<HashMap<String, RunningHost>>,
 }
 
@@ -215,6 +222,10 @@ impl DriverManager {
                 .map_err(|e| Error::Argument(format!("驱动管理器：公钥无效（{e}）")))?;
         }
         let catalog_url = catalog_url_of(store);
+        let ca_certs = match cfg.ca_pem.as_deref() {
+            Some(pem) => Some(parse_ca_pem(pem).map_err(Error::Argument)?),
+            None => None,
+        };
         let cache_dir = cfg
             .cache_dir
             .clone()
@@ -223,6 +234,7 @@ impl DriverManager {
             cfg,
             cache_dir,
             catalog_url,
+            ca_certs,
             hosts: Mutex::new(HashMap::new()),
         })
     }
@@ -422,11 +434,15 @@ impl DriverManager {
                 "驱动组件源地址不被允许（需 https，或配置公钥后的 http）：{url}"
             )));
         }
-        let config = ureq::Agent::config_builder()
+        let mut builder = ureq::Agent::config_builder()
             .timeout_global(Some(DOWNLOAD_TIMEOUT))
-            .http_status_as_error(false)
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
+            .http_status_as_error(false);
+        if let Some(roots) = &self.ca_certs {
+            // 自签/内网 CA：以配置的根证书集合替换 WebPki 默认根
+            builder = builder
+                .tls_config(ureq::tls::TlsConfig::builder().root_certs(roots.clone()).build());
+        }
+        let agent = ureq::Agent::new_with_config(builder.build());
         let mut resp = agent
             .get(url)
             .call()
@@ -725,6 +741,28 @@ fn url_allowed(url: &str, has_pubkey: bool) -> bool {
     host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]")
 }
 
+/// 解析 PEM 根证书（可含多张 `BEGIN CERTIFICATE` 块；供自签/内网 CA 场景）。
+fn parse_ca_pem(pem: &[u8]) -> std::result::Result<ureq::tls::RootCerts, String> {
+    let text = String::from_utf8_lossy(pem);
+    let mut certs = Vec::new();
+    for block in text.split("-----BEGIN CERTIFICATE-----").skip(1) {
+        let Some(end) = block.find("-----END CERTIFICATE-----") else {
+            return Err("根证书 PEM 缺少 END 标记".to_string());
+        };
+        let full = format!(
+            "-----BEGIN CERTIFICATE-----{}-----END CERTIFICATE-----",
+            &block[..end]
+        );
+        let cert = ureq::tls::Certificate::from_pem(full.as_bytes())
+            .map_err(|e| format!("根证书 PEM 解析失败：{e}"))?;
+        certs.push(cert);
+    }
+    if certs.is_empty() {
+        return Err("根证书 PEM 未包含 BEGIN CERTIFICATE 块".to_string());
+    }
+    Ok(ureq::tls::RootCerts::new_with_certs(&certs))
+}
+
 /// 组件源根地址 → 目录地址（已是 `.../catalog.json` 则原样）。
 fn catalog_url_of(store: &str) -> String {
     let s = store.trim().trim_end_matches('/');
@@ -885,6 +923,93 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 起一个"固定响应"的 https 静态服务（rustls 自签）；接受 `accepts` 个连接（失败忽略）。
+    fn spawn_https_static(
+        cert: rcgen::Certificate,
+        key: rcgen::KeyPair,
+        body: Vec<u8>,
+        accepts: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let cfg = std::sync::Arc::new(
+            rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.der().to_vec())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..accepts {
+                let Ok((tcp, _)) = listener.accept() else { break };
+                let Ok(conn) = rustls::ServerConnection::new(cfg.clone()) else {
+                    continue;
+                };
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                let mut buf = [0u8; 2048];
+                // 读到请求（校验失败的连接会读错/断开，忽略）
+                let _ = tls.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tls.write_all(head.as_bytes());
+                let _ = tls.write_all(&body);
+                let _ = tls.flush();
+            }
+        });
+        (format!("https://127.0.0.1:{port}"), handle)
+    }
+
+    #[test]
+    fn self_signed_https_source_needs_ca_pem() {
+        // 自签证书（SAN=127.0.0.1）
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "pek-test-ca");
+        let cert = params.self_signed(&key).unwrap();
+        let pem = cert.pem();
+        let body = br#"{"components":[]}"#.to_vec();
+        let (url, handle) = spawn_https_static(cert, key, body.clone(), 2);
+
+        // ① 配置根证书（PEM）→ 信任自签证书，下载成功
+        let mgr = DriverManager::new(DriverManagerConfig {
+            store_url: url.clone(),
+            ca_pem: Some(pem.clone().into_bytes()),
+            cache_dir: Some(temp_dir("https-ca")),
+            ..Default::default()
+        })
+        .unwrap();
+        let got = mgr
+            .fetch(&format!("{url}/components/catalog.json"), 4096)
+            .unwrap();
+        assert_eq!(got, body, "配置根证书后应能下载自签 https 源");
+
+        // ② 不配置 → rustls 默认 WebPki 根不含自签证书，校验失败
+        let mgr = DriverManager::new(DriverManagerConfig {
+            store_url: url.clone(),
+            cache_dir: Some(temp_dir("https-noca")),
+            ..Default::default()
+        })
+        .unwrap();
+        let err = mgr.fetch(&format!("{url}/components/catalog.json"), 4096);
+        assert!(err.is_err(), "未配置根证书时自签源应校验失败：{err:?}");
+
+        let _ = handle.join();
     }
 
     #[test]
@@ -1233,6 +1358,7 @@ fn main() {
             cache_dir: Some(cache.clone()),
             idle_timeout: Some(Duration::from_millis(300)),
             ready_timeout: Some(Duration::from_secs(10)),
+            ca_pem: None,
         })
         .unwrap();
 

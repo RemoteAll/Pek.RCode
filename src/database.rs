@@ -53,6 +53,7 @@ Default = "main"
 # [DriverStore]
 # Url = "http://192.168.1.10:5502"
 # PubKey = ""
+# CaFile = "Config/store-ca.pem"   # 组件源为 https 自签/内网 CA 时指定根证书（PEM 文件路径）
 
 # 连接定义（表形态；也支持简写：Connections.main = "Data Source=Data/main.db;Provider=SQLite"）
 # 注：Windows 绝对路径请用**单引号**字符串（如 'Data Source=C:\App\Data\x.db;Provider=SQLite'）
@@ -75,6 +76,8 @@ pub struct DriverStore {
     pub url: String,
     /// Ed25519 公钥（hex；非空强制验签）
     pub pub_key: String,
+    /// 组件源 https 根证书（PEM 文件路径；自签/内网 CA 场景；空 = WebPki 内置根）
+    pub ca_file: String,
 }
 
 /// 连接条目：字符串简写或表形态。
@@ -378,10 +381,25 @@ impl Databases {
                  请在 {FILE_NAME} 增加 [DriverStore]（Url/PubKey）"
             ));
         };
+        let ca_pem = if spec.ca_file.trim().is_empty() {
+            None
+        } else {
+            let p = Path::new(spec.ca_file.trim());
+            let path = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.base.join(p)
+            };
+            Some(
+                std::fs::read(&path)
+                    .map_err(|e| format!("读取组件源根证书失败（{}）：{e}", path.display()))?,
+            )
+        };
         let manager = DriverManager::new(DriverManagerConfig {
             store_url: spec.url.clone(),
             pubkey: spec.pub_key.clone(),
             cache_dir: Some(self.base.join("Data").join("Drivers")),
+            ca_pem,
             ..Default::default()
         })
         .map_err(|e| format!("驱动组件源配置无效：{e}"))?;
