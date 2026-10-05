@@ -25,6 +25,8 @@
 //!   [`DriverManager::ensure`] 则本地缓存优先（离线可用），仅本地无驱动时才联网。
 //! - [`DriverManager`] 析构时停止全部宿主进程；长驻应用可配置 `idle_timeout` 并用
 //!   [`DriverManager::reap_idle`] 按空闲阈值回收。
+//! - 拉起时附加 `--watch-stdin` 并保持 stdin 打开：调用方进程消失（stdin EOF）时
+//!   dbserver 自退，防止强杀场景下的孤儿进程；旧版 dbserver 忽略该参数（向后兼容）。
 //! - https 组件源需同时启用 `http-tls` 特性。
 //!
 //! 用法：
@@ -178,6 +180,8 @@ struct RunningHost {
     addr: String,
     connection: String,
     child: Child,
+    /// 保持打开：调用方退出 → EOF → 宿主（`--watch-stdin`）自退（防孤儿）
+    _stdin: Option<std::process::ChildStdin>,
     last_used: Instant,
 }
 
@@ -509,7 +513,8 @@ impl DriverManager {
         cmd.arg(conn)
             .arg("0")
             .arg(&token)
-            .stdin(Stdio::null())
+            .arg("--watch-stdin")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(windows)]
@@ -520,6 +525,7 @@ impl DriverManager {
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::Db(format!("拉起驱动宿主失败（{}）：{e}", exe.display())))?;
+        let child_stdin = child.stdin.take(); // 保持打开：调用方退出 → EOF → 宿主自退
         let stdout = child.stdout.take().expect("stdout 已管道化");
         let stderr = child.stderr.take().expect("stderr 已管道化");
         let stderr_tail = Arc::new(Mutex::new(String::new()));
@@ -570,6 +576,7 @@ impl DriverManager {
                 addr,
                 connection: connection.clone(),
                 child,
+                _stdin: child_stdin,
                 last_used: Instant::now(),
             },
         );
@@ -613,6 +620,32 @@ fn component_id_for(kind: DatabaseKind) -> Option<String> {
         other => other.name().to_ascii_lowercase(),
     };
     Some(format!("dbserver-{slug}"))
+}
+
+/// 连接串的驱动包需求分类（供消费方判断是否需要 [`DriverManager`]）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriverPackNeed {
+    /// 可直接打开：内嵌驱动（SQLite/DuckDB）或已是 network 连接串。
+    Direct,
+    /// 需要驱动包；值为组件 id（如 `dbserver-mysql`）。
+    Component(String),
+}
+
+/// 判断连接串是否需要驱动包（纯本地判断，不访问网络）。
+pub fn driver_pack_need(conn_str: &str) -> Result<DriverPackNeed> {
+    let cs = ConnectionString::parse(conn_str.trim());
+    let provider = cs.provider().map(str::trim).unwrap_or_default();
+    if provider.is_empty() {
+        return Err(Error::Argument("连接串缺少 provider 字段".to_string()));
+    }
+    if matches!(provider.to_ascii_lowercase().as_str(), "network" | "net") {
+        return Ok(DriverPackNeed::Direct);
+    }
+    let kind = DatabaseKind::from_provider(provider)?;
+    Ok(match component_id_for(kind) {
+        None => DriverPackNeed::Direct,
+        Some(id) => DriverPackNeed::Component(id),
+    })
 }
 
 /// 版本号比较（段拆分：数字段按数值、非数字段按字典序；
@@ -924,6 +957,35 @@ mod tests {
         assert_eq!(parse_ready_line("hello"), None);
         assert_eq!(parse_ready_line(r#"{"event":"other","addr":"x"}"#), None);
         assert_eq!(parse_ready_line(r#"{"event":"ready"}"#), None);
+    }
+
+    #[test]
+    fn driver_pack_need_classification() {
+        // 内嵌驱动 / network：直接打开
+        assert_eq!(
+            driver_pack_need("Data Source=x.db;Provider=SQLite").unwrap(),
+            DriverPackNeed::Direct
+        );
+        assert_eq!(
+            driver_pack_need("Server=http://127.0.0.1:1;Password=t;provider=network").unwrap(),
+            DriverPackNeed::Direct
+        );
+        // 需要驱动包（含别名与 ODBC 桥）
+        assert_eq!(
+            driver_pack_need("Server=x;Provider=MySql").unwrap(),
+            DriverPackNeed::Component("dbserver-mysql".to_string())
+        );
+        assert_eq!(
+            driver_pack_need("Server=x;Provider=postgres").unwrap(),
+            DriverPackNeed::Component("dbserver-postgresql".to_string())
+        );
+        assert_eq!(
+            driver_pack_need("Server=x;Provider=dm").unwrap(),
+            DriverPackNeed::Component("dbserver-odbc".to_string())
+        );
+        // 无效输入
+        assert!(driver_pack_need("Server=x").is_err());
+        assert!(driver_pack_need("Server=x;Provider=NoSuch").is_err());
     }
 
     #[test]

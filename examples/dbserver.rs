@@ -20,6 +20,7 @@
 //! cargo run --release --example dbserver -- "Server=db;Database=x;Provider=MySql" 0 tk123
 //! # 就绪后额外输出单行 JSON（驱动宿主解析用）：
 //! # {"event":"ready","addr":"127.0.0.1:3305","kind":"MySql","protocol":1}
+//! # 驱动宿主（`pek_rcode::driver_pack`）会附加 --watch-stdin：调用方退出（stdin EOF）时自动退出
 //! # 按驱动裁剪的驱动包构建：见 scripts/pack-drivers.ps1
 //! ```
 //!
@@ -43,7 +44,7 @@ use pek_rcode::dal::Dal;
 use pek_rcode::db_service::DbService;
 
 fn main() {
-    // 参数：<连接串> [端口=3305] [令牌] [--host 127.0.0.1]
+    // 参数：<连接串> [端口=3305] [令牌] [--host 127.0.0.1] [--watch-stdin]
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut host = "127.0.0.1".to_string();
     if let Some(i) = args.iter().position(|a| a == "--host") {
@@ -56,15 +57,41 @@ fn main() {
         host = args[i]["--host=".len()..].to_string();
         args.remove(i);
     }
+    let watch_stdin = if let Some(i) = args.iter().position(|a| a == "--watch-stdin") {
+        args.remove(i);
+        true
+    } else {
+        false
+    };
     let conn = args.first().cloned().unwrap_or_default();
     if conn.is_empty() {
-        eprintln!("用法：dbserver <连接串> [端口=3305] [令牌] [--host 127.0.0.1]");
+        eprintln!("用法：dbserver <连接串> [端口=3305] [令牌] [--host 127.0.0.1] [--watch-stdin]");
         eprintln!("示例：dbserver \"Data Source=demo.db;Provider=SQLite\" 3305 tk123");
-        eprintln!("说明：端口 0 = 自动分配；--host 默认 127.0.0.1（仅本机）。");
+        eprintln!("说明：端口 0 = 自动分配；--host 默认 127.0.0.1（仅本机）；");
+        eprintln!("      --watch-stdin：调用方 stdin 关闭（EOF）时自动退出（驱动宿主防孤儿）。");
         std::process::exit(2);
     }
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3305);
     let token = args.get(2).cloned().unwrap_or_default();
+
+    if watch_stdin {
+        // 父进程（驱动宿主调用方，如 `pek_rcode::driver_pack` 的 DriverManager）退出后
+        // stdin 读到 EOF → 自动退出，防止强杀场景下的孤儿进程。手动运行时不会触发。
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let stdin = std::io::stdin();
+            let mut lock = stdin.lock();
+            let mut buf = [0u8; 256];
+            loop {
+                match lock.read(&mut buf) {
+                    Ok(0) => break,    // EOF：调用方已退出
+                    Ok(_) => continue, // 忽略输入内容
+                    Err(_) => break,
+                }
+            }
+            std::process::exit(0);
+        });
+    }
 
     let dal = Arc::new(Dal::open(&conn).expect("连接串无效"));
 
