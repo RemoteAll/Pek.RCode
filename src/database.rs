@@ -215,6 +215,7 @@ pub fn resolve_connection(base: &Path, conn: &str) -> Result<String, String> {
         return Ok(c.to_string());
     }
     let mut parts: Vec<String> = Vec::new();
+    let mut has_source = false;
     for seg in c.split(';') {
         let seg = seg.trim();
         if seg.is_empty() {
@@ -234,14 +235,32 @@ pub fn resolve_connection(base: &Path, conn: &str) -> Result<String, String> {
                     .map_err(|e| format!("创建数据目录失败：{e}"))?;
             }
             parts.push(format!("Data Source={}", abs.display()));
+            has_source = true;
         } else {
             parts.push(seg.to_string());
         }
     }
-    if parts.is_empty() {
-        return Err("连接串无效".to_string());
+    if !has_source {
+        return Err("SQLite 连接串缺少 Data Source".to_string());
     }
     Ok(parts.join(";"))
+}
+
+/// 连接串的 SQLite 数据文件路径（`Data Source`；相对路径按 `base` 解析）。
+///
+/// 非 SQLite 或缺少 `Data Source` 时返回 `None`（面板/管理功能展示库文件用）。
+pub fn sqlite_file_of(base: &Path, conn: &str) -> Option<PathBuf> {
+    let cs = ConnectionString::parse(conn);
+    if !cs.provider()?.eq_ignore_ascii_case("sqlite") {
+        return None;
+    }
+    let ds = cs.data_source()?;
+    let path = Path::new(ds);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    })
 }
 
 /// 多数据源容器：按 `Config/Database.toml` 惰性打开并复用各连接。
@@ -538,6 +557,13 @@ ConnectionString = "Data Source=Data/b.db;Provider=SQLite"
             "Server=x;Provider=MySql"
         );
         assert!(resolve_connection(&dir, "  ").is_err());
+        // SQLite 缺 Data Source：明确报错
+        let err = resolve_connection(&dir, "Provider=SQLite").unwrap_err();
+        assert!(err.contains("Data Source"), "{err}");
+        // SQLite 数据文件路径推导
+        let p = sqlite_file_of(&dir, "Data Source=Data/x.db;Provider=SQLite").unwrap();
+        assert_eq!(p, dir.join("Data").join("x.db"));
+        assert!(sqlite_file_of(&dir, "Server=x;Provider=MySql").is_none());
     }
 
     #[test]
