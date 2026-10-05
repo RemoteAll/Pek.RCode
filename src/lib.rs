@@ -90,6 +90,9 @@ pub mod codegen;
 pub mod common;
 pub mod dal;
 pub mod data_access;
+#[cfg(feature = "database")]
+pub mod database;
+pub mod db_admin;
 pub mod db_service;
 pub mod dbtable;
 pub mod dialect;

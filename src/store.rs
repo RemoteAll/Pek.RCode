@@ -54,8 +54,8 @@ impl SharedStore {
     }
 }
 
-/// 注册表：数据目录 → 共享存储。
-static REGISTRY: Mutex<BTreeMap<PathBuf, Arc<SharedStore>>> = Mutex::new(BTreeMap::new());
+/// 注册表：（数据目录 + 作用域名）→ 共享存储（同一目录可承载多个逻辑库，如多数据源连接的多个文件）。
+static REGISTRY: Mutex<BTreeMap<(PathBuf, String), Arc<SharedStore>>> = Mutex::new(BTreeMap::new());
 /// 默认拦截器装配（每进程一次；TimeInterceptor 等由本模块统一保证）。
 static INTERCEPTORS: Once = Once::new();
 
@@ -72,7 +72,20 @@ pub fn get_or_open<F>(base: &Path, open: F) -> Result<(Arc<SharedStore>, bool), 
 where
     F: FnOnce() -> Result<Dal, String>,
 {
-    let key = key_of(base);
+    get_or_open_scoped(base, "", open)
+}
+
+/// 取或“单飞”打开共享存储（带作用域名）：同一数据目录可注册多个逻辑库
+/// （如 `Config/Database.toml` 多数据源的多个连接）；其余语义同 [`get_or_open`]。
+pub fn get_or_open_scoped<F>(
+    base: &Path,
+    scope: &str,
+    open: F,
+) -> Result<(Arc<SharedStore>, bool), String>
+where
+    F: FnOnce() -> Result<Dal, String>,
+{
+    let key = (key_of(base), scope.to_string());
     let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = registry.get(&key) {
         return Ok((existing.clone(), false));
@@ -80,7 +93,7 @@ where
     INTERCEPTORS.call_once(crate::interceptor::enable_defaults);
     let dal = open()?;
     let store = Arc::new(SharedStore {
-        base: key.clone(),
+        base: key.0.clone(),
         dal,
         lock: Mutex::new(()),
     });
@@ -90,19 +103,29 @@ where
 
 /// 查找已注册的共享存储（未注册返回 `None`，不触发打开）。
 pub fn lookup(base: &Path) -> Option<Arc<SharedStore>> {
+    lookup_scoped(base, "")
+}
+
+/// 查找已注册的共享存储（带作用域名；未注册返回 `None`，不触发打开）。
+pub fn lookup_scoped(base: &Path, scope: &str) -> Option<Arc<SharedStore>> {
     REGISTRY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&key_of(base))
+        .get(&(key_of(base), scope.to_string()))
         .cloned()
 }
 
 /// 移除注册（测试用：Windows 下不释放连接无法删除临时目录；生产代码勿用）。
 pub fn drop_for_test(base: &Path) {
+    drop_for_test_scoped(base, "")
+}
+
+/// 移除注册（带作用域名；测试用）。
+pub fn drop_for_test_scoped(base: &Path, scope: &str) {
     REGISTRY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(&key_of(base));
+        .remove(&(key_of(base), scope.to_string()));
 }
 
 #[cfg(test)]
@@ -206,6 +229,36 @@ mod tests {
         // 失败不注册：再次调用仍会执行 open
         let (_, created) = get_or_open(&dir, || open_dal(&dir)).unwrap();
         assert!(created);
+        drop_for_test(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scoped_stores_are_independent() {
+        let dir = temp_dir("scoped");
+        fn open_at(dir: &Path, name: &str) -> Result<Dal, String> {
+            Dal::open(&format!(
+                "Data Source={};Provider=SQLite",
+                dir.join(name).display()
+            ))
+            .map_err(|e| e.to_string())
+        }
+        let (a, ca) = get_or_open_scoped(&dir, "a", || open_at(&dir, "a.db")).unwrap();
+        let (b, cb) = get_or_open_scoped(&dir, "b", || open_at(&dir, "b.db")).unwrap();
+        assert!(ca && cb, "两个作用域应各自新开");
+        assert!(!Arc::ptr_eq(&a, &b));
+        // 复用：再次按同名取不重复打开
+        let (a2, ca2) = get_or_open_scoped(&dir, "a", || panic!("不应再次打开")).unwrap();
+        assert!(!ca2);
+        assert!(Arc::ptr_eq(&a, &a2));
+        assert!(lookup_scoped(&dir, "a").is_some());
+        assert!(lookup_scoped(&dir, "none").is_none());
+        // 默认作用域独立于具名作用域
+        let (d, cd) = get_or_open(&dir, || open_at(&dir, "d.db")).unwrap();
+        assert!(cd);
+        assert!(!Arc::ptr_eq(&d, &a));
+        drop_for_test_scoped(&dir, "a");
+        drop_for_test_scoped(&dir, "b");
         drop_for_test(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }

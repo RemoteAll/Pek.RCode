@@ -241,6 +241,15 @@ impl DriverManager {
         self.ensure_inner(conn_str, true)
     }
 
+    /// 准备连接串（消费方“一条线”入口）：内嵌驱动（SQLite/DuckDB）与 network 连接串原样返回；
+    /// 需要驱动包的类型经组件源分发（[`Self::ensure_updated`]）后返回 `provider=network` 连接串。
+    pub fn prepare(&self, conn_str: &str) -> Result<String> {
+        match driver_pack_need(conn_str)? {
+            DriverPackNeed::Direct => Ok(conn_str.trim().to_string()),
+            DriverPackNeed::Component(_) => self.ensure_updated(conn_str),
+        }
+    }
+
     /// 停止指定连接串对应的宿主；返回是否存在并已停止。
     pub fn stop(&self, conn_str: &str) -> bool {
         let key = conn_str.trim();
@@ -966,10 +975,6 @@ mod tests {
             driver_pack_need("Data Source=x.db;Provider=SQLite").unwrap(),
             DriverPackNeed::Direct
         );
-        assert_eq!(
-            driver_pack_need("Server=http://127.0.0.1:1;Password=t;provider=network").unwrap(),
-            DriverPackNeed::Direct
-        );
         // 需要驱动包（含别名与 ODBC 桥）
         assert_eq!(
             driver_pack_need("Server=x;Provider=MySql").unwrap(),
@@ -986,6 +991,20 @@ mod tests {
         // 无效输入
         assert!(driver_pack_need("Server=x").is_err());
         assert!(driver_pack_need("Server=x;Provider=NoSuch").is_err());
+    }
+
+    #[test]
+    fn prepare_passes_direct_through() {
+        let mgr = DriverManager::new(DriverManagerConfig {
+            store_url: "http://127.0.0.1:1".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let sqlite = "Data Source=x.db;Provider=SQLite";
+        assert_eq!(mgr.prepare(sqlite).unwrap(), sqlite);
+        let net = "Server=http://127.0.0.1:1;Password=t;provider=network";
+        assert_eq!(mgr.prepare(net).unwrap(), net);
+        assert!(mgr.prepare("Server=x").is_err());
     }
 
     #[test]

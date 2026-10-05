@@ -45,6 +45,8 @@ mongodb = { version = "3.9.1", optional = true }
 # 数据备份：GZip 压缩（`.gz`）与多表 zip 包（与 C# DbPackage 文件格式互通）
 flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# 数据库约定文件（Database.toml）反序列化（随 driver-pack 启用）
+serde = { version = "1", features = ["derive"], optional = true }
 serde_json = "1"
 # HTTP 类驱动（ClickHouse/TDengine/InfluxDB）与 network/db_service 共用传输层
 # 默认不含 TLS：https 场景由可选特性 `http-tls` 启用（ureq/rustls）；局域网明文 HTTP 无需 TLS，
@@ -119,8 +121,11 @@ tls-rustls = [
 # HTTP 传输层 TLS（ureq/rustls）：ClickHouse/TDengine/InfluxDB 与 db_service 的 https 需要
 http-tls = ["ureq/rustls"]
 # 驱动包按需分发（DriverManager）：从 Pek.RPanlServer 组件源下载 dbserver 驱动包并按需拉起
-# （Ed25519 验签经 dhrust/plugin；https 组件源需同时启用 http-tls）
-driver-pack = ["dhrust/plugin"]
+# （Ed25519 验签经 dhrust/plugin；Database.toml 约定文件经 dhrust/toml；https 组件源需同时启用 http-tls）
+# 数据库连接约定文件（Config/Database.toml）：解析 + 多数据源容器 + SQLite 相对路径解析
+database = ["dhrust/toml", "dep:serde"]
+# 驱动按需分发（组件/network）：在约定文件基础上增加 [DriverStore] 自动下载分发
+driver-pack = ["database", "dhrust/plugin"]
 # Redis 集成（Pek.RRedis）：分布式缓存版本号跨进程失效
 redis = ["dep:pek-rredis"]
 
