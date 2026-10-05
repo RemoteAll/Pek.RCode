@@ -26,7 +26,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "driver-pack")]
+use std::sync::Mutex;
 
 use serde::Deserialize;
 

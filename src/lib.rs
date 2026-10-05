@@ -118,6 +118,7 @@ pub mod migration;
 pub mod model;
 #[cfg(feature = "driver-mongodb")]
 pub mod mongodb;
+pub mod panel;
 #[cfg(feature = "driver-sqlserver")]
 pub mod mssql;
 #[cfg(feature = "driver-mysql")]
