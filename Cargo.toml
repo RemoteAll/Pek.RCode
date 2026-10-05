@@ -118,6 +118,9 @@ tls-rustls = [
 ]
 # HTTP 传输层 TLS（ureq/rustls）：ClickHouse/TDengine/InfluxDB 与 db_service 的 https 需要
 http-tls = ["ureq/rustls"]
+# 驱动包按需分发（DriverManager）：从 Pek.RPanlServer 组件源下载 dbserver 驱动包并按需拉起
+# （Ed25519 验签经 dhrust/plugin；https 组件源需同时启用 http-tls）
+driver-pack = ["dhrust/plugin"]
 # Redis 集成（Pek.RRedis）：分布式缓存版本号跨进程失效
 redis = ["dep:pek-rredis"]
 
@@ -129,3 +132,8 @@ members = ["derive"]
 pek-rcode-derive = { path = "derive" }
 # TLS 测试：生成自签 PEM 客户端证书（tls-rustls 用例）
 rcgen = "0.13"
+
+[[example]]
+# 驱动包按需分发演示（下载 → 验签 → 拉起 → network 连接）
+name = "driver_fetch"
+required-features = ["driver-pack"]

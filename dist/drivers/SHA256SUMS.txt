@@ -1,0 +1,2 @@
+455c32cd5cee87cd999cc57f903c93d77bafbfcff632e167131f6f254fe892d4  dbserver-mysql-0.1.0-win-x64.zip
+e86422128d3ef56e3bf460ddcec0d1833a01a20e30f76f52531fc3c793af9861  dbserver-postgresql-0.1.0-win-x64.zip

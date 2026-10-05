@@ -94,6 +94,8 @@ pub mod db_service;
 pub mod dbtable;
 pub mod dialect;
 pub mod dirty;
+#[cfg(feature = "driver-pack")]
+pub mod driver_pack;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod entity;
@@ -136,6 +138,7 @@ pub mod sqlbuild;
 pub mod sqlite;
 pub mod sql_template;
 pub mod statistics;
+pub mod store;
 #[cfg(feature = "driver-tdengine")]
 pub mod tdengine;
 pub mod transaction;

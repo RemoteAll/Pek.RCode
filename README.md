@@ -123,6 +123,7 @@ cd G:\Code\Pek.Rust\Pek.RCode
 cargo test          # 默认测试（含 SQLite + 固件回归 + 对象实体端到端；默认全驱动 + tls-native）
 cargo test --features duckdb   # 额外交付 DuckDB 内嵌引擎的完整用例
 cargo test --features redis    # 分布式缓存版本号（基于 Pek.RRedis；RCODE_REDIS 指向真实 Redis 时实机验证）
+cargo test --features driver-pack   # 驱动包按需分发（DriverManager；含假组件源端到端用例）
 cargo test --no-default-features --features "tls-rustls,all-drivers"   # rustls TLS 后端（PEM 客户端证书）
 # 轻量消费方（如 tcp-scanner-server 仅用 SQLite+MySQL）：按驱动裁剪，构建更小更快
 cargo check --no-default-features --features "driver-mysql,tls-native"
@@ -436,6 +437,7 @@ Pek.RCode/
 │   ├── entity.rs     Entity trait（对象实体的 CRUD/查询默认实现）
 │   ├── db_service.rs 远程服务层 + HTTP 客户端（DbServer/DbClient，DbTable v3 二进制互通）
 │   ├── network.rs    provider=network 驱动（转发 SQL、登录探明远端类型、远端表结构探测）
+│   ├── driver_pack.rs 驱动包按需分发（DriverManager：下载/验签/拉起 dbserver，`--features driver-pack`）
 │   ├── backup.rs     数据备份/恢复/同步（DbPackage 文件格式，与 C# 互认）
 │   ├── meta.rs       在线库管理（建/删/存库，表/列/索引/注释 DDL）
 │   ├── navigation.rs 导航属性注册表与装载（HasOne/HasMany）
@@ -444,7 +446,8 @@ Pek.RCode/
 │   │   └── rcodegen.rs   实体生成命令行工具
 │   └── error.rs      统一错误
 ├── examples/
-│   └── dbserver.rs   参考服务端宿主（DbService → 极简 HTTP，对齐 C# DbServer）
+│   ├── dbserver.rs   参考服务端宿主（DbService → 极简 HTTP，对齐 C# DbServer）
+│   └── driver_fetch.rs 驱动包按需分发演示（下载 → 验签 → 拉起 → network 连接）
 └── tests/
     ├── fixtures/wms_model_sample.xml   生产模型快照固件（7 张表 / 8 种类型）
     ├── fixtures/dbtable_v3_sample.bin  DbTable v3 二进制黄金样本（真实 C# NewLife.Core 生成）
@@ -476,6 +479,7 @@ Pek.RCode/
 12. **`DAL_Backup`（备份/恢复/同步）** ✅ `backup` 模块：单表备份到 DbTable v3 文件（`.gz` 自动 GZip）、多表 zip 包（`{连接名}.xml` 模型 + `{实体名}.table`）、`restore`/`restore_all`（表名可从包内推导、`set_schema` 自动建表）、跨库 `sync_table`/`sync_all`；表头列名为实体属性名、行数上限 i32、NULL 折叠为类型默认值，均与 C# 一致；**C#↔Rust 双向实测互认**（C# `DbPackage` 导出 → Rust 恢复、Rust 备份 → C# 恢复，逐值核对一致，`RCODE_BACKUP_IMPORT`/`RCODE_BACKUP_EXPORT` 门控用例）
 13. **`DbMetaData` 在线库管理** ✅ `meta` 模块：建库/删库/存在性（文件库=文件操作；SQL 库按方言语句与元数据查询，逐一对齐各驱动覆写）、建表/删表（Firebird 连带序列）、列增/改/删、索引建/删、表列注释（`Comment On`/`Alter .. Comment`/`sp_addextendedproperty`）；无能力库返回 `false`（对齐 C# 空语句）
 14. **导航属性与行访问器** ✅ `navigation` 模块：`NavigationRegistry`（HasOne/HasMany，本地或进程级）+ `load_one`/`load_many` + `Entity::load`/`from_rows`（行集→实体，对应 `DataRowEntityAccessor.LoadData`）；C# 的 LINQ `Include`/反射注值在 Rust 无对应机制，以“注册表 + 显式装载”为对等能力面
+15. **驱动包按需分发（DriverManager）** ✅ `driver_pack` 模块（feature `driver-pack`）：应用按 `driver-*` 特性裁剪后，运行时从 **Pek.RPanlServer 组件源**（管理员「下载管理」；`/components/catalog.json` 同址 `.sig` 为 Ed25519 签名，与插件源同一把平台密钥）按需下载 `dbserver` 驱动包（SHA-256 强制校验）→ 解压本地缓存（`{cache}/{组件}/{版本}/`，临时目录 + 原子改名）→ 回环拉起宿主（端口 0 自动分配 + 一次性令牌）→ 解析就绪行 → 返回 `provider=network` 连接串；相同连接串复用宿主、`ensure_updated` 联网检查新版本、组件源不可用时回退本地缓存、`reap_idle` 空闲回收、析构自动停止全部宿主；驱动包由 `scripts/pack-drivers.ps1` 按驱动裁剪构建（实测 MySQL 2.4MB / PostgreSQL 2.2MB zip）；`examples/driver_fetch` 演示全流程（本机实测：平台下载 → 验签 → 拉起 → network 登录探明类型 → 回收，组件源不可达时离线降级正常）
 
 **完整性审计缺口已全部落地（2026-09-27）**：
 

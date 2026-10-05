@@ -14,8 +14,13 @@
 //! 运行：
 //!
 //! ```powershell
-//! # 服务端（一个进程服务一个数据库连接串）
+//! # 服务端（一个进程服务一个数据库连接串；默认仅回环绑定，供本机驱动宿主拉起）
 //! cargo run --release --example dbserver -- "Data Source=demo.db;Provider=SQLite" 3305 tk123
+//! # 端口 0 = 自动分配；--host 0.0.0.0 = 对外提供服务（默认 127.0.0.1）
+//! cargo run --release --example dbserver -- "Server=db;Database=x;Provider=MySql" 0 tk123
+//! # 就绪后额外输出单行 JSON（驱动宿主解析用）：
+//! # {"event":"ready","addr":"127.0.0.1:3305","kind":"MySql","protocol":1}
+//! # 按驱动裁剪的驱动包构建：见 scripts/pack-drivers.ps1
 //! ```
 //!
 //! 客户端连接串（C# 或 Rust 均可用）：
@@ -38,11 +43,24 @@ use pek_rcode::dal::Dal;
 use pek_rcode::db_service::DbService;
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // 参数：<连接串> [端口=3305] [令牌] [--host 127.0.0.1]
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut host = "127.0.0.1".to_string();
+    if let Some(i) = args.iter().position(|a| a == "--host") {
+        if i + 1 < args.len() {
+            host = args.remove(i + 1);
+        }
+        args.remove(i);
+    }
+    if let Some(i) = args.iter().position(|a| a.starts_with("--host=")) {
+        host = args[i]["--host=".len()..].to_string();
+        args.remove(i);
+    }
     let conn = args.first().cloned().unwrap_or_default();
     if conn.is_empty() {
-        eprintln!("用法：dbserver <连接串> [端口=3305] [令牌]");
+        eprintln!("用法：dbserver <连接串> [端口=3305] [令牌] [--host 127.0.0.1]");
         eprintln!("示例：dbserver \"Data Source=demo.db;Provider=SQLite\" 3305 tk123");
+        eprintln!("说明：端口 0 = 自动分配；--host 默认 127.0.0.1（仅本机）。");
         std::process::exit(2);
     }
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3305);
@@ -57,12 +75,15 @@ fn main() {
     }
     let service = Arc::new(service);
 
-    let listener = TcpListener::bind(("0.0.0.0", port)).expect("端口占用或权限不足");
+    let listener = TcpListener::bind((host.as_str(), port)).expect("端口占用或权限不足");
+    let local = listener.local_addr().expect("读取监听地址失败");
+    let kind = dal.kind().name().to_string();
     println!(
-        "DbServer 已启动：http://0.0.0.0:{port}（数据库类型 {:?}，令牌 {}）",
-        dal.kind(),
+        "DbServer 已启动：http://{local}（数据库类型 {kind}，令牌 {}）",
         if token.is_empty() { "<未设置>" } else { "<已设置>" }
     );
+    // 就绪行（驱动宿主解析用；稳定单行 JSON 协议 v1）
+    println!("{{\"event\":\"ready\",\"addr\":\"{local}\",\"kind\":\"{kind}\",\"protocol\":1}}");
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
