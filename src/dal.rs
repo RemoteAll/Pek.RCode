@@ -503,7 +503,24 @@ impl Dal {
     /// - `Full`：在 `On` 基础上允许修改列类型与删除多余列/索引（**删除类动作仅此档允许**）
     ///
     /// 表级档位（`<Table Migration="...">`）只能收紧、不能放大：生效档 = `min(表级, 全局)`。
+    ///
+    /// **network 连接默认不建表/改表**（对齐 C# `NetworkMetaData.OnSetTables` 空实现）；
+    /// 由驱动组件分发的**自有远端库**（本机 dbserver 驱动宿主）请用
+    /// [`Dal::sync_schema_including_network`] 显式启用。
     pub fn sync_schema(&self) -> Result<SchemaReport> {
+        self.sync_schema_inner(false)
+    }
+
+    /// 同 [`Dal::sync_schema`]，但**对 network 连接也执行**结构同步（建表 / 补列 / 补索引）。
+    ///
+    /// 适用场景：`provider=network`（驱动组件自举的 dbserver 宿主）接入**全新空库**时
+    /// 自动建表，对齐原生连接的 `SyncSchema` 行为；远端为共享/他人维护的数据库时请勿使用。
+    pub fn sync_schema_including_network(&self) -> Result<SchemaReport> {
+        self.sync_schema_inner(true)
+    }
+
+    /// 结构同步实现：`include_network = false` 时保持 C# 对齐的网络空实现。
+    fn sync_schema_inner(&self, include_network: bool) -> Result<SchemaReport> {
         let model = self
             .model
             .as_ref()
@@ -519,8 +536,9 @@ impl Dal {
             return Ok(report);
         }
 
-        // 网络库不在本端建表/改表（对齐 C# `NetworkMetaData.OnSetTables` 空实现：远端结构由远端维护）
-        if crate::network::is_network(&self.conn_str) {
+        // 网络库默认不在本端建表/改表（对齐 C# `NetworkMetaData.OnSetTables` 空实现：远端结构由远端维护）；
+        // 自有远端库（dbserver 驱动宿主 + 空库初始化）经 sync_schema_including_network 显式放行
+        if !include_network && crate::network::is_network(&self.conn_str) {
             return Ok(report);
         }
 

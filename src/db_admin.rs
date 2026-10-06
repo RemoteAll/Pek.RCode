@@ -322,17 +322,17 @@ impl DbAdmin {
         let expected = present.len();
         let outcome = (|| -> Result<(Vec<String>, Json), String> {
             let _guard = self.store.lock();
-            let mut session = self
-                .store
-                .dal()
-                .open_session()
-                .map_err(|e| e.to_string())?;
+            let dal = self.store.dal();
+            let mut session = dal.open_session().map_err(|e| e.to_string())?;
             for entity in &present {
                 let physical = self.physical_name(entity).ok_or_else(|| {
                     format!("未知实体：{entity}（不在模型内）")
                 })?;
+                // 标识符按目标方言引用：SQLite `"x"`、MySQL `` `x` ``、SqlServer `[x]`。
+                // 硬编码双引号在 MySQL 下会被当作字符串字面量，导致语法错误。
+                let quoted = dal.kind().quote(&physical);
                 session
-                    .execute(&format!("DELETE FROM \"{physical}\""), &[])
+                    .execute(&format!("DELETE FROM {quoted}"), &[])
                     .map_err(|e| format!("清空 {physical} 失败：{e}"))?;
             }
             drop(session);

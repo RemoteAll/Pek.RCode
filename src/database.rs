@@ -22,6 +22,9 @@
 //! - [`Databases`]：多数据源容器——按连接名**惰性打开并复用**（单飞 + 串行锁经 [`crate::store`]），
 //!   需要驱动包的连接自动经 [`DriverManager`] 分发（驱动缓存 `{base}/Data/Drivers`），
 //!   可用 `model` 提供时按模型打开并增量同步表结构；
+//! - 自动化能力（对齐 DH.NCode `Entity<T>.InitData`——"初始化数据，执行反向工程检查，建库建表"）：
+//!   [`Databases::with_remote_schema_sync`]（network/驱动宿主连接也按模型建表）与
+//!   [`Databases::with_init_data`]（连接首次打开后初始化数据）；
 //! - 面向面板/管理功能：`names` / `default_name` / `connection_label`（摘要展示，避免泄露口令）。
 
 use std::collections::BTreeMap;
@@ -273,6 +276,12 @@ pub struct Databases {
     file: DatabaseFile,
     /// `Some` = 按模型打开并增量同步表结构（与各项目现有行为一致）。
     model: Option<EntityModel>,
+    /// 对 network 连接也执行建表结构同步（默认 false，对齐 C# `NetworkMetaData.OnSetTables` 空实现）。
+    /// 自有远端库（驱动组件分发的 dbserver 宿主）场景经 [`Databases::with_remote_schema_sync`] 启用。
+    remote_schema_sync: bool,
+    /// 连接首次打开成功后执行的**初始化数据**（对齐 DH.NCode `Entity<T>.InitData`；默认无）。
+    /// 见 [`Databases::with_init_data`]。
+    init_data: Option<Arc<dyn Fn(&str, &Dal) -> Result<(), String> + Send + Sync>>,
     /// 驱动分发管理器（需要时按 `[DriverStore]` 惰性构建；仅 driver-pack）。
     #[cfg(feature = "driver-pack")]
     manager: Mutex<Option<Arc<DriverManager>>>,
@@ -285,9 +294,34 @@ impl Databases {
             base: base.to_path_buf(),
             file,
             model,
+            remote_schema_sync: false,
+            init_data: None,
             #[cfg(feature = "driver-pack")]
             manager: Mutex::new(None),
         }
+    }
+
+    /// 启用 "network 连接结构同步"（builder 链式；默认关闭）。
+    ///
+    /// 开启后，`provider=network` 的**自有远端库**（驱动组件自举的 dbserver 宿主）在首次
+    /// 打开时会像原生连接一样按模型建表（对齐 [`Dal::sync_schema_including_network`]）；
+    /// 未开启时保持 C# 对齐的"网络连接不建表"行为。
+    pub fn with_remote_schema_sync(mut self, yes: bool) -> Self {
+        self.remote_schema_sync = yes;
+        self
+    }
+
+    /// 设置 "首次打开连接时初始化数据"（builder 链式；对齐 DH.NCode `Entity<T>.InitData`）。
+    ///
+    /// 回调在数据源打开成功（含结构同步）后调用，参数为连接名与共享 [`Dal`]；
+    /// **消费方自行判空并保证幂等**（进程重启会再次触发，与 XCode"首次连接时初始化"语义一致）。
+    /// 回调失败视同打开失败：不注册、可重试。
+    pub fn with_init_data<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str, &Dal) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.init_data = Some(Arc::new(f));
+        self
     }
 
     /// 加载约定文件并构建；**文件缺失返回 `None`**。
@@ -345,16 +379,29 @@ impl Databases {
         let raw = resolve_connection(&self.base, entry.connection_string())?;
         let (store, _) = store::get_or_open_scoped(&self.base, name, || {
             let conn = self.prepare_conn(&raw)?;
-            match &self.model {
+            let dal = match &self.model {
                 Some(model) => {
                     let dal = Dal::open_with_model(&conn, model.clone())
                         .map_err(|e| format!("打开数据库失败：{e}"))?;
                     dal.sync_schema()
                         .map_err(|e| format!("同步表结构失败：{e}"))?;
-                    Ok(dal)
+                    // 自有远端库：network 连接默认空实现（对齐 C#），显式启用时补做结构同步
+                    if self.remote_schema_sync
+                        && crate::network::is_network(&ConnectionString::parse(&conn))
+                    {
+                        dal.sync_schema_including_network()
+                            .map_err(|e| format!("同步远端表结构失败：{e}"))?;
+                    }
+                    dal
                 }
-                None => Dal::open(&conn).map_err(|e| format!("打开数据库失败：{e}")),
+                None => Dal::open(&conn).map_err(|e| format!("打开数据库失败：{e}"))?,
+            };
+            // 首次打开时初始化数据（对齐 DH.NCode `Entity<T>.InitData`：首次连接数据库时初始化数据；
+            // 消费方自行判空、保证幂等；失败视同打开失败——不注册、可重试）
+            if let Some(init) = &self.init_data {
+                init(name, &dal).map_err(|e| format!("初始化数据失败：{e}"))?;
             }
+            Ok(dal)
         })?;
         Ok(store)
     }
@@ -586,5 +633,71 @@ ConnectionString = "Server=127.0.0.1;Database=x;Provider=MySql"
         };
         assert!(err.contains("DriverStore"), "{err}");
         assert!(err.contains(FILE_NAME), "{err}");
+    }
+
+    #[test]
+    fn init_data_runs_on_first_open_per_connection() {
+        use std::sync::Mutex;
+        let dir = temp_dir("initdata");
+        write_file(
+            &dir,
+            r#"
+Default = "a"
+[Connections.a]
+ConnectionString = "Data Source=Data/a.db;Provider=SQLite"
+[Connections.b]
+ConnectionString = "Data Source=Data/b.db;Provider=SQLite"
+"#,
+        );
+        std::fs::create_dir_all(dir.join("Data")).unwrap();
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&calls);
+        let dbs = Databases::load(&dir, None)
+            .unwrap()
+            .unwrap()
+            .with_init_data(move |name, _dal| {
+                sink.lock().unwrap().push(name.to_string());
+                Ok(())
+            });
+        dbs.store("a").unwrap();
+        dbs.store("a").unwrap(); // 复用已打开连接：不重复初始化
+        dbs.store("b").unwrap();
+        assert_eq!(calls.lock().unwrap().as_slice(), ["a", "b"]);
+        store::drop_for_test_scoped(&dir, "a");
+        store::drop_for_test_scoped(&dir, "b");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_data_error_fails_open_and_allows_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = temp_dir("initfail");
+        write_file(
+            &dir,
+            "Default = \"main\"\n[Connections.main]\nConnectionString = \"Data Source=Data/m.db;Provider=SQLite\"\n",
+        );
+        std::fs::create_dir_all(dir.join("Data")).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let dbs = Databases::load(&dir, None)
+            .unwrap()
+            .unwrap()
+            .with_init_data(move |_name, _dal| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err("模拟初始化失败".to_string())
+                } else {
+                    Ok(())
+                }
+            });
+        let err = match dbs.store("main") {
+            Ok(_) => panic!("首次应失败"),
+            Err(e) => e,
+        };
+        assert!(err.contains("初始化数据失败"), "{err}");
+        // 未注册：重试时重新打开并再次执行初始化
+        assert!(dbs.store("main").is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        store::drop_for_test_scoped(&dir, "main");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
