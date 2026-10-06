@@ -1,0 +1,71 @@
+name: Tests
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run formatter
+        run: cargo fmt
+      - name: Commit changes
+        run: |
+          if [[ `git status --porcelain` ]]; then
+            git config user.name "github-actions[bot]"
+            # Make formatting commits look lie they'r authored by the official github-actions[bot]
+            # instead of an anonymous user account.
+            # For the id see: https://api.github.com/users/github-actions%5Bbot%5D
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .
+            git commit -m "style: formattig"
+            git push
+          fi
+
+  test:
+    needs: [format]
+    name: ${{ matrix.features || 'dynamic unixodbc' }} on ${{ matrix.target }}
+    runs-on: ${{ contains(matrix.target, 'windows') && 'windows-latest' || contains(matrix.target, 'darwin') && 'macos-latest' || 'ubuntu-latest' }}
+
+    strategy:
+      matrix:
+        target: ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+        features: ["", "iodbc", "vendored-unix-odbc"]
+        include: # windows always links dynamically to the system's driver manager
+          - target: "x86_64-pc-windows-msvc"
+            features: ""
+          - target: "i686-pc-windows-msvc"
+            features: ""
+
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          submodules: "recursive"
+      - if: ${{ contains(matrix.target, 'linux') && matrix.features == '' }}
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
+      - if: ${{ contains(matrix.target, 'linux') && matrix.features == 'iodbc' }}
+        run: sudo apt-get update && sudo apt-get install -y libiodbc2-dev
+      - if: ${{ contains(matrix.target, 'darwin') && matrix.features == '' }}
+        run: brew install unixodbc
+      - if: ${{ contains(matrix.target, 'darwin') && matrix.features == 'iodbc' }}
+        run: brew install libiodbc
+      - run: cargo clippy --all-targets --features "${{ matrix.features }}" -- -D warnings
+      - run: cargo test -p odbc-sys --target "${{ matrix.target }}" --features "${{ matrix.features }}"
+
+  # Verify that the build script does nothing nasty, which would prevent publishing to crates.io
+  test_publish_unix_odbc:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Test publish to crates.io
+        run: cargo publish -p unix-odbc --dry-run

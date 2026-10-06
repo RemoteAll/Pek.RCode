@@ -18,7 +18,7 @@ mysql = { version = "28.0.2", default-features = false, features = ["minimal", "
 native-tls = { version = "0.2.18", optional = true }
 oracle = { version = "0.6.3", features = ["chrono"], optional = true }
 postgres = { version = "0.19.14", features = ["with-chrono-0_4"], optional = true }
-# PostgreSQL：TLS 经 native-tls（postgres-native-tls 提供 MakeTlsConnect 适配）
+# PostgreSQL：TLS 经 native-tls（postgres-native-tls 适配；由 tls-native 特性携带启用）
 postgres-native-tls = { version = "0.5", optional = true }
 # TLS 后端之二：rustls（PEM 根证书/客户端证书；PG 走 tokio-postgres-rustls，MySQL 启用 mysql/rustls）
 rustls = { version = "0.23", optional = true }
@@ -31,7 +31,9 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # Decimal 精确值（对 PostgreSQL 的绑定转换随 driver-postgresql 特性启用）
 rust_decimal = { version = "1.43.0" }
 thiserror = "2.0.21"
-tiberius = { version = "0.13.0", features = ["chrono", "rust_decimal"], optional = true }
+# SQL Server：tiberius 默认特性含 native-tls（+winauth），会拖入 openssl-sys 阻断 musl 交叉；
+# 关默认、保留 TDS8/数值特性，TLS 后端由 tls-native/tls-rustls 弱依赖转发
+tiberius = { version = "0.13.0", default-features = false, features = ["tds80", "chrono", "rust_decimal"], optional = true }
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
 tokio-util = { version = "0.7.19", features = ["compat"], optional = true }
 odbc-api = { version = "29.1.0", optional = true }
@@ -84,12 +86,12 @@ driver-mysql = ["dep:mysql"]
 # SQL Server（tiberius，纯 Rust TDS）
 driver-sqlserver = ["dep:tiberius", "dep:tokio-util"]
 # PostgreSQL 系（含 HighGo/KingBase/VastBase；Decimal 绑定转换一并启用）
-# postgres-native-tls（MakeTlsConnect 适配）随本驱动启用，避免仅用 SQLite/MySQL 的消费方被动拖入整个 tokio-postgres 栈
+# native-tls 适配（postgres-native-tls）不在此声明：由 tls-native 特性携带，
+# 使 driver-postgresql + tls-rustls 组合（musl 交叉打包）不引入 openssl-sys
 driver-postgresql = [
     "dep:postgres",
     "dep:postgres-types",
     "dep:bytes",
-    "dep:postgres-native-tls",
     "rust_decimal/db-tokio-postgres",
 ]
 # Oracle（oracle crate / OCI，运行时需 Instant Client）
@@ -106,10 +108,22 @@ driver-hana = ["dep:hdbconnect"]
 driver-mongodb = ["dep:mongodb", "dep:futures-util"]
 # ODBC 桥（DB2 / 达梦 / IRIS / Access）
 driver-odbc = ["dep:odbc-api"]
+# ODBC 内置 unixODBC 静态库（面向 linux-gnu 交叉构建）：musl 静态二进制的 dlopen 是桩函数
+# （"Dynamic loading not supported"），而 ODBC 驱动管理器运行时必须 dlopen 厂商驱动，
+# 故 odbc 只能构建为 glibc 目标（glibc 动态二进制 + 内置 unixODBC，除厂商驱动外无系统依赖）。
+# 静态库由第三方构建脚本 unix-odbc 产出；odbc-sys 由本仓 [patch.crates-io] 修正主机/目标判断（见文件尾）。
+# windows 目标不需要此特性（非静态链接直接走系统 odbc32）
+odbc-vendored = ["odbc-api?/vendored-unix-odbc"]
 # TLS 后端（两者互斥）：tls-native（缺省，native-tls；客户端证书仅 PKCS#12）
-# 注：`mysql?/` 为弱依赖语法——未启用 driver-mysql 时不会把 MySQL 驱动带回；
-#     PG 侧的 postgres-native-tls 已随 driver-postgresql 启用，此处不再重复声明
-tls-native = ["dep:native-tls", "mysql?/native-tls"]
+# 注：`mysql?/`、`tiberius?/` 为弱依赖语法——未启用对应驱动时不会把驱动带回；
+#     PG 侧的 postgres-native-tls 适配随本特性启用（driver-postgresql 已不再声明，
+#     否则 driver-postgresql + tls-rustls 组合在 musl 交叉时会拉入 openssl-sys）
+tls-native = [
+    "dep:native-tls",
+    "dep:postgres-native-tls",
+    "mysql?/native-tls",
+    "tiberius?/native-tls",
+]
 # TLS 后端：rustls（支持 PEM 客户端证书；配合 --no-default-features 使用）
 tls-rustls = [
     "dep:rustls",
@@ -117,6 +131,7 @@ tls-rustls = [
     "dep:postgres-rustls",
     "dep:webpki-roots",
     "mysql?/rustls",
+    "tiberius?/rustls",
 ]
 # HTTP 传输层 TLS（ureq/rustls）：ClickHouse/TDengine/InfluxDB 与 db_service 的 https 需要
 http-tls = ["ureq/rustls"]
@@ -132,6 +147,13 @@ redis = ["dep:pek-rredis"]
 
 [workspace]
 members = ["derive"]
+
+# odbc-sys 0.31 的 build.rs 用 cfg!(target_os = "windows") 判断的是“主机”而非“目标”——
+# Windows 主机交叉编译到 Linux 目标并启用 static 特性（odbc-vendored → vendored-unix-odbc）时会误 panic。
+# 本地副本（third_party/odbc-sys）已将判断改为 CARGO_CFG_TARGET_OS（目标平台）。
+# 仅在启用 odbc-vendored 的打包构建中生效；odbc-sys/odbc-api 升级后需对照上游 build.rs 重新同步该补丁。
+[patch.crates-io]
+odbc-sys = { path = "third_party/odbc-sys" }
 
 [dev-dependencies]
 # 派生宏（`#[derive(Entity)]`）：与主 crate 分离的 proc-macro 包
