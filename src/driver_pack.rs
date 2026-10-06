@@ -209,14 +209,12 @@ pub struct DriverManager {
 }
 
 impl DriverManager {
-    /// 创建管理器（校验组件源地址与公钥格式）。
+    /// 创建管理器（校验组件源地址与公钥格式；`store_url` 为空 = **仅本地缓存模式**：
+    /// 不联网，消费方可从本机组件库等来源预置缓存后直接使用）。
     pub fn new(cfg: DriverManagerConfig) -> Result<Self> {
         let store = cfg.store_url.trim().trim_end_matches('/');
-        if store.is_empty() {
-            return Err(Error::Argument("驱动管理器：store_url 不能为空".to_string()));
-        }
         let has_pubkey = !cfg.pubkey.trim().is_empty();
-        if !url_allowed(store, has_pubkey) {
+        if !store.is_empty() && !url_allowed(store, has_pubkey) {
             return Err(Error::Argument(format!(
                 "驱动管理器：组件源地址不被允许（需 https；配置公钥后可放行内网 http）：{store}"
             )));
@@ -226,7 +224,11 @@ impl DriverManager {
             dhrust::plugin::parse_pubkey(cfg.pubkey.trim())
                 .map_err(|e| Error::Argument(format!("驱动管理器：公钥无效（{e}）")))?;
         }
-        let catalog_url = catalog_url_of(store);
+        let catalog_url = if store.is_empty() {
+            String::new()
+        } else {
+            catalog_url_of(store)
+        };
         let ca_certs = match cfg.ca_pem.as_deref() {
             Some(pem) => Some(parse_ca_pem(pem).map_err(Error::Argument)?),
             None => None,
@@ -253,7 +255,7 @@ impl DriverManager {
     }
 
     /// 同 [`DriverManager::ensure`]，但**总是联网检查目录**，有更高版本则下载并替换宿主；
-    /// 组件源不可用时回退本地缓存（有缓存则继续，无则报错）。
+    /// 组件源不可用时回退本地缓存（有缓存则继续，无则报错）；未配置组件源时直接用本地缓存。
     pub fn ensure_updated(&self, conn_str: &str) -> Result<String> {
         self.ensure_inner(conn_str, true)
     }
@@ -265,6 +267,25 @@ impl DriverManager {
             DriverPackNeed::Direct => Ok(conn_str.trim().to_string()),
             DriverPackNeed::Component(_) => self.ensure_updated(conn_str),
         }
+    }
+
+    /// 仅准备驱动包（下载/校验/解压到缓存，**不拉起宿主**）：供消费方在切换/重启前预热，
+    /// 使后续启动直接命中缓存。返回 `(组件 id, 版本, 缓存目录)`；内嵌驱动报错。
+    pub fn prepare_package(&self, conn_str: &str) -> Result<(String, String, PathBuf)> {
+        let key = conn_str.trim();
+        if key.is_empty() {
+            return Err(Error::Argument("驱动管理器：连接串为空".to_string()));
+        }
+        let cs = ConnectionString::parse(key);
+        let kind = resolve_provider_kind(&cs)?;
+        let component = component_id_for(kind).ok_or_else(|| {
+            Error::Argument(format!(
+                "驱动管理器：{} 为内嵌驱动（本地直接打开即可），无需下载驱动包",
+                kind.name()
+            ))
+        })?;
+        let (version, dir) = self.resolve_driver(&component, true)?;
+        Ok((component, version, dir))
     }
 
     /// 停止指定连接串对应的宿主；返回是否存在并已停止。
@@ -354,6 +375,16 @@ impl DriverManager {
             && let Some((version, dir)) = local.last()
         {
             return Ok((version.clone(), dir.clone()));
+        }
+        // 未配置组件源：仅本地缓存模式（消费方可预先从本机组件库等来源安装）
+        if self.catalog_url.is_empty() {
+            if let Some((version, dir)) = local.last() {
+                return Ok((version.clone(), dir.clone()));
+            }
+            return Err(Error::Model(format!(
+                "缺少驱动包 {component}：本地缓存为空，且未配置组件源\
+                 （可在 [DriverStore] 填 Url，或由消费方从本机组件库预置到缓存）"
+            )));
         }
         // 联网取目录（update = 总是查；无本地缓存 = 必须查）
         let entries = match self.load_catalog() {
@@ -472,50 +503,9 @@ impl DriverManager {
         Ok(bytes)
     }
 
-    /// 解压驱动包到 `{cache}/{组件}/{版本}/`（临时目录 + 原子改名；并发安全）。
+    /// 解压驱动包到缓存（实现见模块函数 [`extract_package_to_cache`]）。
     fn extract_package(&self, data: &[u8], component: &str, version: &str) -> Result<PathBuf> {
-        let root = self.cache_dir.join(component);
-        std::fs::create_dir_all(&root)?;
-        let final_dir = root.join(version);
-        if final_dir.join(DBSERVER_BIN).is_file() {
-            return Ok(final_dir); // 竞态：另一进程已完成
-        }
-        let tmp = root.join(format!("{version}.tmp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp)?;
-        let cleanup = |e: Error| {
-            let _ = std::fs::remove_dir_all(&tmp);
-            e
-        };
-        extract_zip_bytes(data, &tmp).map_err(cleanup)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                tmp.join(DBSERVER_BIN),
-                std::fs::Permissions::from_mode(0o755),
-            );
-        }
-        if !tmp.join(DBSERVER_BIN).is_file() {
-            return Err(cleanup(Error::Model(format!(
-                "驱动包缺少 {DBSERVER_BIN}（{component} {version}）"
-            ))));
-        }
-        if final_dir.join(DBSERVER_BIN).is_file() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Ok(final_dir);
-        }
-        match std::fs::rename(&tmp, &final_dir) {
-            Ok(()) => Ok(final_dir),
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp);
-                if final_dir.join(DBSERVER_BIN).is_file() {
-                    Ok(final_dir) // 竞态：另一进程已完成
-                } else {
-                    Err(Error::Io(e))
-                }
-            }
-        }
+        extract_package_to_cache(&self.cache_dir, data, component, version)
     }
 
     /// 拉起（或复用）驱动宿主，返回 network 连接串。
@@ -623,6 +613,83 @@ impl Drop for DriverManager {
 // ————— 纯函数（独立可测） —————
 
 /// 解析连接串 provider → 数据库类型（DriverManager 场景的约束检查）。
+/// 从本地 zip 包安装驱动到 `{cache_dir}/{组件}/{版本}/`（供消费方从本机组件库预置；返回安装目录）。
+///
+/// 与组件源下载路径同语义：大小上限、临时目录 + 原子改名、校验包含 `dbserver`、Unix 置 0o755。
+pub fn install_from_zip(
+    cache_dir: &Path,
+    component_id: &str,
+    version: &str,
+    zip_path: &Path,
+) -> Result<PathBuf> {
+    let safe = |s: &str| !s.is_empty() && !s.contains(['/', '\\']) && s != "." && s != "..";
+    if !safe(component_id) || !safe(version) {
+        return Err(Error::Argument(
+            "驱动管理器：组件 id / 版本号不合法".to_string(),
+        ));
+    }
+    let data = std::fs::read(zip_path)?;
+    if data.len() > MAX_PACKAGE_SIZE {
+        return Err(Error::Model(format!(
+            "驱动包超出大小上限（{} > {MAX_PACKAGE_SIZE} 字节）：{}",
+            data.len(),
+            zip_path.display()
+        )));
+    }
+    extract_package_to_cache(cache_dir, &data, component_id, version)
+}
+
+/// 解压驱动包字节到 `{cache}/{组件}/{版本}/`（临时目录 + 原子改名；并发安全）。
+fn extract_package_to_cache(
+    cache_dir: &Path,
+    data: &[u8],
+    component: &str,
+    version: &str,
+) -> Result<PathBuf> {
+    let root = cache_dir.join(component);
+    std::fs::create_dir_all(&root)?;
+    let final_dir = root.join(version);
+    if final_dir.join(DBSERVER_BIN).is_file() {
+        return Ok(final_dir); // 竞态：另一进程已完成
+    }
+    let tmp = root.join(format!("{version}.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    let cleanup = |e: Error| {
+        let _ = std::fs::remove_dir_all(&tmp);
+        e
+    };
+    extract_zip_bytes(data, &tmp).map_err(cleanup)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            tmp.join(DBSERVER_BIN),
+            std::fs::Permissions::from_mode(0o755),
+        );
+    }
+    if !tmp.join(DBSERVER_BIN).is_file() {
+        return Err(cleanup(Error::Model(format!(
+            "驱动包缺少 {DBSERVER_BIN}（{component} {version}）"
+        ))));
+    }
+    if final_dir.join(DBSERVER_BIN).is_file() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Ok(final_dir);
+    }
+    match std::fs::rename(&tmp, &final_dir) {
+        Ok(()) => Ok(final_dir),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            if final_dir.join(DBSERVER_BIN).is_file() {
+                Ok(final_dir) // 竞态：另一进程已完成
+            } else {
+                Err(Error::Io(e))
+            }
+        }
+    }
+}
+
 fn resolve_provider_kind(cs: &ConnectionString) -> Result<DatabaseKind> {
     let provider = cs.provider().map(str::trim).unwrap_or_default();
     if provider.is_empty() {
@@ -1084,6 +1151,67 @@ mod tests {
         // 预发布低于正式版
         assert_eq!(version_cmp("1.0.0-beta", "1.0.0"), Ordering::Less);
         assert_eq!(version_cmp("1.0.0-alpha", "1.0.0-beta"), Ordering::Less);
+    }
+
+    #[test]
+    fn cache_only_manager_resolves_local_and_reports_missing() {
+        let cache = temp_dir("cacheonly");
+        let mgr = DriverManager::new(DriverManagerConfig {
+            cache_dir: Some(cache.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        // 空缓存 + 未配置组件源：明确报错
+        let err = mgr.resolve_driver("dbserver-mysql", true).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("本地缓存为空") && msg.contains("组件源"), "{msg}");
+        // 预置版本目录（含 dbserver 占位）→ 直接解析成功，且不联网
+        let dir = cache.join("dbserver-mysql").join("1.2.3");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(DBSERVER_BIN), b"stub").unwrap();
+        let (version, resolved) = mgr.resolve_driver("dbserver-mysql", true).unwrap();
+        assert_eq!(version, "1.2.3");
+        assert_eq!(resolved, dir);
+    }
+
+    #[test]
+    fn install_from_zip_places_package() {
+        let cache = temp_dir("instzip");
+        let zip = build_zip(&[
+            ("driver.json", br#"{"id":"dbserver-demo"}"# as &[u8]),
+            (DBSERVER_BIN, b"stub-binary"),
+        ]);
+        let path = cache.join("pkg.zip");
+        std::fs::write(&path, &zip).unwrap();
+        let dir = install_from_zip(&cache, "dbserver-demo", "0.9.0", &path).unwrap();
+        assert!(dir.join(DBSERVER_BIN).is_file());
+        assert!(dir.join("driver.json").is_file());
+        // 非法 id/版本拒绝
+        assert!(install_from_zip(&cache, "../evil", "1.0", &path).is_err());
+        assert!(install_from_zip(&cache, "dbserver-demo", "a/b", &path).is_err());
+    }
+
+    #[test]
+    fn prepare_package_primes_cache_without_host() {
+        let cache = temp_dir("prime");
+        let mgr = DriverManager::new(DriverManagerConfig {
+            cache_dir: Some(cache.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        // 空缓存：报错（不得静默）
+        assert!(mgr.prepare_package("Server=x;Provider=MySql").is_err());
+        // 预置后：返回位置且不拉起宿主
+        let dir = cache.join("dbserver-mysql").join("0.1.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(DBSERVER_BIN), b"stub").unwrap();
+        let (component, version, got) = mgr.prepare_package("Server=x;Provider=MySql").unwrap();
+        assert_eq!(component, "dbserver-mysql");
+        assert_eq!(version, "0.1.0");
+        assert_eq!(got, dir);
+        assert!(mgr.hosts().is_empty(), "准备阶段不应拉起宿主");
+        // 内嵌驱动：明确报错
+        assert!(mgr.prepare_package("Data Source=x.db;Provider=SQLite").is_err());
     }
 
     #[test]

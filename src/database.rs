@@ -367,7 +367,7 @@ impl Databases {
 
     /// 打开（或复用）指定连接的共享存储。
     ///
-    /// 需要驱动包的连接：按 `[DriverStore]` 分发（未配置组件源时给出明确错误）。
+    /// 需要驱动包的连接：按 `[DriverStore]` 分发（未配置且无缓存/预置时给出明确错误）。
     pub fn store(&self, name: &str) -> Result<Arc<SharedStore>, String> {
         let name = name.trim();
         let entry = self.file.connections.get(name).ok_or_else(|| {
@@ -439,15 +439,10 @@ impl Databases {
         if let Some(existing) = slot.as_ref() {
             return Ok(Arc::clone(existing));
         }
-        let Some(spec) = self
-            .file
-            .driver_store
-            .as_ref()
-            .filter(|s| !s.url.trim().is_empty())
-        else {
+        let Some(spec) = self.file.driver_store.as_ref() else {
             return Err(format!(
                 "连接需要驱动包（本程序未内置该驱动），但未配置驱动组件源：\
-                 请在 {FILE_NAME} 增加 [DriverStore]（Url/PubKey）"
+                 请在 {FILE_NAME} 增加 [DriverStore]（Url/PubKey；Url 可空 = 仅用本机缓存）"
             ));
         };
         let ca_pem = if spec.ca_file.trim().is_empty() {
@@ -633,6 +628,29 @@ ConnectionString = "Server=127.0.0.1;Database=x;Provider=MySql"
         };
         assert!(err.contains("DriverStore"), "{err}");
         assert!(err.contains(FILE_NAME), "{err}");
+    }
+
+    #[test]
+    #[cfg(feature = "driver-pack")]
+    fn empty_driver_store_url_is_cache_only() {
+        let dir = temp_dir("cacheonly");
+        write_file(
+            &dir,
+            r#"
+[Connections.main]
+ConnectionString = "Server=127.0.0.1;Database=x;Provider=MySql"
+
+[DriverStore]
+Url = ""
+"#,
+        );
+        let dbs = Databases::load(&dir, None).unwrap().unwrap();
+        let err = match dbs.store("main") {
+            Ok(_) => panic!("空缓存 + 空 Url 应报错"),
+            Err(e) => e,
+        };
+        assert!(err.contains("本地缓存为空"), "{err}");
+        assert!(err.contains("组件源"), "{err}");
     }
 
     #[test]
