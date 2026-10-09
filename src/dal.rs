@@ -1292,7 +1292,6 @@ impl<'a> TableRef<'a> {
     /// - Oracle：插入语句携带 `SEQ_{表名}.NEXTVAL`（由 [`sqlbuild::insert_sql`] 注入），随后读取序列 CURRVAL
     /// - 其余：插入后通过会话读取自增函数（`last_insert_rowid()` / `LAST_INSERT_ID()` / `SCOPE_IDENTITY()`）
     pub fn insert(&self, session: &mut dyn SqlSession, fields: &[(&str, DbValue)]) -> Result<i64> {
-        let identity = self.table.identity();
         // 拦截器补全审计字段（对应实体拦截器 OnValid）
         let values = crate::interceptor::prepare(
             self.table,
@@ -1301,8 +1300,20 @@ impl<'a> TableRef<'a> {
         );
         let fields: Vec<(&str, DbValue)> =
             values.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        self.insert_prepared(session, &fields)
+    }
+
+    /// 插入一行（**已执行拦截器补全**的字段）。
+    ///
+    /// 供批量写入的回退路径复用，避免拦截器重复执行；单行 [`TableRef::insert`] 亦委托至此。
+    pub(crate) fn insert_prepared(
+        &self,
+        session: &mut dyn SqlSession,
+        fields: &[(&str, DbValue)],
+    ) -> Result<i64> {
+        let identity = self.table.identity();
         let (mut sql, params) =
-            sqlbuild::insert_sql_named(self.dal.kind, self.table, self.physical_name(), &fields)?;
+            sqlbuild::insert_sql_named(self.dal.kind, self.table, self.physical_name(), fields)?;
 
         if let Some(id_col) = identity
             && matches!(
@@ -1333,6 +1344,146 @@ impl<'a> TableRef<'a> {
         // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
         self.dal.invalidate_cache(self.physical_name());
         Ok(id)
+    }
+
+    /// 批量插入（对应 C# `EntityExtension.Insert(list)` → `IDbSession.Insert(table, columns, list)`）。
+    ///
+    /// - `rows`：每行一组 `(字段, 值)`；列集以首行为准，其余行按列名（大小写不敏感）投影，缺失补 `NULL`；
+    /// - 每行先执行拦截器补全（与单行 [`TableRef::insert`] 一致）；
+    /// - **首行自增列为 0 或缺失 → 整批排除自增列**（由数据库生成；对齐 C# `BuildInsertColumns`，
+    ///   需要显式指定自增值时请按"含/不含自增值"拆批调用）；
+    /// - 支持多行 `VALUES` 的数据库整批写入（`batch_size` 默认
+    ///   [`crate::batch::DEFAULT_INSERT_BATCH_SIZE`] = 5000，再按数据库单语句参数上限收紧）；
+    ///   其余数据库回退逐行执行（语义一致，仅少一次往返的优化不生效）；
+    /// - **不保证回写自增主键**（与 C# `BatchInsert` 一致）；无自增的雪花主键请先填值
+    ///   （分表批量 [`crate::entity::Entity::insert_batch_sharded`] 会自动生成）；
+    /// - 返回受影响行数；任一分块失败即中止（已执行的分块不回滚，需要原子性请自行包裹事务）。
+    pub fn insert_batch(
+        &self,
+        session: &mut dyn SqlSession,
+        rows: &[Vec<(&str, DbValue)>],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        let prepared: Vec<Vec<(String, DbValue)>> = rows
+            .iter()
+            .map(|fields| {
+                crate::interceptor::prepare(
+                    self.table,
+                    crate::interceptor::DataMethod::Insert,
+                    fields,
+                )
+            })
+            .collect();
+        self.insert_batch_prepared(session, &prepared, batch_size)
+    }
+
+    /// 批量插入（**已执行拦截器补全**的行；分表批量路径复用，避免拦截器重复执行）。
+    pub(crate) fn insert_batch_prepared(
+        &self,
+        session: &mut dyn SqlSession,
+        rows: &[Vec<(String, DbValue)>],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        let rows: Vec<&Vec<(String, DbValue)>> = rows.iter().filter(|r| !r.is_empty()).collect();
+        let Some(first) = rows.first() else {
+            return Ok(0);
+        };
+        let batch = batch_size
+            .unwrap_or(crate::batch::DEFAULT_INSERT_BATCH_SIZE)
+            .max(1);
+
+        // 列集 = 首行列集；首行自增列为 0/缺失 → 整批排除自增列（对齐 C# `BuildInsertColumns`）
+        let identity = self.table.identity().map(|c| c.name.clone());
+        let drop_identity = identity.as_ref().is_some_and(|name| {
+            first
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .and_then(|(_, v)| v.as_i64())
+                .unwrap_or(0)
+                == 0
+        });
+        let columns: Vec<&str> = first
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| {
+                !(drop_identity && identity.as_deref().is_some_and(|id| k.eq_ignore_ascii_case(id)))
+            })
+            .collect();
+        if columns.is_empty() {
+            return Err(Error::Model(format!(
+                "表 {} 的批量插入没有可写字段",
+                self.table.name
+            )));
+        }
+
+        let mut affected = 0u64;
+        if self.dal.kind.supports_multi_row_insert() {
+            let max_params = self.dal.kind.max_statement_params();
+            let per_statement = if max_params == 0 {
+                batch
+            } else {
+                (max_params / columns.len()).clamp(1, batch)
+            };
+            for chunk in rows.chunks(per_statement) {
+                let sql = sqlbuild::insert_multi_sql_named(
+                    self.dal.kind,
+                    self.table,
+                    self.physical_name(),
+                    &columns,
+                    chunk.len(),
+                )?;
+                let mut params = Vec::with_capacity(chunk.len() * columns.len());
+                for row in chunk {
+                    for column in &columns {
+                        // 按列名投影（大小写不敏感；缺失补 NULL）
+                        params.push(
+                            row.iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case(column))
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(DbValue::Null),
+                        );
+                    }
+                }
+                self.dal.log_sql(&sql);
+                affected += session.execute(&sql, &params)?;
+            }
+        } else {
+            // 回退逐行（拦截器已补全，不再重复执行）
+            for row in rows {
+                let fields: Vec<(&str, DbValue)> =
+                    row.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                let _ = self.insert_prepared(session, &fields)?;
+                affected += 1;
+            }
+        }
+        self.dal.invalidate_cache(self.physical_name());
+        Ok(affected)
+    }
+
+    /// 按单列主键批量删除（主键 `IN` 分批；对应 C# `EntityExtension.Delete(list)` 的批量分支）。
+    ///
+    /// - `pk_field`：主键字段名（由实体层保证是单一主键）；
+    /// - `values`：主键值列表（空返回 0；调用方应先过滤 `NULL` 值）；
+    /// - `batch_size` 默认 [`crate::batch::DEFAULT_DELETE_BATCH_SIZE`] = 1000（对齐 C#）。
+    pub fn delete_by_pk_values(
+        &self,
+        session: &mut dyn SqlSession,
+        pk_field: &str,
+        values: &[DbValue],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if values.is_empty() {
+            return Ok(0);
+        }
+        let batch = batch_size
+            .unwrap_or(crate::batch::DEFAULT_DELETE_BATCH_SIZE)
+            .max(1);
+        let mut affected = 0u64;
+        for chunk in values.chunks(batch) {
+            let filter = Where::new().in_(pk_field, chunk.iter().cloned());
+            affected += self.delete_where(session, &filter)?;
+        }
+        Ok(affected)
     }
 
     /// 按主键查找（主键值按 `TableMeta::primary_keys()` 顺序传入）。

@@ -48,6 +48,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `cache` | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | ✅ 整表实体缓存 + 单对象缓存（默认 60s 过期；写入自动失效）；✅ Redis 版本号（feature `redis`，底层为 **Pek.RRedis** 自研客户端） |
 | `reverse` | `DAL.GetTables`（反向工程） | ✅ 数据库 → `EntityModel` / `Model.xml`（**全部驱动**、含索引/唯一约束；`rcodegen --conn`） |
 | `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count`；`AuditExt` 审计字段访问；`#[derive(Entity)]` 宏；分表变体 `insert_sharded` / `find_sharded` / `query_sharded` 等 |
+| `batch` | `BatchFinder` / `EntityExtension`（批量写入） | ✅ 批量写入：`insert_batch`（多行 VALUES）/ `insert_batch_sharded`（**分片提前计算、按（连接, 物理表）分组批量插入**，跨库自动路由）/ `delete_batch` / `delete_batch_sharded`（主键 `IN` 分批）；批量查找 `BatchFinder`（主键 `IN` 合并） |
 | `shards` | `Shards/TimeShardPolicy`（`EntitySplit`） | ✅ 时间分表策略（`TablePolicy` / `ConnPolicy` / `Step` 模板与 C# 完全一致 + .NET 日期格式子集）；实体分表增删改查、**跨表查询/分页/计数/条件删除**、`auto_shard` 区间遍历、分表自动建表（对齐 C# `EntitySession.CheckTable`）；**自动分库执行**：连接注册表按连接名路由（对应 `DAL.AddConnStr` / `DAL.Create`），未注册连接名按 C# 规则自动落为 SQLite 库 |
 | `snowflake` | `NewLife.Data.Snowflake` | ✅ 位结构与 C# 互通（1+41+10+12；`GetId` / `TryParse` 语义一致）：`now_id` / `new_id_at` / `id_at` / `parse`，进程级共享实例 `shared()` |
 | `db_service` | `Services`（`DbServer` / `DbClient`） | ✅ 远程服务层 + HTTP 客户端；`/Db/Query` 为 **DbTable v3 二进制**（与 C# `DbClient` 双向互通，黄金样本逐字节验证）；配套 `provider=network` 驱动与 `examples/dbserver` 参考宿主 |
@@ -58,7 +59,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --kind entity,model,interface,biz / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`；`biz` 业务扩展**永不覆盖**、只合并缺失区块） |
 
-测试：**291 项全部通过**（库单测 253 + 集成 26 + 文档测试 12；`--features duckdb` 全量 298 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 292 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 252 项（rustls TLS 后端），`--no-default-features` 全量 252 项（完全不含 TLS 依赖）；
+测试：**297 项全部通过**（库单测 254 + 集成 31 + 文档测试 12；`--features duckdb` 全量 304 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 298 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 258 项（rustls TLS 后端），`--no-default-features` 全量 258 项（完全不含 TLS 依赖）；
 MySQL / PostgreSQL / SQL Server / Oracle / network 端到端用例在有真实库/服务时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -377,6 +378,12 @@ let db_policy = TimeShardPolicy::new("CreateTime")
     .with_table_policy("{0}_{1:yyyyMMdd}");
 log.insert_sharded(&dal, session.as_mut(), &db_policy)?;   // 自动写进 DH_2027 库的分表
 let list = WmsLog::query_sharded(&dal, session.as_mut(), &db_policy, &query)?;  // 跨库自动合并
+
+// 批量写入（对应 C# EntityExtension.Insert(list)）：整批多行 VALUES；分表自动分组、跨库自动路由
+let mut batch = vec![/* WmsLog ... */];
+let n = WmsLog::insert_batch(&dal, session.as_mut(), &batch, None)?;                     // 普通表
+let n = WmsLog::insert_batch_sharded(&dal, session.as_mut(), &db_policy, &mut batch, None)?; // 分表/分库
+let removed = WmsLog::delete_batch(&dal, session.as_mut(), &batch, None)?;               // 主键 IN 分批
 ```
 
 - 表句柄层同样可用：`dal.table_as("WmsLog", "WmsLog_202609")` 以物理表名操作（列元数据仍取模型），
@@ -388,6 +395,11 @@ let list = WmsLog::query_sharded(&dal, session.as_mut(), &db_policy, &query)?;  
   已注册连接（`shards::register_connection`，对应 `DAL.AddConnStr`，大小写不敏感）路由到注册的库；
   未注册的连接名按 C# 规则**自动落为 SQLite 库** `{数据目录}/{连接名}.db`（默认 `{程序目录}/Data`，
   可用 `shards::set_auto_db_dir` 覆盖）；跨库查询 / 计数 / 条件删除 / 遍历 / 删表与实体增删改查全自动切换会话；
+- **批量写入（对应 C# `EntityExtension`）**：`insert_batch`（普通表多行 `VALUES`）、
+  `insert_batch_sharded`（**提前计算分片 → 按（连接, 物理表）分组 → 分组批量插入**：跨库自动路由、
+  雪花主键逐行生成并回写；首行自增列为 0 时整批排除自增列、**不回写自增主键**——与 C# 一致）、
+  `delete_batch` / `delete_batch_sharded`（单一主键 `IN` 分批 1000）；`batch_size` 默认 5000
+  （对齐 C# `DAL.GetBatchSize()`）；实体队列 `EntityQueue::flush` 的连续 Insert/Delete 段亦自动合并批量；
 - `BETWEEN` 条件按 SQL 闭区间处理（右端 +1 秒参与扫描，只会多扫、不会漏）。
 
 ### 结构迁移档位（对应 DH.NCode 的 `Migration` 枚举）
@@ -542,6 +554,7 @@ Pek.RCode/
 14. **导航属性与行访问器** ✅ `navigation` 模块：`NavigationRegistry`（HasOne/HasMany，本地或进程级）+ `load_one`/`load_many` + `Entity::load`/`from_rows`（行集→实体，对应 `DataRowEntityAccessor.LoadData`）；C# 的 LINQ `Include`/反射注值在 Rust 无对应机制，以“注册表 + 显式装载”为对等能力面
 15. **驱动包按需分发（DriverManager）** ✅ `driver_pack` 模块（feature `driver-pack`）：应用按 `driver-*` 特性裁剪后，运行时从 **Pek.RPanlServer 组件源**（管理员「下载管理」；`/components/catalog.json` 同址 `.sig` 为 Ed25519 签名，与插件源同一把平台密钥）按需下载 `dbserver` 驱动包（SHA-256 强制校验）→ 解压本地缓存（`{cache}/{组件}/{版本}/`，临时目录 + 原子改名）→ 回环拉起宿主（端口 0 自动分配 + 一次性令牌）→ 解析就绪行 → 返回 `provider=network` 连接串；相同连接串复用宿主、`ensure_updated` 联网检查新版本、组件源不可用时回退本地缓存、`reap_idle` 空闲回收、析构自动停止全部宿主；驱动包由 `scripts/pack-drivers.ps1` 按驱动裁剪构建（实测 MySQL 2.4MB / PostgreSQL 2.2MB zip）；`examples/driver_fetch` 演示全流程（本机实测：平台下载 → 验签 → 拉起 → network 登录探明类型 → 回收，组件源不可达时离线降级正常）
 16. **分表（`Shards` / `EntitySplit`）** ✅ `shards` 模块 + `snowflake` 模块：`TimeShardPolicy`（`TablePolicy`/`ConnPolicy`/`Step`/Level 与 C# 逐语义对齐，表名渲染含 .NET 日期格式子集 → 与 C# 共用同一批分表）；实体分表 CRUD（`insert_sharded`/`update_sharded`/`delete_sharded`/`save_sharded`/`find_sharded`，**写入自动建表**对齐 `EntitySession.CheckTable`、雪花主键自动生成并回写对应 `AutoFillSnowIdPrimaryKey`）；跨表查询 `query_sharded`（条件推导多表 + `FixOrder` + 跨表续页/跳过扣减，即 C# `FindAll` 分表分支全语义）、`count_sharded`（逐表求和）、`delete_where_sharded`、`auto_shard`（区间遍历仅走已存在分表）；`Where` 条件推导 `shards_of`/`shards_of_trim`（含 C# Trim 优化）；`rcodegen` 识别 `DataScale="timeShard:..."` 生成 `shard_policy()` 与 `set_field`（生成代码已编译验证）；**自动分库执行**：连接注册表（`register_connection`/`unregister_connection`，对应 C# `DAL.AddConnStr`/`DAL.Create`，名称大小写不敏感）按连接名自动路由，未注册连接名按 C# 规则自动落为 `{数据目录}/{连接名}.db`（`set_auto_db_dir` 可覆盖，连接名合法性校验同 C#）——跨库查询/计数/删除/遍历/删表与实体 CRUD **全自动切换会话**（跨库端到端用例已覆盖）
+17. **批量写入（`EntityExtension` / 数据库批能力）** ✅ `dialect`/`sqlbuild`/`dal`/`entity`/`entity_queue`：`TableRef::insert_batch`（**多行 `VALUES`**，按数据库单语句参数上限与 `batch_size` 分块；SQLite/MySQL/PostgreSQL/SQL Server/DuckDB 方言直写，其余数据库自动回退逐行）、`TableRef::delete_by_pk_values`（主键 `IN` 分批）；实体层 `insert_batch` / `insert_batch_sharded`（**对齐 C# `Insert(list)` 分表分支：提前计算分片 → 按（连接, 物理表）分组 → 分组批量插入**；跨库自动路由、雪花主键逐行生成回写、首行自增列为 0 时整批排除自增列——与 C# `BuildInsertColumns`/`BatchInsert` 一致）/ `delete_batch` / `delete_batch_sharded`；`EntityQueue::flush` 连续 Insert/Delete 段自动合并批量（对应 C# `OnProcess` 的 `batch.Insert`/`batch.Delete`）；默认批 5000/删除批 1000（对齐 C# `GetBatchSize`/删除分批；事务由调用方按需 `begin/commit` 包裹，同 C# 不做隐式事务）；**实测（SQLite, release 构建）**：普通插入 2000 行 62.2ms → 4.1ms（**15.3x**）、分表插入 3000 行/30 表 164.4ms → 31.5ms（**5.2x**）、分库分表 1000 行/2 库 56.9ms → 43.5ms（**1.3x**，分片越小单表批越小、收益越低）、主键删除 2000 行 23.3ms → 0.9ms（**25.8x**）；基准用例 `cargo test --test batch_e2e -- --ignored --nocapture`
 
 **完整性审计缺口已全部落地（2026-09-27）**：
 

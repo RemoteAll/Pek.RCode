@@ -113,6 +113,36 @@ impl DatabaseKind {
         !matches!(self, DatabaseKind::InfluxDb | DatabaseKind::MongoDb)
     }
 
+    /// 是否支持标准多行 `VALUES (..),(..)` 批量插入语法。
+    ///
+    /// 对齐 C# 各数据库会话的 `BatchCapability.Insert`（`IDbSession.Insert(table, columns, list)` 覆写）；
+    /// C# 部分库走参数数组绑定（Oracle/新驱动 MySQL），本库对标准 SQL 引擎生成多行 VALUES，
+    /// 其余数据库由 [`crate::dal::TableRef::insert_batch`] 回退逐行执行（语义一致，仅少一次往返优化）。
+    pub fn supports_multi_row_insert(&self) -> bool {
+        matches!(
+            self,
+            DatabaseKind::Sqlite
+                | DatabaseKind::MySql
+                | DatabaseKind::PostgreSql
+                | DatabaseKind::SqlServer
+                | DatabaseKind::DuckDb
+        )
+    }
+
+    /// 单条语句允许的最大绑定参数个数（批量插入分块用；`0` = 不设上限）。
+    ///
+    /// - SQLite：`SQLITE_MAX_VARIABLE_NUMBER`（3.32+ 默认 32766）
+    /// - SQL Server：单语句最多 2100 个参数
+    /// - MySQL / PostgreSQL：按协议上限 65535 保守取值
+    pub fn max_statement_params(&self) -> usize {
+        match self {
+            DatabaseKind::Sqlite | DatabaseKind::DuckDb => 32_766,
+            DatabaseKind::SqlServer => 2_100,
+            DatabaseKind::MySql | DatabaseKind::PostgreSql => 65_535,
+            _ => 0,
+        }
+    }
+
     /// 从连接串中的 `provider` 名称解析（兼容常见别名）。
     ///
     /// 与 DH.NCode 支持的库对应关系：

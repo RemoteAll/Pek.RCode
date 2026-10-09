@@ -1,7 +1,9 @@
 //! 实体写队列（对应 DH.NCode 的 `Entity/EntityQueue.cs`）：凑批延迟写入。
 //!
 //! 把逐行写入请求先入队，达到批大小（默认 1000）或显式 [`EntityQueue::flush`] 时批量执行；
-//! 每项按 Insert / Update / Delete / Upsert 分发，走标准表句柄（拦截器与缓存失效自动生效）。
+//! 每项按 Insert / Update / Delete / Upsert 分发，走标准表句柄（拦截器与缓存失效自动生效）；
+//! **刷入时连续 Insert 段合并为多行批量插入、连续 Delete 段（单一主键）合并为主键 `IN` 批量删除**
+//! （对应 C# `EntityQueue.OnProcess` 的 `batch.Insert` / `batch.Delete`）。
 //!
 //! 与 C# 版的差异：C# 由后台线程按周期（默认 1000ms）自动持久化；Rust 版由调用方驱动
 //! `flush()`（入队时达到批大小也会自动 flush），需要异步时可在 `LazyConsumer` 任务中调用。
@@ -165,7 +167,13 @@ impl EntityQueue {
         Ok(())
     }
 
-    /// 立即执行全部待办项（逐条走标准表句柄；事务由调用方按需包裹）。
+    /// 立即执行全部待办项（对应 C# `EntityQueue.OnProcess` 的批处理）：
+    ///
+    /// - **连续 Insert 段**合并为多行批量插入（对应 C# `batch.Insert` → `EntityExtension.Insert(list)`）；
+    /// - **连续 Delete 段**（单一主键）合并为主键 `IN` 分批删除（对应 C# `batch.Delete`）；
+    /// - Update / Upsert 逐条执行（Upsert 需逐条存在性判定，与 C# `BatchSave` 拆分前的语义一致）；
+    /// - 段内成批执行 = 单条语句原子（与逐条相比不产生更多锁冲突）；事务仍由调用方按需包裹
+    ///   （与 C# 一致，SQLite 下不要在外层无条件包事务）。
     pub fn flush(
         &mut self,
         dal: &Dal,
@@ -173,26 +181,63 @@ impl EntityQueue {
     ) -> Result<QueueStats> {
         let table = dal.table(&self.table)?;
         let mut stats = QueueStats::default();
-        for item in self.items.drain(..) {
-            let fields: Vec<(&str, DbValue)> = item
-                .fields
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.clone()))
-                .collect();
-            match item.method {
+        let items = std::mem::take(&mut self.items);
+        let mut index = 0usize;
+        while index < items.len() {
+            match items[index].method {
                 QueueMethod::Insert => {
-                    table.insert(session, &fields)?;
-                    stats.inserted += 1;
-                }
-                QueueMethod::Update => {
-                    let affected = table.update_by_pk(session, &fields, &item.pk)?;
-                    stats.updated += affected;
+                    // 连续 Insert 段：合并为多行批量插入
+                    let start = index;
+                    while index < items.len() && items[index].method == QueueMethod::Insert {
+                        index += 1;
+                    }
+                    let rows: Vec<Vec<(&str, DbValue)>> = items[start..index]
+                        .iter()
+                        .map(|item| {
+                            item.fields
+                                .iter()
+                                .map(|(name, value)| (name.as_str(), value.clone()))
+                                .collect()
+                        })
+                        .collect();
+                    stats.inserted += table.insert_batch(session, &rows, None)?;
                 }
                 QueueMethod::Delete => {
-                    let affected = table.delete_by_pk(session, &item.pk)?;
-                    stats.deleted += affected;
+                    // 连续 Delete 段：单一主键时合并为主键 IN 批量删除
+                    let start = index;
+                    while index < items.len() && items[index].method == QueueMethod::Delete {
+                        index += 1;
+                    }
+                    let run = &items[start..index];
+                    let pks = table.meta().primary_keys();
+                    if pks.len() == 1 && run.iter().all(|item| item.pk.len() == 1) {
+                        let pk = pks[0].name.clone();
+                        let values: Vec<DbValue> =
+                            run.iter().map(|item| item.pk[0].clone()).collect();
+                        stats.deleted += table.delete_by_pk_values(session, &pk, &values, None)?;
+                    } else {
+                        for item in run {
+                            stats.deleted += table.delete_by_pk(session, &item.pk)?;
+                        }
+                    }
+                }
+                QueueMethod::Update => {
+                    let item = &items[index];
+                    let fields: Vec<(&str, DbValue)> = item
+                        .fields
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.clone()))
+                        .collect();
+                    stats.updated += table.update_by_pk(session, &fields, &item.pk)?;
+                    index += 1;
                 }
                 QueueMethod::Upsert => {
+                    let item = &items[index];
+                    let fields: Vec<(&str, DbValue)> = item
+                        .fields
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.clone()))
+                        .collect();
                     if table.find_by_pk(session, &item.pk)?.is_some() {
                         let affected = table.update_by_pk(session, &fields, &item.pk)?;
                         stats.updated += affected;
@@ -221,6 +266,7 @@ impl EntityQueue {
                         table.insert(session, &with_pk)?;
                         stats.inserted += 1;
                     }
+                    index += 1;
                 }
             }
         }

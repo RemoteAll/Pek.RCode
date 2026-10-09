@@ -21,6 +21,15 @@ use crate::value::DbValue;
 /// 默认批大小。
 pub const DEFAULT_BATCH_SIZE: usize = 500;
 
+/// 默认批量写入批大小（对应 C# `DAL.GetBatchSize()` 默认 5000）。
+///
+/// 用于 [`crate::dal::TableRef::insert_batch`] / [`crate::entity::Entity::insert_batch`] 等
+/// 批量写操作的分块（实际分块还会按数据库单语句参数上限收紧）。
+pub const DEFAULT_INSERT_BATCH_SIZE: usize = 5_000;
+
+/// 默认批量删除批大小（对应 C# `EntityExtension.Delete(list)` 的 1000/批）。
+pub const DEFAULT_DELETE_BATCH_SIZE: usize = 1_000;
+
 /// 实体对象批量查找器。
 pub struct BatchFinder {
     /// 表名（模型实体名）

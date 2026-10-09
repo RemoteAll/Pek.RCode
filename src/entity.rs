@@ -59,6 +59,7 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
@@ -147,6 +148,41 @@ pub trait Entity: Sized {
         Ok(id)
     }
 
+    /// 批量插入（对应 C# `EntityExtension.Insert(list)`）：整批多行写入，返回受影响行数。
+    ///
+    /// - 每行先执行拦截器补全（如 `TimeInterceptor` 补全 `CreateTime`），与单行插入一致；
+    /// - **首行自增列为 0 或缺失 → 整批排除自增列**（由数据库生成，对齐 C# `BuildInsertColumns`；
+    ///   需要显式指定自增值时请按含/不含自增值拆批调用）；
+    /// - **不回写自增主键**（与 C# `BatchInsert` 一致）；无自增的雪花主键请先填值，
+    ///   分表场景请用 [`Entity::insert_batch_sharded`]（自动生成雪花并路由分片）；
+    /// - `batch_size` 默认 5000（对齐 C# `DAL.GetBatchSize()`）；支持多行 `VALUES` 的数据库
+    ///   整批写入，其余数据库回退逐行（语义一致）。
+    fn insert_batch(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        list: &[Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let rows: Vec<Vec<(&str, DbValue)>> = list
+            .iter()
+            .map(|entity| {
+                entity
+                    .to_fields()
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let name: &str = name;
+                        (name, value)
+                    })
+                    .collect()
+            })
+            .collect();
+        let table = dal.table(Self::table())?;
+        table.insert_batch(session, &rows, batch_size)
+    }
+
     /// 按主键更新（主键值与自增列不参与 SET），返回受影响行数。
     fn update(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
         let table = dal.table(Self::table())?;
@@ -220,6 +256,43 @@ pub trait Entity: Sized {
     fn delete_with(&self, table: &TableRef<'_>, session: &mut dyn SqlSession) -> Result<u64> {
         let pk = pk_values_of(&self.to_fields(), Self::primary_keys())?;
         table.delete_by_pk(session, &pk)
+    }
+
+    /// 批量按主键删除（对应 C# `EntityExtension.Delete(list)` 的批量分支）：
+    /// 实体为**单一主键**且数量大于 1 时按主键 `IN` 分批删除（默认 1000/批，对齐 C#），
+    /// 否则逐条删除（复合主键/单条）。返回受影响行数。
+    fn delete_batch(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        list: &[Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let pks = Self::primary_keys();
+        if pks.len() == 1 && list.len() > 1 {
+            let pk = pks[0];
+            let mut values = Vec::with_capacity(list.len());
+            for entity in list {
+                let fields = entity.to_fields();
+                if let Some((_, value)) = fields
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(pk))
+                    && !matches!(value, DbValue::Null)
+                {
+                    values.push(value.clone());
+                }
+            }
+            let table = dal.table(Self::table())?;
+            table.delete_by_pk_values(session, pk, &values, batch_size)
+        } else {
+            let mut affected = 0u64;
+            for entity in list {
+                affected += entity.delete(dal, session)?;
+            }
+            Ok(affected)
+        }
     }
 
     /// 按主键查询单条记录（对应 XCode 的 `FindByID` 等）。
@@ -340,6 +413,144 @@ pub trait Entity: Sized {
         }
     }
 
+    /// 批量插入到各自分表（对应 C# `EntityExtension.Insert(list)` 的分表分支：
+    /// **提前计算分表、按库表分组后分组批量插入**）。
+    ///
+    /// - 逐行先执行拦截器补全（如 `CreateTime` 自动填充）并回写实体，再按 `policy.field` 计算分片
+    ///   （分片字段缺失时报错，与单行 [`Entity::insert_sharded`] 一致）；
+    /// - 雪花主键（Int64 ≤ 0）逐行生成并回写（对齐 C# `AutoFillSnowIdPrimaryKey`，批内顺序稳定）；
+    /// - 按 **(连接, 物理表)** 分组：同连接复用同一会话；跨库连接经连接注册表解析
+    ///   （未注册按 C# 规则自动落 SQLite 库）；分表不存在时自动建表（对齐 `CheckTable`）；
+    /// - **不回写自增主键**（与 C# `BatchInsert` 一致）；返回受影响行数。
+    fn insert_batch_sharded(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+        list: &mut [Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let handle = dal.table(Self::table())?;
+        let base = handle.shard_base();
+        let base_table = handle.meta().effective_table_name().to_string();
+
+        let mut groups: Vec<BatchGroup<Vec<(String, DbValue)>>> = Vec::new();
+        let mut group_index: HashMap<String, usize> = HashMap::new();
+
+        // 阶段一：拦截器补全 → 回写 → 雪花生成 → 分片解析，按（连接, 物理表）分组
+        for entity in list.iter_mut() {
+            let fields = entity.to_fields();
+            let own_value = fields
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&policy.field))
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| {
+                    Error::Model(format!(
+                        "实体 {} 不存在分表字段 {}",
+                        Self::table(),
+                        policy.field
+                    ))
+                })?;
+            let mut row = crate::interceptor::prepare(
+                handle.meta(),
+                crate::interceptor::DataMethod::Insert,
+                &fields,
+            );
+            let mut value = row
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&policy.field))
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| own_value.clone());
+            if value != own_value {
+                let _ = entity.set_field(&policy.field, value.clone());
+            }
+            // 雪花主键为空 → 生成并回写（同步进待插入行，保证分片与入库一致）
+            if let DbValue::Int(id) = value
+                && id <= 0
+            {
+                let snow = policy.snow.as_ref().ok_or_else(|| {
+                    Error::Model(format!(
+                        "实体 {} 的雪花主键为空，且分表策略未配置 Snowflake",
+                        Self::table()
+                    ))
+                })?;
+                let new_id = snow.now_id()?;
+                if !entity.set_field(&policy.field, DbValue::Int(new_id))? {
+                    return Err(Error::Model(format!(
+                        "实体 {} 未实现 set_field，无法回写生成的雪花主键",
+                        Self::table()
+                    )));
+                }
+                value = DbValue::Int(new_id);
+                if let Some((_, cell)) = row
+                    .iter_mut()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&policy.field))
+                {
+                    *cell = value.clone();
+                }
+            }
+
+            // 分片解析（策略未配置分表模板 → 基础表单组）
+            let (target, conn, physical, ensure) = match policy.shard_of_value(base, &value)? {
+                Some(model) => {
+                    let physical = model
+                        .table_name
+                        .clone()
+                        .unwrap_or_else(|| base_table.clone());
+                    let target = crate::shards::resolve_shard_dal(&model, base, dal)?;
+                    let conn = match &target {
+                        Some(_) => model.conn_name.as_deref().unwrap_or("").to_lowercase(),
+                        None => String::new(),
+                    };
+                    (target, conn, physical, true)
+                }
+                None => (None, String::new(), base_table.clone(), false),
+            };
+
+            let key = format!("{conn}\u{1}{physical}");
+            let index = match group_index.get(&key) {
+                Some(&index) => index,
+                None => {
+                    let index = groups.len();
+                    groups.push(BatchGroup {
+                        dal: target.clone(),
+                        conn: conn.clone(),
+                        physical: physical.clone(),
+                        ensure,
+                        payload: Vec::new(),
+                    });
+                    group_index.insert(key, index);
+                    index
+                }
+            };
+            groups[index].ensure |= ensure;
+            groups[index].payload.push(row);
+        }
+
+        // 阶段二：按连接复用会话，逐组批量写入
+        let mut affected = 0u64;
+        let mut owned: HashMap<String, Box<dyn SqlSession>> = HashMap::new();
+        for group in &groups {
+            let (group_dal, group_session): (&Dal, &mut dyn SqlSession) = match &group.dal {
+                None => (dal, &mut *session),
+                Some(d) => {
+                    if !owned.contains_key(&group.conn) {
+                        owned.insert(group.conn.clone(), d.open_session()?);
+                    }
+                    (d.as_ref(), &mut **owned.get_mut(&group.conn).unwrap())
+                }
+            };
+            if group.ensure {
+                group_dal.ensure_shard_table(Self::table(), &group.physical)?;
+            }
+            let table = group_dal.table_as(Self::table(), &group.physical)?;
+            affected += table.insert_batch_prepared(group_session, &group.payload, batch_size)?;
+        }
+        Ok(affected)
+    }
+
     /// 更新本对象所在分表的行（按 `policy.field` 字段值路由；分表不存在时自动建表，对齐 C#）。
     fn update_sharded(
         &self,
@@ -382,6 +593,115 @@ pub trait Entity: Sized {
                 self.delete_with(&table, session)
             }
         }
+    }
+
+    /// 批量删除各自分表的行（分表场景的批量删除）。
+    ///
+    /// - 按 **(连接, 物理表)** 自动分组，组内按主键 `IN` 分批删除（默认 1000/批；
+    ///   复合主键回退逐条删除）；跨库连接自动路由（注册表 / 自动 SQLite 回退）；
+    /// - 与 C# 的差异：C# 批量删除不区分分表（用会话当前表），本库自动路由到正确分表（更安全）；
+    /// - 缺主键值的行跳过（与 C# 一致）；不存在的分表跳过（与单行删除一致）；返回受影响行数。
+    fn delete_batch_sharded(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+        list: &[Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let pks = Self::primary_keys();
+        if pks.len() != 1 {
+            let mut affected = 0u64;
+            for entity in list {
+                affected += entity.delete_sharded(dal, session, policy)?;
+            }
+            return Ok(affected);
+        }
+        let pk = pks[0];
+        let handle = dal.table(Self::table())?;
+        let base = handle.shard_base();
+        let base_table = handle.meta().effective_table_name().to_string();
+
+        let mut groups: Vec<BatchGroup<DbValue>> = Vec::new();
+        let mut group_index: HashMap<String, usize> = HashMap::new();
+
+        for entity in list {
+            let fields = entity.to_fields();
+            // 主键值缺失/为空 → 跳过（对齐 C# `if (val == null) continue`）
+            let Some((_, pk_value)) = fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(pk))
+            else {
+                continue;
+            };
+            if matches!(pk_value, DbValue::Null) {
+                continue;
+            }
+            let shard_value = fields
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&policy.field))
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| {
+                    Error::Model(format!(
+                        "实体 {} 不存在分表字段 {}",
+                        Self::table(),
+                        policy.field
+                    ))
+                })?;
+            let (target, conn, physical) = match policy.shard_of_value(base, &shard_value)? {
+                Some(model) => {
+                    let physical = model
+                        .table_name
+                        .clone()
+                        .unwrap_or_else(|| base_table.clone());
+                    let target = crate::shards::resolve_shard_dal(&model, base, dal)?;
+                    let conn = match &target {
+                        Some(_) => model.conn_name.as_deref().unwrap_or("").to_lowercase(),
+                        None => String::new(),
+                    };
+                    (target, conn, physical)
+                }
+                None => (None, String::new(), base_table.clone()),
+            };
+
+            let key = format!("{conn}\u{1}{physical}");
+            let index = match group_index.get(&key) {
+                Some(&index) => index,
+                None => {
+                    let index = groups.len();
+                    groups.push(BatchGroup {
+                        dal: target.clone(),
+                        conn: conn.clone(),
+                        physical: physical.clone(),
+                        ensure: false,
+                        payload: Vec::new(),
+                    });
+                    group_index.insert(key, index);
+                    index
+                }
+            };
+            groups[index].payload.push(pk_value.clone());
+        }
+
+        let mut affected = 0u64;
+        let mut owned: HashMap<String, Box<dyn SqlSession>> = HashMap::new();
+        for group in &groups {
+            let (group_dal, group_session): (&Dal, &mut dyn SqlSession) = match &group.dal {
+                None => (dal, &mut *session),
+                Some(d) => {
+                    if !owned.contains_key(&group.conn) {
+                        owned.insert(group.conn.clone(), d.open_session()?);
+                    }
+                    (d.as_ref(), &mut **owned.get_mut(&group.conn).unwrap())
+                }
+            };
+            if !group_session.table_exists(&group.physical)? {
+                continue;
+            }
+            let table = group_dal.table_as(Self::table(), &group.physical)?;
+            affected += table.delete_by_pk_values(group_session, pk, &group.payload, batch_size)?;
+        }
+        Ok(affected)
     }
 
     /// 保存到分表（对应 C# `Save()` 的分表分支）：
@@ -543,6 +863,20 @@ struct ShardTarget {
     dal: Option<Arc<Dal>>,
     /// 物理表名
     physical: String,
+}
+
+/// 分片批量分组（按 **目标连接 + 物理表** 聚合；对应 C# 按会话对象分组）。
+struct BatchGroup<T> {
+    /// 目标连接（`None` = 基础连接）
+    dal: Option<Arc<Dal>>,
+    /// 连接缓存键（基础连接为空串；否则为小写连接名）
+    conn: String,
+    /// 物理表名
+    physical: String,
+    /// 是否需要确保分表存在（写操作；删除不建表）
+    ensure: bool,
+    /// 组内载荷（插入=待写字段行；删除=主键值）
+    payload: Vec<T>,
 }
 
 /// 解析分表目标（对应 C# `Meta.CreateShard`）：

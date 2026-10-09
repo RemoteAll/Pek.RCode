@@ -87,6 +87,57 @@ pub fn insert_sql_named(
     Ok((sql, params))
 }
 
+/// 组装多行 INSERT 语句（对应 C# 各库 `IDbSession.Insert(table, columns, list)` 的批量实现）。
+///
+/// 生成 `INSERT INTO t (列..) VALUES (..), (..), ...`；列集由调用方统一，占位符按行展开，
+/// 参数由调用方按行、列顺序拍平传入（与 [`insert_sql_named`] 的单行占位符规则一致）。
+pub fn insert_multi_sql_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    columns: &[&str],
+    rows: usize,
+) -> Result<String> {
+    if columns.is_empty() {
+        return Err(Error::Model(format!(
+            "表 {} 的批量插入语句至少需要一个字段",
+            table.name
+        )));
+    }
+    if rows == 0 {
+        return Err(Error::Model("批量插入的行数不能为 0".into()));
+    }
+    // InfluxDB 行协议、MongoDB 子集翻译不属于 SQL 多行语法（调用方先行回退）
+    if !kind.supports_multi_row_insert() {
+        return Err(Error::Unsupported(format!(
+            "{kind:?} 不支持多行 VALUES 批量插入，请回退逐行执行"
+        )));
+    }
+
+    let cols: Vec<String> = columns
+        .iter()
+        .map(|field| column_name(table, field).map(|name| kind.quote(name)))
+        .collect::<Result<_>>()?;
+
+    let mut tuples = Vec::with_capacity(rows);
+    let mut index = 0usize;
+    for _ in 0..rows {
+        let mut marks = Vec::with_capacity(columns.len());
+        for _ in columns {
+            marks.push(kind.placeholder(index));
+            index += 1;
+        }
+        tuples.push(format!("({})", marks.join(", ")));
+    }
+
+    Ok(format!(
+        "INSERT INTO {} ({}) VALUES {}",
+        kind.quote(table_name),
+        cols.join(", "),
+        tuples.join(", ")
+    ))
+}
+
 /// InfluxDB 行协议：`measurement,tag=.. field=.. timestamp`。
 ///
 /// 与 DH.NCode 的批量写入规则一致：主键/主列（`PrimaryKey`/`Master`）作为 tag，
@@ -438,6 +489,36 @@ mod tests {
 
         // 未知列应尽早报错
         assert!(insert_sql(DatabaseKind::Sqlite, &t, &[("Nope", 1.into())]).is_err());
+    }
+
+    #[test]
+    fn multi_row_insert_generation() {
+        let t = table();
+        // SQLite/MySQL：占位符 `?` 按行展开
+        let sql = insert_multi_sql_named(
+            DatabaseKind::Sqlite,
+            &t,
+            "DH_Order_2026",
+            &["Code", "Amount"],
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"DH_Order_2026\" (\"Code\", \"Amount\") VALUES (?, ?), (?, ?)"
+        );
+
+        // SQL Server：命名占位符连续编号
+        let sql =
+            insert_multi_sql_named(DatabaseKind::SqlServer, &t, "DH_Order", &["Code"], 2).unwrap();
+        assert_eq!(sql, "INSERT INTO [DH_Order] ([Code]) VALUES (@p0), (@p1)");
+
+        // 不支持多行的方言 / 非法参数：调用方先行回退
+        assert!(insert_multi_sql_named(DatabaseKind::Oracle, &t, "T", &["Code"], 1).is_err());
+        assert!(insert_multi_sql_named(DatabaseKind::InfluxDb, &t, "T", &["Code"], 1).is_err());
+        assert!(insert_multi_sql_named(DatabaseKind::Sqlite, &t, "T", &["Nope"], 1).is_err());
+        assert!(insert_multi_sql_named(DatabaseKind::Sqlite, &t, "T", &[], 1).is_err());
+        assert!(insert_multi_sql_named(DatabaseKind::Sqlite, &t, "T", &["Code"], 0).is_err());
     }
 
     #[test]
