@@ -30,6 +30,16 @@ pub const DEFAULT_INSERT_BATCH_SIZE: usize = 5_000;
 /// 默认批量删除批大小（对应 C# `EntityExtension.Delete(list)` 的 1000/批）。
 pub const DEFAULT_DELETE_BATCH_SIZE: usize = 1_000;
 
+/// 默认**分批删除**批大小（对应 C# `EntityPersistence.Delete(...)` 的 `GetBatchSize(10_000)`）。
+pub const DEFAULT_DELETE_WHERE_BATCH_SIZE: usize = 10_000;
+
+/// 分批删除的默认批间隔（毫秒；对齐 C# `XCodeSetting.BatchInterval` 默认 100ms，防一次性删除压垮数据库 IO）。
+pub const DEFAULT_BATCH_INTERVAL_MS: u64 = 100;
+
+/// 批量写入模式（对应 C# `IDbSession.Insert / InsertIgnore / Replace / Upsert` 的多行实现；
+/// 定义在 [`crate::sqlbuild`]，由本模块再导出）。
+pub use crate::sqlbuild::BatchWriteMode;
+
 /// 实体对象批量查找器。
 pub struct BatchFinder {
     /// 表名（模型实体名）

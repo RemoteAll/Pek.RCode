@@ -87,30 +87,48 @@ pub fn insert_sql_named(
     Ok((sql, params))
 }
 
-/// 组装多行 INSERT 语句（对应 C# 各库 `IDbSession.Insert(table, columns, list)` 的批量实现）。
+/// 批量写入模式（对应 C# `IDbSession.Insert / InsertIgnore / Replace / Upsert` 的多行实现）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchWriteMode {
+    /// 普通插入（多行 `VALUES`）
+    Insert,
+    /// 忽略重复插入（SQLite/DuckDB `Insert Or Ignore`、MySQL `Insert Ignore`、PostgreSQL `On Conflict Do Nothing`）
+    InsertIgnore,
+    /// 替换插入（SQLite/DuckDB `Insert Or Replace`、MySQL `Replace Into`）
+    Replace,
+    /// 插入或更新（SQLite/DuckDB/PostgreSQL `On Conflict(pk) Do Update`、MySQL `On Duplicate Key Update`）
+    Upsert,
+}
+
+/// 组装多行写入语句（对应 C# 各库 `IDbSession.Insert / InsertIgnore / Replace / Upsert` 的批量实现）。
 ///
-/// 生成 `INSERT INTO t (列..) VALUES (..), (..), ...`；列集由调用方统一，占位符按行展开，
+/// 生成 `INSERT ... VALUES (..), (..), ...` 及方言去重后缀；列集由调用方统一，占位符按行展开，
 /// 参数由调用方按行、列顺序拍平传入（与 [`insert_sql_named`] 的单行占位符规则一致）。
-pub fn insert_multi_sql_named(
+///
+/// - `Upsert` 的冲突目标取**表主键**（无主键报错）；更新列 = 插入列中排除主键与自增列
+///   （对齐 C# `On Conflict Do Update` 的字段过滤；无更新列时 SQLite 系 `Do Nothing`、MySQL no-op）；
+/// - 方言不支持对应模式时返回 [`Error::Unsupported`]（由调用方回退或报错）。
+pub fn multi_write_sql_named(
     kind: DatabaseKind,
     table: &TableMeta,
     table_name: &str,
     columns: &[&str],
     rows: usize,
+    mode: BatchWriteMode,
 ) -> Result<String> {
     if columns.is_empty() {
         return Err(Error::Model(format!(
-            "表 {} 的批量插入语句至少需要一个字段",
+            "表 {} 的批量写入语句至少需要一个字段",
             table.name
         )));
     }
     if rows == 0 {
-        return Err(Error::Model("批量插入的行数不能为 0".into()));
+        return Err(Error::Model("批量写入的行数不能为 0".into()));
     }
     // InfluxDB 行协议、MongoDB 子集翻译不属于 SQL 多行语法（调用方先行回退）
     if !kind.supports_multi_row_insert() {
         return Err(Error::Unsupported(format!(
-            "{kind:?} 不支持多行 VALUES 批量插入，请回退逐行执行"
+            "{kind:?} 不支持多行 VALUES 批量写入，请回退逐行执行"
         )));
     }
 
@@ -130,12 +148,114 @@ pub fn insert_multi_sql_named(
         tuples.push(format!("({})", marks.join(", ")));
     }
 
+    let (head, tail): (&str, String) = match mode {
+        BatchWriteMode::Insert => ("INSERT INTO", String::new()),
+        BatchWriteMode::InsertIgnore => match kind {
+            DatabaseKind::Sqlite | DatabaseKind::DuckDb => ("INSERT OR IGNORE INTO", String::new()),
+            DatabaseKind::MySql => ("INSERT IGNORE INTO", String::new()),
+            DatabaseKind::PostgreSql => ("INSERT INTO", " ON CONFLICT DO NOTHING".into()),
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "{kind:?} 不支持多行 InsertIgnore 批量写入"
+                )));
+            }
+        },
+        BatchWriteMode::Replace => match kind {
+            DatabaseKind::Sqlite | DatabaseKind::DuckDb => ("INSERT OR REPLACE INTO", String::new()),
+            DatabaseKind::MySql => ("REPLACE INTO", String::new()),
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "{kind:?} 不支持多行 Replace 批量写入"
+                )));
+            }
+        },
+        BatchWriteMode::Upsert => {
+            let pks = table.primary_keys();
+            if pks.is_empty() {
+                return Err(Error::Model(format!(
+                    "表 {} 没有主键，无法批量 Upsert",
+                    table.name
+                )));
+            }
+            // 更新列 = 插入列中排除主键与自增列（对齐 C# `On Conflict Do Update` 的字段过滤）
+            let update_fields: Vec<&str> = columns
+                .iter()
+                .copied()
+                .filter(|field| {
+                    !pks.iter().any(|pk| pk.name.eq_ignore_ascii_case(field))
+                        && !table
+                            .identity()
+                            .is_some_and(|id| id.name.eq_ignore_ascii_case(field))
+                })
+                .collect();
+
+            match kind {
+                DatabaseKind::Sqlite | DatabaseKind::DuckDb | DatabaseKind::PostgreSql => {
+                    let target: Vec<String> = pks
+                        .iter()
+                        .map(|pk| kind.quote(table.effective_column_name(pk)))
+                        .collect();
+                    let tail = if update_fields.is_empty() {
+                        format!(" ON CONFLICT ({}) DO NOTHING", target.join(", "))
+                    } else {
+                        let sets: Vec<String> = update_fields
+                            .iter()
+                            .map(|field| {
+                                let col = kind.quote(column_name(table, field)?);
+                                Ok(format!("{col}=excluded.{col}"))
+                            })
+                            .collect::<Result<_>>()?;
+                        format!(
+                            " ON CONFLICT ({}) DO UPDATE SET {}",
+                            target.join(", "),
+                            sets.join(", ")
+                        )
+                    };
+                    ("INSERT INTO", tail)
+                }
+                DatabaseKind::MySql => {
+                    let tail = if update_fields.is_empty() {
+                        // 无更新列：no-op 保持"存在即忽略"语义（MySQL 惯用写法）
+                        let pk = kind.quote(table.effective_column_name(pks[0]));
+                        format!(" ON DUPLICATE KEY UPDATE {pk}={pk}")
+                    } else {
+                        let sets: Vec<String> = update_fields
+                            .iter()
+                            .map(|field| {
+                                let col = kind.quote(column_name(table, field)?);
+                                Ok(format!("{col}=VALUES({col})"))
+                            })
+                            .collect::<Result<_>>()?;
+                        format!(" ON DUPLICATE KEY UPDATE {}", sets.join(", "))
+                    };
+                    ("INSERT INTO", tail)
+                }
+                _ => {
+                    return Err(Error::Unsupported(format!(
+                        "{kind:?} 不支持多行 Upsert 批量写入"
+                    )));
+                }
+            }
+        }
+    };
+
     Ok(format!(
-        "INSERT INTO {} ({}) VALUES {}",
+        "{head} {} ({}) VALUES {}{tail}",
         kind.quote(table_name),
         cols.join(", "),
         tuples.join(", ")
     ))
+}
+
+/// 组装多行 INSERT 语句（[`BatchWriteMode::Insert`] 的便捷入口，保留原签名）。
+pub fn insert_multi_sql_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    columns: &[&str],
+    rows: usize,
+) -> Result<String> {
+    multi_write_sql_named(kind, table, table_name, columns, rows, BatchWriteMode::Insert)
 }
 
 /// InfluxDB 行协议：`measurement,tag=.. field=.. timestamp`。
@@ -308,6 +428,83 @@ pub fn delete_sql_named(
         sql.push_str(&where_sql);
     }
     (sql, params)
+}
+
+/// 组装**分批删除**语句（每批最多 `batch_size` 行；对应 C# `IDbDatabase.BuildDeleteSql`）。
+///
+/// 支持分批删除的方言（与 C# 对齐，另含 SQLite 增强）：
+/// - MySQL / IRIS / NovaDb（MySQL 协议）：`DELETE ... LIMIT n`
+/// - SQL Server：`DELETE TOP (n) FROM ...`
+/// - PostgreSQL 系（含 HighGo/KingBase/VastBase）：`WITH _to_delete AS (SELECT ctid ... LIMIT n) DELETE ... WHERE ctid IN (...)`
+/// - Oracle：`DELETE ... WHERE ROWID IN (SELECT ROWID ... WHERE (where) AND ROWNUM<=n)`
+/// - SQLite（**C# 未支持，本库增强**）：`DELETE ... WHERE rowid IN (SELECT rowid FROM ... LIMIT n)`（`WITHOUT ROWID` 表不可用）
+///
+/// 其余方言返回 `None`（调用方回退为一次性删除，与 C# 相同）。
+pub fn delete_batched_sql_named(
+    kind: DatabaseKind,
+    table_name: &str,
+    filter: &Where,
+    batch_size: usize,
+) -> Option<(String, Vec<DbValue>)> {
+    if batch_size == 0 {
+        return None;
+    }
+    let mut params = Vec::with_capacity(4);
+    let where_sql = filter.render(kind, &mut params);
+    let has_where = !where_sql.is_empty();
+    let t = kind.quote(table_name);
+
+    let sql = match kind {
+        DatabaseKind::MySql | DatabaseKind::Iris => {
+            let mut sql = format!("DELETE FROM {t}");
+            if has_where {
+                sql.push_str(" WHERE ");
+                sql.push_str(&where_sql);
+            }
+            sql.push_str(&format!(" LIMIT {batch_size}"));
+            sql
+        }
+        DatabaseKind::SqlServer => {
+            let mut sql = format!("DELETE TOP ({batch_size}) FROM {t}");
+            if has_where {
+                sql.push_str(" WHERE ");
+                sql.push_str(&where_sql);
+            }
+            sql
+        }
+        DatabaseKind::PostgreSql => {
+            let mut inner = format!("SELECT ctid FROM {t}");
+            if has_where {
+                inner.push_str(" WHERE ");
+                inner.push_str(&where_sql);
+            }
+            inner.push_str(&format!(" LIMIT {batch_size}"));
+            format!(
+                "WITH _to_delete AS ({inner}) DELETE FROM {t} WHERE ctid IN (SELECT ctid FROM _to_delete)"
+            )
+        }
+        DatabaseKind::Oracle => {
+            let cond = if has_where {
+                format!("{where_sql} AND ")
+            } else {
+                String::new()
+            };
+            format!(
+                "DELETE FROM {t} WHERE ROWID IN (SELECT ROWID FROM {t} WHERE {cond}ROWNUM<={batch_size})"
+            )
+        }
+        DatabaseKind::Sqlite => {
+            let mut inner = format!("SELECT rowid FROM {t}");
+            if has_where {
+                inner.push_str(" WHERE ");
+                inner.push_str(&where_sql);
+            }
+            inner.push_str(&format!(" LIMIT {batch_size}"));
+            format!("DELETE FROM {t} WHERE rowid IN ({inner})")
+        }
+        _ => return None,
+    };
+    Some((sql, params))
 }
 
 /// 组装 COUNT 语句。
@@ -519,6 +716,221 @@ mod tests {
         assert!(insert_multi_sql_named(DatabaseKind::Sqlite, &t, "T", &["Nope"], 1).is_err());
         assert!(insert_multi_sql_named(DatabaseKind::Sqlite, &t, "T", &[], 1).is_err());
         assert!(insert_multi_sql_named(DatabaseKind::Sqlite, &t, "T", &["Code"], 0).is_err());
+    }
+
+    #[test]
+    fn multi_write_modes_generation() {
+        let t = table();
+        let cols = ["Id", "Code", "Amount"];
+
+        // 忽略重复：SQLite/MySQL 前缀式、PostgreSQL On Conflict Do Nothing
+        let sql = multi_write_sql_named(
+            DatabaseKind::Sqlite,
+            &t,
+            "DH_Order",
+            &cols,
+            1,
+            BatchWriteMode::InsertIgnore,
+        )
+        .unwrap();
+        assert!(sql.starts_with("INSERT OR IGNORE INTO \"DH_Order\""));
+        let sql = multi_write_sql_named(
+            DatabaseKind::MySql,
+            &t,
+            "DH_Order",
+            &cols,
+            1,
+            BatchWriteMode::InsertIgnore,
+        )
+        .unwrap();
+        assert!(sql.starts_with("INSERT IGNORE INTO `DH_Order`"));
+        let sql = multi_write_sql_named(
+            DatabaseKind::PostgreSql,
+            &t,
+            "DH_Order",
+            &cols,
+            1,
+            BatchWriteMode::InsertIgnore,
+        )
+        .unwrap();
+        assert!(sql.ends_with(" ON CONFLICT DO NOTHING"), "{sql}");
+
+        // 替换插入：SQLite/DuckDB 前缀式、MySQL Replace Into
+        let sql = multi_write_sql_named(
+            DatabaseKind::Sqlite,
+            &t,
+            "DH_Order",
+            &cols,
+            1,
+            BatchWriteMode::Replace,
+        )
+        .unwrap();
+        assert!(sql.starts_with("INSERT OR REPLACE INTO \"DH_Order\""));
+        let sql = multi_write_sql_named(
+            DatabaseKind::MySql,
+            &t,
+            "DH_Order",
+            &cols,
+            1,
+            BatchWriteMode::Replace,
+        )
+        .unwrap();
+        assert!(sql.starts_with("REPLACE INTO `DH_Order`"));
+
+        // Upsert：SQLite/PG 用 On Conflict(pk) Do Update（更新列排除主键与自增列）
+        let sql = multi_write_sql_named(
+            DatabaseKind::Sqlite,
+            &t,
+            "DH_Order",
+            &cols,
+            1,
+            BatchWriteMode::Upsert,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"DH_Order\" (\"Id\", \"Code\", \"Amount\") VALUES (?, ?, ?) \
+             ON CONFLICT (\"Id\") DO UPDATE SET \"Code\"=excluded.\"Code\", \"Amount\"=excluded.\"Amount\""
+        );
+        let sql = multi_write_sql_named(
+            DatabaseKind::PostgreSql,
+            &t,
+            "DH_Order",
+            &cols,
+            1,
+            BatchWriteMode::Upsert,
+        )
+        .unwrap();
+        assert!(sql.contains("ON CONFLICT (\"Id\") DO UPDATE SET"), "{sql}");
+        let sql = multi_write_sql_named(
+            DatabaseKind::MySql,
+            &t,
+            "DH_Order",
+            &cols,
+            1,
+            BatchWriteMode::Upsert,
+        )
+        .unwrap();
+        assert!(
+            sql.contains("ON DUPLICATE KEY UPDATE `Code`=VALUES(`Code`), `Amount`=VALUES(`Amount`)"),
+            "{sql}"
+        );
+
+        // 仅主键列（无更新列）：SQLite 系 Do Nothing、MySQL no-op
+        let sql = multi_write_sql_named(
+            DatabaseKind::Sqlite,
+            &t,
+            "DH_Order",
+            &["Id"],
+            1,
+            BatchWriteMode::Upsert,
+        )
+        .unwrap();
+        assert!(sql.ends_with("ON CONFLICT (\"Id\") DO NOTHING"), "{sql}");
+        let sql = multi_write_sql_named(
+            DatabaseKind::MySql,
+            &t,
+            "DH_Order",
+            &["Id"],
+            1,
+            BatchWriteMode::Upsert,
+        )
+        .unwrap();
+        assert!(sql.ends_with("ON DUPLICATE KEY UPDATE `Id`=`Id`"), "{sql}");
+
+        // 方言不支持：报错（无安全回退）
+        assert!(
+            multi_write_sql_named(
+                DatabaseKind::Oracle,
+                &t,
+                "T",
+                &cols,
+                1,
+                BatchWriteMode::InsertIgnore
+            )
+            .is_err()
+        );
+        assert!(
+            multi_write_sql_named(
+                DatabaseKind::SqlServer,
+                &t,
+                "T",
+                &cols,
+                1,
+                BatchWriteMode::Replace
+            )
+            .is_err()
+        );
+        assert!(
+            multi_write_sql_named(
+                DatabaseKind::Oracle,
+                &t,
+                "T",
+                &cols,
+                1,
+                BatchWriteMode::Upsert
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn batched_delete_generation() {
+        let filter = Where::new().eq("Status", 0);
+
+        // MySQL：DELETE ... LIMIT
+        let (sql, params) =
+            delete_batched_sql_named(DatabaseKind::MySql, "DH_Order", &filter, 100).unwrap();
+        assert_eq!(sql, "DELETE FROM `DH_Order` WHERE (`Status` = ?) LIMIT 100");
+        assert_eq!(params.len(), 1);
+
+        // SQL Server：DELETE TOP (n)
+        let (sql, _) =
+            delete_batched_sql_named(DatabaseKind::SqlServer, "DH_Order", &filter, 100).unwrap();
+        assert_eq!(sql, "DELETE TOP (100) FROM [DH_Order] WHERE ([Status] = @p0)");
+
+        // PostgreSQL：ctid 子查询
+        let (sql, _) =
+            delete_batched_sql_named(DatabaseKind::PostgreSql, "DH_Order", &filter, 100).unwrap();
+        assert_eq!(
+            sql,
+            "WITH _to_delete AS (SELECT ctid FROM \"DH_Order\" WHERE (\"Status\" = $1) LIMIT 100) \
+             DELETE FROM \"DH_Order\" WHERE ctid IN (SELECT ctid FROM _to_delete)"
+        );
+
+        // Oracle：ROWID + ROWNUM
+        let (sql, _) =
+            delete_batched_sql_named(DatabaseKind::Oracle, "DH_Order", &filter, 100).unwrap();
+        assert_eq!(
+            sql,
+            "DELETE FROM \"DH_Order\" WHERE ROWID IN (SELECT ROWID FROM \"DH_Order\" \
+             WHERE (\"Status\" = :1) AND ROWNUM<=100)"
+        );
+
+        // SQLite：rowid 子查询（本库增强；C# 未支持）
+        let (sql, _) =
+            delete_batched_sql_named(DatabaseKind::Sqlite, "DH_Order", &filter, 100).unwrap();
+        assert_eq!(
+            sql,
+            "DELETE FROM \"DH_Order\" WHERE rowid IN \
+             (SELECT rowid FROM \"DH_Order\" WHERE (\"Status\" = ?) LIMIT 100)"
+        );
+
+        // 无 WHERE：全表分批删除（不带 WHERE 子句）
+        let (sql, params) = delete_batched_sql_named(
+            DatabaseKind::MySql,
+            "DH_Order",
+            &Where::default(),
+            7,
+        )
+        .unwrap();
+        assert_eq!(sql, "DELETE FROM `DH_Order` LIMIT 7");
+        assert!(params.is_empty());
+
+        // 其余方言：None（调用方回退一次性删除）；批大小 0：None
+        assert!(delete_batched_sql_named(DatabaseKind::SqlServer, "T", &filter, 0).is_none());
+        assert!(delete_batched_sql_named(DatabaseKind::DuckDb, "T", &filter, 100).is_none());
+        assert!(delete_batched_sql_named(DatabaseKind::Firebird, "T", &filter, 100).is_none());
     }
 
     #[test]

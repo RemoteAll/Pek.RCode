@@ -59,15 +59,17 @@
 //! # }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
     dal::{Dal, TableRef},
+    entity_queue::EntityQueue,
     error::{Error, Result},
     query::{Query, Where},
     session::{DbRow, SqlSession},
     shards::TimeShardPolicy,
+    sqlbuild::BatchWriteMode,
     value::DbValue,
 };
 
@@ -166,6 +168,31 @@ pub trait Entity: Sized {
         if list.is_empty() {
             return Ok(0);
         }
+        let refs: Vec<&Self> = list.iter().collect();
+        Self::insert_batch_refs(dal, session, &refs, batch_size)
+    }
+
+    /// 批量插入的核心实现（引用列表；供 [`Entity::save_batch`] 复用）。
+    fn insert_batch_refs(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        list: &[&Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        Self::write_batch_refs(dal, session, list, BatchWriteMode::Insert, batch_size)
+    }
+
+    /// 通用批量写入的核心实现（引用列表；供各批量方法复用）。
+    fn write_batch_refs(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        list: &[&Self],
+        mode: BatchWriteMode,
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
         let rows: Vec<Vec<(&str, DbValue)>> = list
             .iter()
             .map(|entity| {
@@ -180,7 +207,123 @@ pub trait Entity: Sized {
             })
             .collect();
         let table = dal.table(Self::table())?;
-        table.insert_batch(session, &rows, batch_size)
+        table.write_batch(session, &rows, mode, batch_size)
+    }
+
+    /// 批量忽略重复插入（对应 C# `EntityExtension.BatchInsertIgnore`）：重复键静默跳过。
+    ///
+    /// 仅 SQLite/DuckDB（`Insert Or Ignore`）、MySQL（`Insert Ignore`）、PostgreSQL（`On Conflict Do Nothing`）
+    /// 支持多行实现；其余方言报 [`Error::Unsupported`]（无安全回退，与 C# 一致）。
+    fn insert_ignore_batch(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        list: &[Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let refs: Vec<&Self> = list.iter().collect();
+        Self::write_batch_refs(dal, session, &refs, BatchWriteMode::InsertIgnore, batch_size)
+    }
+
+    /// 批量替换插入（对应 C# `EntityExtension.BatchReplace`）：按主键/唯一键替换整行。
+    ///
+    /// 仅 SQLite/DuckDB（`Insert Or Replace`）、MySQL（`Replace Into`）支持；其余方言报错（与 C# 一致）。
+    fn replace_batch(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        list: &[Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let refs: Vec<&Self> = list.iter().collect();
+        Self::write_batch_refs(dal, session, &refs, BatchWriteMode::Replace, batch_size)
+    }
+
+    /// 批量插入或更新（对应 C# `EntityExtension.Save(list)` 的 Upsert 语义）：按主键冲突更新非主键列。
+    ///
+    /// - SQLite/DuckDB/PostgreSQL 生成 `On Conflict(pk) Do Update`、MySQL 生成 `On Duplicate Key Update`，
+    ///   多行一条语句；其余方言回退逐行（查主键后更新/插入，同队列 Upsert）；
+    /// - 存在自增列时**不允许部分指定主键、部分不指定**（对齐 C# `Save(list)` 的 `NotSupportedException`）；
+    /// - 无自增的雪花主键请先填值，分表场景用 [`Entity::upsert_batch_sharded`]（自动生成并路由）。
+    fn upsert_batch(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        list: &[Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let refs: Vec<&Self> = list.iter().collect();
+        Self::ensure_identity_uniform(&refs)?;
+        Self::write_batch_refs(dal, session, &refs, BatchWriteMode::Upsert, batch_size)
+    }
+
+    /// 批量按主键更新（对应 C# `EntityExtension.BatchUpdate`）：逐条 `Update`（无批更新能力的方言行为一致）。
+    fn update_batch(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        list: &[Self],
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let table = dal.table(Self::table())?;
+        let mut total = 0u64;
+        for entity in list {
+            total += entity.update_with(&table, session)?;
+        }
+        Ok(total)
+    }
+
+    /// 批量更新到各自分表（逐条按分表值路由更新；返回受影响行数合计）。
+    fn update_batch_sharded(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+        list: &[Self],
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        for entity in list {
+            total += entity.update_sharded(dal, session, policy)?;
+        }
+        Ok(total)
+    }
+
+    /// 自增列一致性检查（对齐 C# `Save(list)`：存在自增列时不允许"部分指定主键、部分不指定"）。
+    fn ensure_identity_uniform(list: &[&Self]) -> Result<()> {
+        let Some(id) = Self::identity_column() else {
+            return Ok(());
+        };
+        let mut empty = false;
+        let mut full = false;
+        for entity in list {
+            let value = entity
+                .to_fields()
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(id))
+                .map(|(_, value)| value)
+                .unwrap_or(DbValue::Null);
+            if is_empty_pk_value(&value) {
+                empty = true;
+            } else {
+                full = true;
+            }
+            if empty && full {
+                return Err(Error::Unsupported(format!(
+                    "实体 {} 存在自增列时不能同时包含新增与更新数据（对齐 C# Save(list)）",
+                    Self::table()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// 按主键更新（主键值与自增列不参与 SET），返回受影响行数。
@@ -222,27 +365,81 @@ pub trait Entity: Sized {
     /// - 有自增列：主键值为 0/NULL 视为新增，否则更新
     /// - 无自增列：按主键行是否存在决定新增或更新
     fn save(&mut self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
+        if is_new_entity(dal, session, self)? {
+            self.insert(dal, session)?;
+            Ok(1)
+        } else {
+            self.update(dal, session)
+        }
+    }
+
+    /// 批量保存（对应 C# `EntityExtension.Save(list)`）：逐实体按 [`Entity::save`] 的规则拆分，
+    /// **新增合并为多行批量插入**，已存在逐条更新（与 C# 无批更新能力时的回退一致）。
+    ///
+    /// - 与 C# 的差异：C# 对"主键非空且非来自数据库"的实体走 Upsert（行不存在则插入）；
+    ///   本库按单实体 `Save` 规则处理（自增列非零 → 直接更新），需要"确保存在"请用 Upsert 能力或在业务侧判断；
+    /// - **不回写自增主键**（批量插入限制，与 C# `BatchInsert` 一致）；雪花主键请先填值
+    ///   （分表场景用 [`Entity::save_batch_sharded`] 自动生成）；
+    /// - 返回受影响行数。
+    fn save_batch(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        list: &[Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let mut news: Vec<usize> = Vec::new();
+        let mut total = 0u64;
+        for (index, entity) in list.iter().enumerate() {
+            if is_new_entity(dal, session, entity)? {
+                news.push(index);
+            } else {
+                total += entity.update(dal, session)?;
+            }
+        }
+        if !news.is_empty() {
+            let refs: Vec<&Self> = news.iter().map(|&index| &list[index]).collect();
+            total += Self::insert_batch_refs(dal, session, &refs, batch_size)?;
+        }
+        Ok(total)
+    }
+
+    /// 保存入队（对应 C# `Entity.SaveAsync(msDelay)` 的入队语义；落库由 [`EntityQueue::flush`] 批量执行）：
+    ///
+    /// - 有自增列且值为 0（或缺失）、或无主键值 → 按**插入**入队
+    ///   （flush 时连续 Insert 段合并为多行批量插入，适合日志表等只插入场景）；
+    /// - 其余 → 按 **Upsert** 入队（flush 时按主键存在性更新/插入，与单实体 [`Entity::save`] 的最终行状态一致）；
+    /// - 达到队列批大小自动 flush，或由调用方显式 [`EntityQueue::flush`]；
+    /// - 与 C# 的差异：无内置定时器与 `msDelay` 延迟集合（由调用方用 `dhrust::threading::Timer`
+    ///   或异步任务驱动 flush）、无同实体去重、不感知分表（分表批量落库请用 [`Entity::save_batch_sharded`]）；
+    /// - 雪花主键请先填值（本方法无分表策略上下文，无法自动生成）。
+    fn enqueue_save(
+        &mut self,
+        queue: &mut EntityQueue,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+    ) -> Result<()> {
+        let fields = self.to_fields();
         let is_new = match Self::identity_column() {
             Some(id) => {
-                let value = self
-                    .to_fields()
-                    .into_iter()
+                let value = fields
+                    .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case(id))
                     .map(|(_, value)| value);
                 !matches!(value.and_then(|v| v.as_i64()), Some(v) if v != 0)
             }
             None => {
-                let fields = self.to_fields();
                 let pk = pk_values_of(&fields, Self::primary_keys())?;
-                Self::find(dal, session, &pk)?.is_none()
+                pk.iter().all(is_empty_pk_value)
             }
         };
-
         if is_new {
-            self.insert(dal, session)?;
-            Ok(1)
+            queue.insert(dal, session, &fields)
         } else {
-            self.update(dal, session)
+            let pk = pk_values_of(&fields, Self::primary_keys())?;
+            queue.upsert(dal, session, &pk, &fields)
         }
     }
 
@@ -429,6 +626,50 @@ pub trait Entity: Sized {
         list: &mut [Self],
         batch_size: Option<usize>,
     ) -> Result<u64> {
+        let mut refs: Vec<&mut Self> = list.iter_mut().collect();
+        Self::write_batch_sharded_refs(
+            dal,
+            session,
+            policy,
+            &mut refs,
+            BatchWriteMode::Insert,
+            batch_size,
+        )
+    }
+
+    /// 批量插入或更新到各自分表（Upsert 模式；分表路由、拦截器、雪花生成同 [`Entity::insert_batch_sharded`]）。
+    ///
+    /// 存在自增列时不允许部分指定主键、部分不指定（对齐 C# `Save(list)`）。
+    fn upsert_batch_sharded(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+        list: &mut [Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        let check: Vec<&Self> = list.iter().collect();
+        Self::ensure_identity_uniform(&check)?;
+        let mut refs: Vec<&mut Self> = list.iter_mut().collect();
+        Self::write_batch_sharded_refs(
+            dal,
+            session,
+            policy,
+            &mut refs,
+            BatchWriteMode::Upsert,
+            batch_size,
+        )
+    }
+
+    /// 分表批量写入的核心实现（可变引用列表；供 [`Entity::insert_batch_sharded`] /
+    /// [`Entity::upsert_batch_sharded`] / [`Entity::save_batch_sharded`] 复用）。
+    fn write_batch_sharded_refs(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+        list: &mut [&mut Self],
+        mode: BatchWriteMode,
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
         if list.is_empty() {
             return Ok(0);
         }
@@ -441,6 +682,7 @@ pub trait Entity: Sized {
 
         // 阶段一：拦截器补全 → 回写 → 雪花生成 → 分片解析，按（连接, 物理表）分组
         for entity in list.iter_mut() {
+            let entity: &mut Self = entity;
             let fields = entity.to_fields();
             let own_value = fields
                 .iter()
@@ -546,7 +788,7 @@ pub trait Entity: Sized {
                 group_dal.ensure_shard_table(Self::table(), &group.physical)?;
             }
             let table = group_dal.table_as(Self::table(), &group.physical)?;
-            affected += table.insert_batch_prepared(group_session, &group.payload, batch_size)?;
+            affected += table.write_batch_prepared(group_session, &group.payload, mode, batch_size)?;
         }
         Ok(affected)
     }
@@ -781,6 +1023,86 @@ pub trait Entity: Sized {
         }
     }
 
+    /// 批量保存到各自分表（分表场景的批量 `Save`）：逐实体按 `save` 规则拆分，
+    /// **新增合并为分组批量插入**（自动生成雪花、自动建分表、跨库自动路由），
+    /// 已存在逐条更新到对应分表。返回受影响行数。
+    ///
+    /// - 判定规则与单实体一致：自增列 0/缺失 → 新增；无自增 → 主键全空视为新增，
+    ///   否则在解析出的分表上按主键查询存在性（分表不存在视为新增）；
+    /// - **不回写自增主键**（批量插入限制）；雪花主键自动生成并回写（同 [`Entity::insert_batch_sharded`]）。
+    fn save_batch_sharded(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+        list: &mut [Self],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let mut news: Vec<usize> = Vec::new();
+        let mut total = 0u64;
+        for (index, entity) in list.iter().enumerate() {
+            let is_new = match Self::identity_column() {
+                Some(id) => {
+                    let value = entity
+                        .to_fields()
+                        .into_iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(id))
+                        .map(|(_, value)| value);
+                    !matches!(value.and_then(|v| v.as_i64()), Some(v) if v != 0)
+                }
+                None => {
+                    let fields = entity.to_fields();
+                    let pk = pk_values_of(&fields, Self::primary_keys())?;
+                    if pk.iter().all(is_empty_pk_value) {
+                        true
+                    } else {
+                        let value = shard_value_of(entity, policy)?;
+                        match resolve_shard_target::<Self>(dal, policy, &value)? {
+                            Some(target) => run_on_shard_target(
+                                &target,
+                                dal,
+                                Self::table(),
+                                session,
+                                |t, s| {
+                                    if !s.table_exists(t.physical_name())? {
+                                        return Ok(true);
+                                    }
+                                    Ok(t.find_by_pk(s, &pk)?.is_none())
+                                },
+                            )?,
+                            None => Self::find(dal, session, &pk)?.is_none(),
+                        }
+                    }
+                }
+            };
+            if is_new {
+                news.push(index);
+            } else {
+                total += entity.update_sharded(dal, session, policy)?;
+            }
+        }
+        if !news.is_empty() {
+            let news_set: HashSet<usize> = news.iter().copied().collect();
+            let mut refs: Vec<&mut Self> = list
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| news_set.contains(index))
+                .map(|(_, entity)| entity)
+                .collect();
+            total += Self::write_batch_sharded_refs(
+                dal,
+                session,
+                policy,
+                &mut refs,
+                BatchWriteMode::Insert,
+                batch_size,
+            )?;
+        }
+        Ok(total)
+    }
+
     /// 按分表值 + 主键查询单条记录（对应 C# `FindByKey` 的分表分支）：
     /// `value` 为分表字段值（时间或雪花 Id，如主键即分表字段可直接传主键值）；
     /// **不存在的分表直接返回 `None`，不自动建表**。
@@ -940,6 +1262,33 @@ where
             let mut own = d.open_session()?;
             func(&handle, own.as_mut())
         }
+    }
+}
+
+/// 新增判定（与单实体 `save` 一致）：自增列 0/缺失 → 新增；无自增列 → 按主键查库判断存在性。
+fn is_new_entity<E: Entity>(dal: &Dal, session: &mut dyn SqlSession, entity: &E) -> Result<bool> {
+    match E::identity_column() {
+        Some(id) => {
+            let value = entity
+                .to_fields()
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(id))
+                .map(|(_, value)| value);
+            Ok(!matches!(value.and_then(|v| v.as_i64()), Some(v) if v != 0))
+        }
+        None => {
+            let pk = pk_values_of(&entity.to_fields(), E::primary_keys())?;
+            Ok(E::find(dal, session, &pk)?.is_none())
+        }
+    }
+}
+
+/// 主键值是否为空（NULL / 数值 0 / 空串）——"主键全空视为新增"判定用（对齐 C# `IsNullKey` 语义）。
+fn is_empty_pk_value(value: &DbValue) -> bool {
+    match value {
+        DbValue::Null => true,
+        DbValue::Text(text) => text.is_empty(),
+        other => other.as_i64() == Some(0),
     }
 }
 

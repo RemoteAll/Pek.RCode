@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt,
     sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 
 use crate::cache::{EntityCache, SingleCache};
@@ -20,6 +21,7 @@ use crate::pool::{PoolOptions, PoolStats, SessionPool};
 use crate::query::{Query, Where};
 use crate::session::{DbRow, RowSet, SqlSession};
 use crate::sqlbuild;
+use crate::sqlbuild::BatchWriteMode;
 use crate::sqlite::SqliteSession;
 use crate::value::DbValue;
 
@@ -1364,6 +1366,29 @@ impl<'a> TableRef<'a> {
         rows: &[Vec<(&str, DbValue)>],
         batch_size: Option<usize>,
     ) -> Result<u64> {
+        self.write_batch(session, rows, BatchWriteMode::Insert, batch_size)
+    }
+
+    /// 通用批量写入（对应 C# `IDbSession.Insert / InsertIgnore / Replace / Upsert` 的多行实现）。
+    ///
+    /// - `rows`：每行一组 `(字段, 值)`；列集以首行为准，其余行按列名（大小写不敏感）投影，缺失补 `NULL`；
+    /// - 每行先执行拦截器补全（与单行 [`TableRef::insert`] 一致）；
+    /// - **首行自增列为 0 或缺失 → 整批排除自增列**（由数据库生成；对齐 C# `BuildInsertColumns`，
+    ///   需要显式指定自增值时请按"含/不含自增值"拆批调用）；
+    /// - 模式支持：`Insert`（不支持多行的方言回退逐行）、`InsertIgnore`/`Replace`（方言不支持时报错，
+    ///   无安全回退）、`Upsert`（SQLite/MySQL/PostgreSQL/DuckDB 多行 `On Conflict`；其余方言回退逐行
+    ///   ——查主键后更新/插入）；
+    /// - `batch_size` 默认 [`crate::batch::DEFAULT_INSERT_BATCH_SIZE`] = 5000，再按数据库单语句参数上限收紧；
+    /// - **不保证回写自增主键**（与 C# `BatchInsert` 一致）；无自增的雪花主键请先填值
+    ///   （分表批量 [`crate::entity::Entity::insert_batch_sharded`] / [`crate::entity::Entity::upsert_batch_sharded`] 会自动生成）；
+    /// - 返回受影响行数；任一分块失败即中止（已执行的分块不回滚，需要原子性请自行包裹事务）。
+    pub fn write_batch(
+        &self,
+        session: &mut dyn SqlSession,
+        rows: &[Vec<(&str, DbValue)>],
+        mode: BatchWriteMode,
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
         let prepared: Vec<Vec<(String, DbValue)>> = rows
             .iter()
             .map(|fields| {
@@ -1374,14 +1399,15 @@ impl<'a> TableRef<'a> {
                 )
             })
             .collect();
-        self.insert_batch_prepared(session, &prepared, batch_size)
+        self.write_batch_prepared(session, &prepared, mode, batch_size)
     }
 
-    /// 批量插入（**已执行拦截器补全**的行；分表批量路径复用，避免拦截器重复执行）。
-    pub(crate) fn insert_batch_prepared(
+    /// 通用批量写入（**已执行拦截器补全**的行；分表批量路径复用，避免拦截器重复执行）。
+    pub(crate) fn write_batch_prepared(
         &self,
         session: &mut dyn SqlSession,
         rows: &[Vec<(String, DbValue)>],
+        mode: BatchWriteMode,
         batch_size: Option<usize>,
     ) -> Result<u64> {
         let rows: Vec<&Vec<(String, DbValue)>> = rows.iter().filter(|r| !r.is_empty()).collect();
@@ -1411,52 +1437,138 @@ impl<'a> TableRef<'a> {
             .collect();
         if columns.is_empty() {
             return Err(Error::Model(format!(
-                "表 {} 的批量插入没有可写字段",
+                "表 {} 的批量写入没有可写字段",
                 self.table.name
             )));
         }
 
         let mut affected = 0u64;
-        if self.dal.kind.supports_multi_row_insert() {
-            let max_params = self.dal.kind.max_statement_params();
-            let per_statement = if max_params == 0 {
-                batch
-            } else {
-                (max_params / columns.len()).clamp(1, batch)
-            };
-            for chunk in rows.chunks(per_statement) {
-                let sql = sqlbuild::insert_multi_sql_named(
-                    self.dal.kind,
-                    self.table,
-                    self.physical_name(),
-                    &columns,
-                    chunk.len(),
-                )?;
-                let mut params = Vec::with_capacity(chunk.len() * columns.len());
-                for row in chunk {
-                    for column in &columns {
-                        // 按列名投影（大小写不敏感；缺失补 NULL）
-                        params.push(
-                            row.iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case(column))
-                                .map(|(_, v)| v.clone())
-                                .unwrap_or(DbValue::Null),
-                        );
+        match mode {
+            BatchWriteMode::Insert => {
+                if self.dal.kind.supports_multi_row_insert() {
+                    affected += self.exec_multi_write(session, &rows, &columns, batch, mode)?;
+                } else {
+                    // 回退逐行（拦截器已补全，不再重复执行）
+                    for row in &rows {
+                        let fields: Vec<(&str, DbValue)> =
+                            row.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                        let _ = self.insert_prepared(session, &fields)?;
+                        affected += 1;
                     }
                 }
-                self.dal.log_sql(&sql);
-                affected += session.execute(&sql, &params)?;
             }
+            BatchWriteMode::InsertIgnore | BatchWriteMode::Replace => {
+                // 方言不支持时由 SQL 组装报错（无安全回退）
+                affected += self.exec_multi_write(session, &rows, &columns, batch, mode)?;
+            }
+            BatchWriteMode::Upsert => {
+                if self.dal.kind.supports_multi_upsert() {
+                    affected += self.exec_multi_write(session, &rows, &columns, batch, mode)?;
+                } else {
+                    // 回退：逐行查主键后更新/插入（与队列 Upsert 同语义）
+                    affected += self.upsert_rows_fallback(session, &rows)?;
+                }
+            }
+        }
+        self.dal.invalidate_cache(self.physical_name());
+        Ok(affected)
+    }
+
+    /// 多行写入执行（按参数上限与批大小分块；供各模式复用）。
+    fn exec_multi_write(
+        &self,
+        session: &mut dyn SqlSession,
+        rows: &[&Vec<(String, DbValue)>],
+        columns: &[&str],
+        batch: usize,
+        mode: BatchWriteMode,
+    ) -> Result<u64> {
+        let max_params = self.dal.kind.max_statement_params();
+        let per_statement = if max_params == 0 {
+            batch
         } else {
-            // 回退逐行（拦截器已补全，不再重复执行）
-            for row in rows {
+            (max_params / columns.len()).clamp(1, batch)
+        };
+        let mut affected = 0u64;
+        for chunk in rows.chunks(per_statement) {
+            let sql = sqlbuild::multi_write_sql_named(
+                self.dal.kind,
+                self.table,
+                self.physical_name(),
+                columns,
+                chunk.len(),
+                mode,
+            )?;
+            let mut params = Vec::with_capacity(chunk.len() * columns.len());
+            for row in chunk {
+                for column in columns {
+                    // 按列名投影（大小写不敏感；缺失补 NULL）
+                    params.push(
+                        row.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(column))
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(DbValue::Null),
+                    );
+                }
+            }
+            self.dal.log_sql(&sql);
+            affected += session.execute(&sql, &params)?;
+        }
+        Ok(affected)
+    }
+
+    /// Upsert 的逐行回退（方言不支持多行 `On Conflict` 时）：查主键存在则更新、否则插入。
+    fn upsert_rows_fallback(
+        &self,
+        session: &mut dyn SqlSession,
+        rows: &[&Vec<(String, DbValue)>],
+    ) -> Result<u64> {
+        let pks: Vec<String> = self
+            .table
+            .primary_keys()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        if pks.is_empty() {
+            return Err(Error::Model(format!(
+                "表 {} 没有主键，无法批量 Upsert",
+                self.table.name
+            )));
+        }
+        let identity = self.table.identity().map(|c| c.name.clone());
+        let mut affected = 0u64;
+        for row in rows {
+            let mut pk_values = Vec::with_capacity(pks.len());
+            for pk in &pks {
+                let value = row
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(pk))
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| {
+                        Error::Model(format!("批量 Upsert 行缺少主键列 {pk}"))
+                    })?;
+                pk_values.push(value);
+            }
+            let exists = self.find_by_pk(session, &pk_values)?.is_some();
+            if exists {
+                let sets: Vec<(&str, DbValue)> = row
+                    .iter()
+                    .filter(|(k, _)| {
+                        !pks.iter().any(|p| p.eq_ignore_ascii_case(k))
+                            && !identity.as_deref().is_some_and(|i| i.eq_ignore_ascii_case(k))
+                    })
+                    .map(|(k, v)| (k.as_str(), v.clone()))
+                    .collect();
+                if !sets.is_empty() {
+                    affected += self.update_by_pk(session, &sets, &pk_values)?;
+                }
+            } else {
                 let fields: Vec<(&str, DbValue)> =
                     row.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                 let _ = self.insert_prepared(session, &fields)?;
                 affected += 1;
             }
         }
-        self.dal.invalidate_cache(self.physical_name());
         Ok(affected)
     }
 
@@ -1484,6 +1596,63 @@ impl<'a> TableRef<'a> {
             affected += self.delete_where(session, &filter)?;
         }
         Ok(affected)
+    }
+
+    /// 分批删除（对应 C# `EntityPersistence.Delete(session, whereClause, maximumRows)`）：
+    /// 每批最多 `batch_size` 行（默认 [`crate::batch::DEFAULT_DELETE_WHERE_BATCH_SIZE`] = 10000，
+    /// 对齐 C# `Dal.GetBatchSize(10_000)`），批间按 `interval` 等待
+    /// （`None` = [`crate::batch::DEFAULT_BATCH_INTERVAL_MS`] 100ms，对齐 C# `XCodeSetting.BatchInterval`；
+    /// `Some(0)` = 不等待），避免一次性删除压垮数据库 IO。
+    ///
+    /// - 方言不支持分批删除时回退为一次性删除（与 C# 相同）；
+    /// - `max_rows`：最多删除行数（`None`/`0` = 全部），达到后停止；
+    /// - 批内语句不经过拦截器（与 C# 分批删除一致，直接执行 SQL）；返回实际删除行数。
+    pub fn delete_where_batched(
+        &self,
+        session: &mut dyn SqlSession,
+        filter: &Where,
+        batch_size: Option<usize>,
+        max_rows: Option<u64>,
+        interval: Option<Duration>,
+    ) -> Result<u64> {
+        let batch = batch_size
+            .unwrap_or(crate::batch::DEFAULT_DELETE_WHERE_BATCH_SIZE)
+            .max(1);
+        let wait = interval.unwrap_or_else(|| {
+            Duration::from_millis(crate::batch::DEFAULT_BATCH_INTERVAL_MS)
+        });
+        let max = max_rows.unwrap_or(0);
+        let mut total = 0u64;
+        loop {
+            let size = if max > 0 {
+                batch.min((max - total) as usize)
+            } else {
+                batch
+            };
+            if size == 0 {
+                break;
+            }
+            let Some((sql, params)) =
+                sqlbuild::delete_batched_sql_named(self.dal.kind, self.physical_name(), filter, size)
+            else {
+                // 方言不支持分批删除：回退一次性删除
+                return self.delete_where(session, filter);
+            };
+            self.dal.log_sql(&sql);
+            let rows = session.execute(&sql, &params)?;
+            total += rows;
+            if rows < size as u64 {
+                break;
+            }
+            if max > 0 && total >= max {
+                break;
+            }
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+        }
+        self.dal.invalidate_cache(self.physical_name());
+        Ok(total)
     }
 
     /// 按主键查找（主键值按 `TableMeta::primary_keys()` 顺序传入）。

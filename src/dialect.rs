@@ -143,6 +143,19 @@ impl DatabaseKind {
         }
     }
 
+    /// 是否支持多行 `Upsert`（SQLite/DuckDB/PostgreSQL `On Conflict Do Update`、MySQL `On Duplicate Key Update`）。
+    ///
+    /// 不支持时由 [`crate::dal::TableRef::write_batch`] 的 Upsert 模式回退逐行（查主键后更新/插入）。
+    pub fn supports_multi_upsert(&self) -> bool {
+        matches!(
+            self,
+            DatabaseKind::Sqlite
+                | DatabaseKind::MySql
+                | DatabaseKind::PostgreSql
+                | DatabaseKind::DuckDb
+        )
+    }
+
     /// 从连接串中的 `provider` 名称解析（兼容常见别名）。
     ///
     /// 与 DH.NCode 支持的库对应关系：

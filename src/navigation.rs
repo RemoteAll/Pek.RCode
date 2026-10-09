@@ -9,7 +9,10 @@
 //! - [`NavigationRegistry`]：按（源实体, 导航名）登记关系（本地实例或进程级全局表）；
 //! - [`Navigation::load_one`] / [`Navigation::load_many`]：给定外键/主键值装载目标实体（可指定
 //!   会话以复用连接/事务，对应 C# 的 `NavigationLoader`）；
-//! - [`load_one`] / [`load_many`]：按全局注册表登记的名字装载（对应 `HasOne/HasMany` 注册后的使用方式）。
+//! - [`Navigation::load_ones`] / [`Navigation::load_manys`]：**批量装载**（一次 `IN` 查询按值分组，
+//!   对应 C# LINQ `BatchLoadNavigations`，消除集合导航的 N+1）；
+//! - [`load_one`] / [`load_many`] / [`load_ones`] / [`load_manys`]：按全局注册表登记的名字装载
+//!   （对应 `HasOne/HasMany` 注册后的使用方式）。
 //!
 //! 与 C# 的差异（机制边界）：
 //!
@@ -35,6 +38,7 @@
 //! # }
 //! ```
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use crate::dal::Dal;
@@ -108,6 +112,62 @@ impl Navigation {
             Where::new().eq(self.foreign_key.clone(), primary_key_value.clone()),
         );
         E::query(dal, session, &query)
+    }
+
+    /// 批量装载引用目标（HasOne 批量版；对应 C# LINQ `BatchLoadNavigations` 的 HasOne 分支）。
+    ///
+    /// 收集 `fk_values`（去重、跳过 NULL）后**一次 `IN` 查询**，按目标主键值（`to_text` 归一）
+    /// 建索引返回；调用方对每个源实体用 `map.get(&fk.to_text())` 取引用目标（未命中即该值不存在）。
+    /// <param name="dal">数据访问层</param>
+    /// <param name="session">会话</param>
+    /// <param name="fk_values">源实体的外键值列表（可含重复与 NULL）</param>
+    /// <returns>目标主键值 → 目标实体</returns>
+    pub fn load_ones<E: Entity>(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        fk_values: &[DbValue],
+    ) -> Result<HashMap<String, E>> {
+        let Some(values) = dedup_non_null(fk_values) else {
+            return Ok(HashMap::new());
+        };
+        let query = Query::new().filter(Where::new().in_(self.primary_key.clone(), values));
+        let list = E::query(dal, session, &query)?;
+        let mut map = HashMap::with_capacity(list.len());
+        for entity in list {
+            if let Some(key) = entity_nav_key::<E>(&entity, &self.primary_key) {
+                map.insert(key, entity);
+            }
+        }
+        Ok(map)
+    }
+
+    /// 批量装载集合目标（HasMany 批量版；对应 C# LINQ `BatchLoadNavigations` 的 HasMany 分支）。
+    ///
+    /// 收集 `pk_values`（去重、跳过 NULL）后**一次 `IN` 查询**，按目标外键值分组返回；
+    /// 调用方对每个源实体用 `map.get(&pk.to_text())` 取集合（未命中即无子项）。
+    /// <param name="dal">数据访问层</param>
+    /// <param name="session">会话</param>
+    /// <param name="pk_values">源实体的主键值列表（可含重复与 NULL）</param>
+    /// <returns>源主键值 → 目标实体集合</returns>
+    pub fn load_manys<E: Entity>(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        pk_values: &[DbValue],
+    ) -> Result<HashMap<String, Vec<E>>> {
+        let Some(values) = dedup_non_null(pk_values) else {
+            return Ok(HashMap::new());
+        };
+        let query = Query::new().filter(Where::new().in_(self.foreign_key.clone(), values));
+        let list = E::query(dal, session, &query)?;
+        let mut map: HashMap<String, Vec<E>> = HashMap::new();
+        for entity in list {
+            if let Some(key) = entity_nav_key::<E>(&entity, &self.foreign_key) {
+                map.entry(key).or_default().push(entity);
+            }
+        }
+        Ok(map)
     }
 }
 
@@ -296,6 +356,74 @@ pub fn load_many<E: Entity>(
         crate::error::Error::Model(format!("导航关系未注册：{source}.{name}"))
     })?;
     nav.load_many(dal, session, primary_key_value)
+}
+
+/// 按全局注册表批量装载引用目标（HasOne 批量版）。
+/// <param name="dal">数据访问层</param>
+/// <param name="session">会话</param>
+/// <param name="source">源实体名</param>
+/// <param name="name">导航名</param>
+/// <param name="fk_values">源实体的外键值列表</param>
+/// <returns>目标主键值 → 目标实体</returns>
+pub fn load_ones<E: Entity>(
+    dal: &Dal,
+    session: &mut dyn SqlSession,
+    source: &str,
+    name: &str,
+    fk_values: &[DbValue],
+) -> Result<HashMap<String, E>> {
+    let nav = with_registry(|r| r.get(source, name).cloned());
+    let nav = nav.ok_or_else(|| {
+        crate::error::Error::Model(format!("导航关系未注册：{source}.{name}"))
+    })?;
+    nav.load_ones(dal, session, fk_values)
+}
+
+/// 按全局注册表批量装载集合目标（HasMany 批量版）。
+/// <param name="dal">数据访问层</param>
+/// <param name="session">会话</param>
+/// <param name="source">源实体名</param>
+/// <param name="name">导航名</param>
+/// <param name="pk_values">源实体的主键值列表</param>
+/// <returns>源主键值 → 目标实体集合</returns>
+pub fn load_manys<E: Entity>(
+    dal: &Dal,
+    session: &mut dyn SqlSession,
+    source: &str,
+    name: &str,
+    pk_values: &[DbValue],
+) -> Result<HashMap<String, Vec<E>>> {
+    let nav = with_registry(|r| r.get(source, name).cloned());
+    let nav = nav.ok_or_else(|| {
+        crate::error::Error::Model(format!("导航关系未注册：{source}.{name}"))
+    })?;
+    nav.load_manys(dal, session, pk_values)
+}
+
+/// 去重并剔除 NULL（空/全 NULL 返回 `None`；批量 `IN` 查询的取值准备）。
+fn dedup_non_null(values: &[DbValue]) -> Option<Vec<DbValue>> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut items: Vec<DbValue> = Vec::new();
+    for value in values {
+        if value.is_null() {
+            continue;
+        }
+        if seen.insert(value.to_text()) {
+            items.push(value.clone());
+        }
+    }
+    if items.is_empty() { None } else { Some(items) }
+}
+
+/// 取实体指定字段的值并归一为文本键（批量装载结果索引；字段缺失/为 NULL 返回 `None`）。
+fn entity_nav_key<E: Entity>(entity: &E, field: &str) -> Option<String> {
+    entity
+        .to_fields()
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(field))
+        .map(|(_, value)| value)
+        .filter(|value| !value.is_null())
+        .map(|value| value.to_text())
 }
 
 #[cfg(test)]
@@ -524,6 +652,78 @@ mod tests {
         let users = User::load(&set).unwrap();
         assert_eq!(users.len(), 2);
         assert_eq!(users[0].name.as_deref(), Some("Alice"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_load_navigations_over_sqlite() {
+        let (dal, dir) = temp_dal("batchload");
+        seed(&dal);
+
+        let mut nav = NavigationRegistry::new();
+        nav.has_one("Order", "User", "UserId", "Id");
+        nav.has_many("User", "Order", "Id", "UserId");
+
+        let mut session = dal.open_session().unwrap();
+
+        // HasOne 批量：一次 IN 查询按主键值索引（重复值/NULL 去重跳过）
+        let one = nav.get("Order", "User").unwrap();
+        let users: HashMap<String, User> = one
+            .load_ones(
+                &dal,
+                session.as_mut(),
+                &[
+                    DbValue::Int(1),
+                    DbValue::Int(2),
+                    DbValue::Int(1), // 重复
+                    DbValue::Null,   // NULL 跳过
+                ],
+            )
+            .unwrap();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users["1"].name.as_deref(), Some("Alice"));
+        assert_eq!(users["2"].name.as_deref(), Some("Bob"));
+        assert!(!users.contains_key("3")); // 不存在的值不产生条目
+
+        // HasMany 批量：一次 IN 查询按外键值分组
+        let many = nav.get("User", "Order").unwrap();
+        let orders: HashMap<String, Vec<Order>> = many
+            .load_manys(
+                &dal,
+                session.as_mut(),
+                &[DbValue::Int(1), DbValue::Int(2), DbValue::Int(9), DbValue::Null],
+            )
+            .unwrap();
+        assert_eq!(orders["1"].len(), 2);
+        assert_eq!(orders["2"].len(), 1);
+        assert!(!orders.contains_key("9")); // 无订单的源主键不产生条目
+
+        // 空/NULL 列表：不查询直接空表
+        assert!(
+            one.load_ones::<User>(&dal, session.as_mut(), &[]).unwrap().is_empty()
+        );
+        assert!(
+            many.load_manys::<Order>(&dal, session.as_mut(), &[DbValue::Null])
+                .unwrap()
+                .is_empty()
+        );
+
+        // 全局注册表路径
+        with_registry_mut(|r| {
+            r.has_one("Order", "User", "UserId", "Id");
+            r.has_many("User", "Order", "Id", "UserId");
+        });
+        let users: HashMap<String, User> =
+            load_ones(&dal, session.as_mut(), "Order", "User", &[DbValue::Int(2)]).unwrap();
+        assert_eq!(users["2"].name.as_deref(), Some("Bob"));
+        let orders: HashMap<String, Vec<Order>> =
+            load_manys(&dal, session.as_mut(), "User", "Order", &[DbValue::Int(1)]).unwrap();
+        assert_eq!(orders["1"].len(), 2);
+        assert!(
+            load_ones::<User>(&dal, session.as_mut(), "Order", "Nope", &[DbValue::Int(1)])
+                .is_err()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

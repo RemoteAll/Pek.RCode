@@ -1,10 +1,12 @@
 //! 批量写入端到端测试（真实 SQLite）：多行插入 / 分表分组批量插入 / 主键 IN 批量删除 /
 //! 性能基准（`#[ignore]`，手动运行）。
 //!
-//! 对照 C# `EntityExtension.Insert(list) / Delete(list)`（DH.NCode）：
+//! 对照 C# `EntityExtension.Insert(list) / Save(list) / Delete(list)`（DH.NCode）：
 //! - 普通批量插入：多行 `VALUES` + 按批分块（默认 5000，对齐 `DAL.GetBatchSize()`）；
 //! - 分表批量插入：提前计算分片 → 按（连接, 物理表）分组 → 分组批量插入；
-//! - 批量删除：单一主键按 `IN` 分批（默认 1000）；分表场景自动分组路由。
+//! - 批量保存：新增拆分合并批插、已存在逐条更新（对齐 `Save(list)`；分表版自动路由）；
+//! - 批量删除：单一主键按 `IN` 分批（默认 1000）；分表场景自动分组路由；
+//! - `SaveAsync` 等价物：`Entity::enqueue_save` 入队 + `EntityQueue::flush` 批量落库。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -470,6 +472,409 @@ fn delete_batch_uses_primary_key_in() {
     assert_eq!(
         TradeLog::delete_batch(&dal, session.as_mut(), &rows[3..], None).unwrap(),
         2
+    );
+    assert_eq!(TradeLog::count(&dal, session.as_mut(), None).unwrap(), 0);
+
+    dal.clear_pool();
+    drop(session);
+    drop(dal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 批量保存：按 `save` 规则拆分新增/更新——新增合并批量插入、已存在逐条更新。
+#[test]
+fn save_batch_splits_new_and_existing() {
+    let (dir, db) = temp_db("save");
+    let dal = open_dal(&db);
+    dal.sync_schema().unwrap();
+    let mut session = dal.open_session().unwrap();
+
+    // 先入库 3 行
+    let seed: Vec<TradeLog> = (0..3)
+        .map(|i| TradeLog::new(day(2026, 9, 1), &format!("s{i}")))
+        .collect();
+    TradeLog::insert_batch(&dal, session.as_mut(), &seed, None).unwrap();
+
+    // 2 行改值（已存在 → 更新）+ 1 行新增（id=0 → 批量插入）
+    let mut rows = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
+    rows[0].note = "u0".into();
+    rows[1].note = "u1".into();
+    let list = vec![
+        rows[0].clone(),
+        TradeLog::new(day(2026, 9, 2), "n1"),
+        rows[1].clone(),
+    ];
+    assert_eq!(
+        TradeLog::save_batch(&dal, session.as_mut(), &list, None).unwrap(),
+        3
+    );
+    let all = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
+    assert_eq!(all.len(), 4);
+    for note in ["u0", "u1", "n1"] {
+        assert!(all.iter().any(|r| r.note == note), "缺少 {note}");
+    }
+
+    // 分表批量保存：新增落到各自分片（含自动建表），已存在更新到原分片
+    let policy = TimeShardPolicy::new("CreateTime").with_table_policy("{0}_{1:yyyyMMdd}");
+    let mut shard_rows = vec![
+        TradeLog::new(day(2026, 9, 3), "x1"),
+        TradeLog::new(day(2026, 9, 3), "x2"),
+    ];
+    TradeLog::insert_batch_sharded(&dal, session.as_mut(), &policy, &mut shard_rows, None).unwrap();
+    let shard_existing = TradeLog::query_sharded(
+        &dal,
+        session.as_mut(),
+        &policy,
+        &Query::new().filter(
+            Where::new()
+                .ge("CreateTime", day(2026, 9, 3))
+                .lt("CreateTime", day(2026, 9, 4)),
+        ),
+    )
+    .unwrap();
+    assert_eq!(shard_existing.len(), 2);
+    let mut mixed = vec![
+        {
+            let mut row = shard_existing[0].clone();
+            row.note = "x1-updated".into();
+            row
+        },
+        TradeLog::new(day(2026, 9, 4), "x3"),
+    ];
+    assert_eq!(
+        TradeLog::save_batch_sharded(&dal, session.as_mut(), &policy, &mut mixed, None).unwrap(),
+        2
+    );
+    assert!(session.table_exists("TradeLog_20260904").unwrap());
+    let after = TradeLog::query_sharded(
+        &dal,
+        session.as_mut(),
+        &policy,
+        &Query::new().filter(
+            Where::new()
+                .ge("CreateTime", day(2026, 9, 3))
+                .lt("CreateTime", day(2026, 9, 10)),
+        ),
+    )
+    .unwrap();
+    assert_eq!(after.len(), 3, "9-3 两行 + 9-4 一行");
+    assert!(after.iter().any(|r| r.note == "x1-updated"));
+
+    dal.clear_pool();
+    drop(session);
+    drop(dal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 保存入队（`SaveAsync` 等价物）：新增走插入入队（落库合并批量），已存在走 Upsert 入队。
+#[test]
+fn enqueue_save_flushes_insert_and_upsert() {
+    use pek_rcode::entity_queue::EntityQueue;
+
+    let (dir, db) = temp_db("enqueue");
+    let dal = open_dal(&db);
+    dal.sync_schema().unwrap();
+    let mut session = dal.open_session().unwrap();
+    let mut queue = EntityQueue::new("TradeLog");
+
+    // 新增（id=0）→ 插入入队（未达批大小，显式 flush）
+    let mut fresh = TradeLog::new(day(2026, 9, 1), "q1");
+    fresh
+        .enqueue_save(&mut queue, &dal, session.as_mut())
+        .unwrap();
+    assert_eq!(queue.len(), 1);
+    let stats = queue.flush(&dal, session.as_mut()).unwrap();
+    assert_eq!(stats.inserted, 1);
+    assert_eq!(TradeLog::count(&dal, session.as_mut(), None).unwrap(), 1);
+
+    // 已存在（id>0）→ Upsert 入队（flush 时按主键存在性更新）
+    let mut rows = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
+    rows[0].note = "q1-updated".into();
+    rows[0]
+        .enqueue_save(&mut queue, &dal, session.as_mut())
+        .unwrap();
+    queue.flush(&dal, session.as_mut()).unwrap();
+    let again = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
+    assert_eq!(again.len(), 1, "Upsert 不应重复插入");
+    assert_eq!(again[0].note, "q1-updated");
+
+    dal.clear_pool();
+    drop(session);
+    drop(dal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 批量 Upsert：新行插入、已有行按主键更新（幂等重跑），混合自增主键报错（对齐 C# `Save(list)`）。
+#[test]
+fn upsert_batch_is_idempotent_and_updates() {
+    let (dir, db) = temp_db("upsert");
+    let dal = open_dal(&db);
+    dal.sync_schema().unwrap();
+    let mut session = dal.open_session().unwrap();
+
+    // 全新增（Id=0，整批排除自增列）：Upsert 退化为插入
+    let fresh = vec![
+        TradeLog::new(day(2026, 9, 1), "u1"),
+        TradeLog::new(day(2026, 9, 2), "u2"),
+    ];
+    assert_eq!(
+        TradeLog::upsert_batch(&dal, session.as_mut(), &fresh, None).unwrap(),
+        2
+    );
+    assert_eq!(TradeLog::count(&dal, session.as_mut(), None).unwrap(), 2);
+
+    // 幂等重跑：读回（含自增 Id）改值后再 Upsert → 按主键更新，不新增
+    let mut rows = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.note = format!("u{}-v2", index + 1);
+        row.create_time = day(2026, 10, 1);
+    }
+    TradeLog::upsert_batch(&dal, session.as_mut(), &rows, None).unwrap();
+    let again = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
+    assert_eq!(again.len(), 2, "Upsert 不应重复插入");
+    assert!(again.iter().all(|r| r.note.ends_with("-v2")));
+    assert!(again.iter().all(|r| r.create_time == day(2026, 10, 1)));
+
+    // 原样再跑一遍：结果稳定（幂等）
+    TradeLog::upsert_batch(&dal, session.as_mut(), &again, None).unwrap();
+    assert_eq!(TradeLog::count(&dal, session.as_mut(), None).unwrap(), 2);
+
+    // 混合自增主键（部分 0、部分非 0）→ 拒绝（对齐 C# `Save(list)` 的 NotSupportedException）
+    let mixed = vec![
+        TradeLog::new(day(2026, 9, 1), "m1"),
+        TradeLog {
+            id: again[0].id,
+            ..TradeLog::new(day(2026, 9, 1), "m2")
+        },
+    ];
+    let err = TradeLog::upsert_batch(&dal, session.as_mut(), &mixed, None).unwrap_err();
+    assert!(err.to_string().contains("自增列"), "{err}");
+
+    // 空列表：0 行
+    assert_eq!(
+        TradeLog::upsert_batch(&dal, session.as_mut(), &[], None).unwrap(),
+        0
+    );
+
+    dal.clear_pool();
+    drop(session);
+    drop(dal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 批量 InsertIgnore / Replace（SQLite 原生 `Insert Or Ignore` / `Insert Or Replace`）。
+#[test]
+fn insert_ignore_and_replace_batch() {
+    let (dir, db) = temp_db("ignore-replace");
+    let dal = open_dal(&db);
+    dal.sync_schema().unwrap();
+    let mut session = dal.open_session().unwrap();
+
+    // Replace：显式 Id 首插（无冲突即普通插入）
+    let mut first = TradeLog::new(day(2026, 9, 1), "r1");
+    first.id = 10;
+    let mut second = TradeLog::new(day(2026, 9, 2), "r2");
+    second.id = 11;
+    assert_eq!(
+        TradeLog::replace_batch(&dal, session.as_mut(), &[first, second], None).unwrap(),
+        2
+    );
+
+    // Replace 覆盖：同 Id 换值 → 整行替换、不新增
+    let replace = vec![TradeLog {
+        id: 10,
+        ..TradeLog::new(day(2026, 12, 31), "r1-v2")
+    }];
+    TradeLog::replace_batch(&dal, session.as_mut(), &replace, None).unwrap();
+    let rows = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
+    assert_eq!(rows.len(), 2, "Replace 不应新增行");
+    let r1 = rows.iter().find(|r| r.id == 10).unwrap();
+    assert_eq!(r1.note, "r1-v2");
+    assert_eq!(r1.create_time, day(2026, 12, 31));
+
+    // InsertIgnore：重复 Id 静默跳过、新 Id 正常插入
+    let mut dup10 = TradeLog::new(day(2026, 9, 1), "dup");
+    dup10.id = 10;
+    let mut dup11 = TradeLog::new(day(2026, 9, 1), "dup");
+    dup11.id = 11;
+    let mut fresh12 = TradeLog::new(day(2026, 9, 3), "i3");
+    fresh12.id = 12;
+    let affected =
+        TradeLog::insert_ignore_batch(&dal, session.as_mut(), &[dup10, dup11, fresh12], None)
+            .unwrap();
+    assert_eq!(affected, 1, "仅新 Id 计入受影响行数");
+    let rows = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
+    assert_eq!(rows.len(), 3);
+    let r10 = rows.iter().find(|r| r.id == 10).unwrap();
+    assert_eq!(r10.note, "r1-v2", "重复行应保持原值");
+
+    dal.clear_pool();
+    drop(session);
+    drop(dal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 分表批量 Upsert + 分表批量更新：按分片路由、批量 `On Conflict` 更新、逐条更新回退。
+#[test]
+fn upsert_and_update_batch_sharded() {
+    let (dir, db) = temp_db("upsert-sharded");
+    let dal = open_dal(&db);
+    dal.sync_schema().unwrap();
+    let policy = TimeShardPolicy::new("CreateTime").with_table_policy("{0}_{1:yyyyMM}");
+    let mut session = dal.open_session().unwrap();
+
+    // 全新增：落到 202609 分表（自动建表）
+    let mut list = vec![
+        TradeLog::new(day(2026, 9, 1), "s1"),
+        TradeLog::new(day(2026, 9, 20), "s2"),
+    ];
+    assert_eq!(
+        TradeLog::upsert_batch_sharded(&dal, session.as_mut(), &policy, &mut list, None).unwrap(),
+        2
+    );
+    assert!(
+        session.table_exists("TradeLog_202609").unwrap(),
+        "分表应自动创建"
+    );
+
+    // 修改后再 Upsert（同分片）：按主键更新、不新增
+    let range = Where::new()
+        .ge("CreateTime", day(2026, 9, 1))
+        .lt("CreateTime", day(2026, 10, 1));
+    let mut rows = TradeLog::query_sharded(
+        &dal,
+        session.as_mut(),
+        &policy,
+        &Query::new().filter(range.clone()),
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows.iter_mut() {
+        row.note = format!("{}-v2", row.note);
+    }
+    TradeLog::upsert_batch_sharded(&dal, session.as_mut(), &policy, &mut rows, None).unwrap();
+    let again = TradeLog::query_sharded(
+        &dal,
+        session.as_mut(),
+        &policy,
+        &Query::new().filter(range.clone()),
+    )
+    .unwrap();
+    assert_eq!(again.len(), 2, "分表 Upsert 不应重复插入");
+    assert!(again.iter().all(|r| r.note.ends_with("-v2")));
+
+    // 分表批量更新：逐条按分片路由更新
+    let mut rows = again;
+    for row in rows.iter_mut() {
+        row.note = format!("{}-v3", row.note);
+    }
+    assert_eq!(
+        TradeLog::update_batch_sharded(&dal, session.as_mut(), &policy, &rows).unwrap(),
+        2
+    );
+    let final_rows = TradeLog::query_sharded(
+        &dal,
+        session.as_mut(),
+        &policy,
+        &Query::new().filter(range),
+    )
+    .unwrap();
+    assert!(final_rows.iter().all(|r| r.note.ends_with("-v3")));
+    assert_eq!(
+        TradeLog::update_batch_sharded(&dal, session.as_mut(), &policy, &[]).unwrap(),
+        0
+    );
+
+    dal.clear_pool();
+    drop(session);
+    drop(dal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 普通批量更新：逐条按主键更新（对齐 C# `EntityExtension.BatchUpdate` 的回退语义）。
+#[test]
+fn update_batch_updates_by_primary_key() {
+    let (dir, db) = temp_db("update-batch");
+    let dal = open_dal(&db);
+    dal.sync_schema().unwrap();
+    let mut session = dal.open_session().unwrap();
+
+    let rows = vec![
+        TradeLog::new(day(2026, 9, 1), "b1"),
+        TradeLog::new(day(2026, 9, 2), "b2"),
+        TradeLog::new(day(2026, 9, 3), "b3"),
+    ];
+    TradeLog::insert_batch(&dal, session.as_mut(), &rows, None).unwrap();
+
+    let mut rows = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
+    for row in rows.iter_mut() {
+        row.note = format!("{}-upd", row.note);
+    }
+    assert_eq!(
+        TradeLog::update_batch(&dal, session.as_mut(), &rows).unwrap(),
+        3
+    );
+    let again = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
+    assert_eq!(again.len(), 3);
+    assert!(again.iter().all(|r| r.note.ends_with("-upd")));
+    assert_eq!(TradeLog::update_batch(&dal, session.as_mut(), &[]).unwrap(), 0);
+
+    dal.clear_pool();
+    drop(session);
+    drop(dal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 分批删除：按批循环直至清空、`max_rows` 截断、方言支持时走 LIMIT 批语句（SQLite rowid）。
+#[test]
+fn delete_where_batched_loops_until_empty() {
+    use std::time::Duration;
+
+    let (dir, db) = temp_db("delete-batched");
+    let dal = open_dal(&db);
+    dal.sync_schema().unwrap();
+    let mut session = dal.open_session().unwrap();
+
+    let rows: Vec<TradeLog> = (0..25)
+        .map(|i| TradeLog::new(day(2026, 9, 1 + (i % 25) as u32), "bulk"))
+        .collect();
+    TradeLog::insert_batch(&dal, session.as_mut(), &rows, None).unwrap();
+    assert_eq!(TradeLog::count(&dal, session.as_mut(), None).unwrap(), 25);
+
+    let table = dal.table("TradeLog").unwrap();
+    let filter = Where::new().eq("Note", "bulk");
+
+    // batch=10：10 → 10 → 5 共三批删完（批间等待置 0 加速）
+    assert_eq!(
+        table
+            .delete_where_batched(session.as_mut(), &filter, Some(10), None, Some(Duration::ZERO))
+            .unwrap(),
+        25
+    );
+    assert_eq!(TradeLog::count(&dal, session.as_mut(), None).unwrap(), 0);
+
+    // max_rows=15：截断（10 + 5），其余保留
+    TradeLog::insert_batch(&dal, session.as_mut(), &rows, None).unwrap();
+    assert_eq!(
+        table
+            .delete_where_batched(
+                session.as_mut(),
+                &filter,
+                Some(10),
+                Some(15),
+                Some(Duration::ZERO)
+            )
+            .unwrap(),
+        15
+    );
+    assert_eq!(TradeLog::count(&dal, session.as_mut(), None).unwrap(), 10);
+
+    // 默认批间隔（None → 100ms，对齐 C# `XCodeSetting.BatchInterval`）：小批跑完剩余 10 行
+    assert_eq!(
+        table
+            .delete_where_batched(session.as_mut(), &filter, Some(4), None, None)
+            .unwrap(),
+        10
     );
     assert_eq!(TradeLog::count(&dal, session.as_mut(), None).unwrap(), 0);
 

@@ -19,7 +19,8 @@
 //! | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | [`cache::EntityCache`] / [`cache::SingleCache`]（写入自动失效） |
 //! | `DAL.GetTables`（反向工程） | [`reverse`]（[`Dal::read_model`](dal::Dal::read_model)） |
 //! | `Shards` / `EntitySplit`（分表） | [`shards`]（`TimeShardPolicy` + `TableRef::query_sharded` / `Entity::insert_sharded` 等，表名与 C# 共用） |
-//! | `EntityExtension.Insert(list)`（批量写入） | [`entity::Entity::insert_batch`] / [`insert_batch_sharded`](entity::Entity::insert_batch_sharded) / [`delete_batch_sharded`](entity::Entity::delete_batch_sharded)（多行 `VALUES` + 分片分组，跨库自动路由） |
+//! | `EntityExtension.Insert(list)`（批量写入） | [`entity::Entity::insert_batch`] / [`insert_batch_sharded`](entity::Entity::insert_batch_sharded) / [`save_batch`](entity::Entity::save_batch) / [`delete_batch_sharded`](entity::Entity::delete_batch_sharded)（多行 `VALUES` + 分片分组，跨库自动路由） |
+//! | `Entity.SaveAsync`（队列延迟保存） | [`entity::Entity::enqueue_save`] + [`entity_queue::EntityQueue`]（批量刷入；定时由调用方驱动） |
 //! | `DAL.AddConnStr` / `DAL.Create`（分库连接解析） | [`shards::register_connection`]（跨库路由；未注册的连接名按 C# 规则自动落 SQLite 库） |
 //! | `Snowflake`（雪花 Id） | [`snowflake`]（[`Snowflake`](snowflake::Snowflake)，位结构与 C# 互通） |
 //! | `xcode` 命令（XCodeTool 代码生成） | [`codegen`]（`generate` / `generate_all`） |

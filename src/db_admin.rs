@@ -517,7 +517,7 @@ mod tests {
         let db_path = dir.join(format!("{tag}.db"));
         let conn = format!("Data Source={};Provider=SQLite", db_path.display());
         let model = EntityModel::parse(MINI_MODEL).unwrap();
-        let (store, _) = store::get_or_open(&dir, || {
+        let (store, _) = store::get_or_open(dir, || {
             let dal = Dal::open_with_model(&conn, model).map_err(|e| e.to_string())?;
             dal.sync_schema().map_err(|e| e.to_string())?;
             Ok(dal)
