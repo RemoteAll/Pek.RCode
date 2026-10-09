@@ -60,10 +60,11 @@
 //! ```
 
 use crate::{
-    dal::Dal,
+    dal::{Dal, TableRef},
     error::{Error, Result},
     query::{Query, Where},
     session::{DbRow, SqlSession},
+    shards::TimeShardPolicy,
     value::DbValue,
 };
 
@@ -112,9 +113,23 @@ pub trait Entity: Sized {
         Ok(())
     }
 
+    /// 回写指定列的值，返回是否识别并写入该列（由生成代码实现；手写实现可忽略）。
+    ///
+    /// 用于分表场景回写生成的雪花主键（[`Entity::insert_sharded`]）；
+    /// 默认实现返回 `Ok(false)`（不支持）。
+    fn set_field(&mut self, column: &str, value: DbValue) -> Result<bool> {
+        let _ = (column, value);
+        Ok(false)
+    }
+
     /// 插入一行（自动跳过自增列并回写主键），返回自增主键（无自增时 0）。
     fn insert(&mut self, dal: &Dal, session: &mut dyn SqlSession) -> Result<i64> {
         let table = dal.table(Self::table())?;
+        self.insert_with(&table, session)
+    }
+
+    /// 插入一行到指定表句柄（分表场景由 [`Entity::insert_sharded`] 传入分表句柄）。
+    fn insert_with(&mut self, table: &TableRef<'_>, session: &mut dyn SqlSession) -> Result<i64> {
         let identity = table.meta().identity().map(|c| c.name.clone());
 
         let fields: Vec<(&'static str, DbValue)> = self
@@ -133,6 +148,11 @@ pub trait Entity: Sized {
     /// 按主键更新（主键值与自增列不参与 SET），返回受影响行数。
     fn update(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
         let table = dal.table(Self::table())?;
+        self.update_with(&table, session)
+    }
+
+    /// 按主键更新指定表句柄（分表场景使用）。
+    fn update_with(&self, table: &TableRef<'_>, session: &mut dyn SqlSession) -> Result<u64> {
         let pks = Self::primary_keys();
         if pks.is_empty() {
             return Err(Error::Model(format!("实体 {} 没有主键，无法按主键更新", Self::table())));
@@ -191,6 +211,11 @@ pub trait Entity: Sized {
     /// 按主键删除本对象对应的行，返回受影响行数。
     fn delete(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
         let table = dal.table(Self::table())?;
+        self.delete_with(&table, session)
+    }
+
+    /// 按主键删除指定表句柄中的行（分表场景使用）。
+    fn delete_with(&self, table: &TableRef<'_>, session: &mut dyn SqlSession) -> Result<u64> {
         let pk = pk_values_of(&self.to_fields(), Self::primary_keys())?;
         table.delete_by_pk(session, &pk)
     }
@@ -224,6 +249,287 @@ pub trait Entity: Sized {
         let table = dal.table(Self::table())?;
         table.count(session, filter)
     }
+
+    // ================= 分表（对应 C# `Meta.CreateShard` 包装的增删改查） =================
+    //
+    // 分表路由规则与 C# 完全一致：由实体上 `policy.field` 指定的分表字段值（时间列 / 雪花 Id）
+    // 定位物理表（如 `Log2_20260927`）；写操作在分表不存在时自动建表（对齐 C# `EntitySession.CheckTable`），
+    // 读操作对不存在的分表直接返回空。
+
+    /// 插入一行到对应分表（按 `policy.field` 字段值路由；字段为空时按策略自动生成雪花 Id）。
+    ///
+    /// - 时间字段：字段为空时**先执行拦截器**（如 `TimeInterceptor` 自动填 `CreateTime`，
+    ///   与 C# 的 `Valid → CreateShard` 顺序一致），再按补全值定位分表；
+    /// - 雪花 Id 字段（`DbValue::Int` 且 <= 0）：使用策略中的 [`Snowflake`](crate::snowflake::Snowflake)
+    ///   生成新 Id 并通过 [`Entity::set_field`] 回写实体（对齐 C# `AutoFillSnowIdPrimaryKey`），
+    ///   未实现 `set_field` 时返回错误；
+    /// - 分表不存在时自动建表（迁移档位为 `Off`/只读时不建，插入将直接报错）。
+    fn insert_sharded(
+        &mut self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+    ) -> Result<i64> {
+        // 1) 拦截器先行：拿到"实际入库"的字段值（含 CreateTime 自动补全）
+        let handle = dal.table(Self::table())?;
+        let fields = self.to_fields();
+        let own_value = fields
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&policy.field))
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| {
+                Error::Model(format!(
+                    "实体 {} 不存在分表字段 {}",
+                    Self::table(),
+                    policy.field
+                ))
+            })?;
+        let prepared = crate::interceptor::prepare(
+            handle.meta(),
+            crate::interceptor::DataMethod::Insert,
+            &fields,
+        );
+        let mut value = prepared
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&policy.field))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| own_value.clone());
+        // 拦截器补全了分表字段（如 CreateTime）→ 回写实体，保证分表解析与入库值一致
+        if value != own_value {
+            let _ = self.set_field(&policy.field, value.clone());
+        }
+
+        // 2) 雪花主键为空 → 生成并回写（此时必须支持 set_field，否则分表无法确定）
+        let mut generated = None;
+        if let DbValue::Int(id) = value
+            && id <= 0
+        {
+            let snow = policy.snow.as_ref().ok_or_else(|| {
+                Error::Model(format!(
+                    "实体 {} 的雪花主键为空，且分表策略未配置 Snowflake",
+                    Self::table()
+                ))
+            })?;
+            let new_id = snow.now_id()?;
+            if !self.set_field(&policy.field, DbValue::Int(new_id))? {
+                return Err(Error::Model(format!(
+                    "实体 {} 未实现 set_field，无法回写生成的雪花主键",
+                    Self::table()
+                )));
+            }
+            value = DbValue::Int(new_id);
+            generated = Some(new_id);
+        }
+
+        let table = match resolve_shard_table::<Self>(dal, policy, &value, true)? {
+            Some(table) => table,
+            None => dal.table(Self::table())?,
+        };
+        let id = self.insert_with(&table, session)?;
+        // 雪花主键（无自增列）时返回生成值，便于调用方直接使用
+        Ok(generated.unwrap_or(id))
+    }
+
+    /// 更新本对象所在分表的行（按 `policy.field` 字段值路由；分表不存在时自动建表，对齐 C#）。
+    fn update_sharded(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+    ) -> Result<u64> {
+        let value = shard_value_of(self, policy)?;
+        let table = match resolve_shard_table::<Self>(dal, policy, &value, true)? {
+            Some(table) => table,
+            None => dal.table(Self::table())?,
+        };
+        self.update_with(&table, session)
+    }
+
+    /// 删除本对象所在分表的行（按 `policy.field` 字段值路由；分表不存在时自动建表，对齐 C#）。
+    fn delete_sharded(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+    ) -> Result<u64> {
+        let value = shard_value_of(self, policy)?;
+        let table = match resolve_shard_table::<Self>(dal, policy, &value, true)? {
+            Some(table) => table,
+            None => dal.table(Self::table())?,
+        };
+        self.delete_with(&table, session)
+    }
+
+    /// 保存到分表（对应 C# `Save()` 的分表分支）：
+    /// 有自增列按 0 值判定新增/更新；无自增列按主键是否存在判定（在解析出的分表上判断）。
+    ///
+    /// 与 [`Entity::insert_sharded`] 一样，会**先执行拦截器**（如 `TimeInterceptor` 自动填
+    /// `CreateTime`，对齐 C# 的 `Valid → CreateShard` 顺序）再判定与路由。
+    fn save_sharded(
+        &mut self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+    ) -> Result<u64> {
+        // 拦截器先行：补全分表字段（空白 CreateTime 等）并回写实体
+        {
+            let handle = dal.table(Self::table())?;
+            let fields = self.to_fields();
+            if let Some((name, _)) = fields
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&policy.field))
+            {
+                let own = fields
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.clone());
+                let prepared = crate::interceptor::prepare(
+                    handle.meta(),
+                    crate::interceptor::DataMethod::Insert,
+                    &fields,
+                );
+                if let Some((_, value)) = prepared
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    && Some(value) != own.as_ref()
+                {
+                    let _ = self.set_field(&policy.field, value.clone());
+                }
+            }
+        }
+
+        let is_new = match Self::identity_column() {
+            Some(id) => {
+                let value = self
+                    .to_fields()
+                    .into_iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(id))
+                    .map(|(_, value)| value);
+                !matches!(value.and_then(|v| v.as_i64()), Some(v) if v != 0)
+            }
+            None => {
+                let fields = self.to_fields();
+                let pk = pk_values_of(&fields, Self::primary_keys())?;
+                let value = shard_value_of(self, policy)?;
+                match resolve_shard_table::<Self>(dal, policy, &value, false)? {
+                    Some(table) => {
+                        if !session.table_exists(table.physical_name())? {
+                            true
+                        } else {
+                            table.find_by_pk(session, &pk)?.is_none()
+                        }
+                    }
+                    None => Self::find(dal, session, &pk)?.is_none(),
+                }
+            }
+        };
+
+        if is_new {
+            self.insert_sharded(dal, session, policy)?;
+            Ok(1)
+        } else {
+            self.update_sharded(dal, session, policy)
+        }
+    }
+
+    /// 按分表值 + 主键查询单条记录（对应 C# `FindByKey` 的分表分支）：
+    /// `value` 为分表字段值（时间或雪花 Id，如主键即分表字段可直接传主键值）；
+    /// **不存在的分表直接返回 `None`，不自动建表**。
+    fn find_sharded(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+        value: &DbValue,
+        pk: &[DbValue],
+    ) -> Result<Option<Self>> {
+        match resolve_shard_table::<Self>(dal, policy, value, false)? {
+            Some(table) => {
+                if !session.table_exists(table.physical_name())? {
+                    return Ok(None);
+                }
+                table
+                    .find_by_pk(session, pk)?
+                    .map(|row| Self::from_row(&row))
+                    .transpose()
+            }
+            None => Self::find(dal, session, pk),
+        }
+    }
+
+    /// 跨分表条件查询（对应 C# `FindAll(where, ...)` 的分表分支，自动跨表分页）。
+    ///
+    /// 条件可推导分表区间时逐表查询并合并；否则按单表查询。用法见 [`crate::shards`]。
+    fn query_sharded(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+        query: &Query,
+    ) -> Result<Vec<Self>> {
+        let table = dal.table(Self::table())?;
+        let set = table.query_sharded(session, policy, query)?;
+        Self::load(&set)
+    }
+
+    /// 跨分表计数（对应 C# `FindCount(where)` 的分表分支：逐表计数求和）。
+    fn count_sharded(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+        filter: Option<&Where>,
+    ) -> Result<i64> {
+        let table = dal.table(Self::table())?;
+        table.count_sharded(session, policy, filter)
+    }
+
+    /// 跨分表条件删除（对应 C# 静态 `Delete(Expression)` 的分表分支）。
+    fn delete_where_sharded(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        policy: &TimeShardPolicy,
+        filter: &Where,
+    ) -> Result<u64> {
+        let table = dal.table(Self::table())?;
+        table.delete_sharded(session, policy, filter)
+    }
+}
+
+/// 提取实体中分表字段的值（缺失时报错）。
+fn shard_value_of<E: Entity>(entity: &E, policy: &TimeShardPolicy) -> Result<DbValue> {
+    entity
+        .to_fields()
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&policy.field))
+        .map(|(_, value)| value)
+        .ok_or_else(|| {
+            Error::Model(format!(
+                "实体 {} 不存在分表字段 {}",
+                E::table(),
+                policy.field
+            ))
+        })
+}
+
+/// 解析分表句柄（对应 C# `Meta.CreateShard`）：
+///
+/// - 策略未配置模板 → `Ok(None)`（调用方回退基础表）；
+/// - `ensure = true` 时对分表自动建表（写操作路径，对齐 C# `EntitySession.CheckTable`）。
+fn resolve_shard_table<'a, E: Entity>(
+    dal: &'a Dal,
+    policy: &TimeShardPolicy,
+    value: &DbValue,
+    ensure: bool,
+) -> Result<Option<TableRef<'a>>> {
+    let handle = dal.table(E::table())?;
+    let Some(model) = policy.shard_of_value(handle.shard_base(), value)? else {
+        return Ok(None);
+    };
+    let physical = model
+        .table_name
+        .unwrap_or_else(|| handle.meta().effective_table_name().to_string());
+    if ensure {
+        dal.ensure_shard_table(E::table(), &physical)?;
+    }
+    Ok(Some(dal.table_as(E::table(), &physical)?))
 }
 
 /// 从字段列表按主键顺序提取主键值。

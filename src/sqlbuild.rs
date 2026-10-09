@@ -23,6 +23,16 @@ pub fn insert_sql(
     table: &TableMeta,
     fields: &[(&str, DbValue)],
 ) -> Result<(String, Vec<DbValue>)> {
+    insert_sql_named(kind, table, table.effective_table_name(), fields)
+}
+
+/// 组装 INSERT 语句（指定物理表名；分表场景由 [`crate::dal::Dal::table_as`] 的句柄自动传入）。
+pub fn insert_sql_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    fields: &[(&str, DbValue)],
+) -> Result<(String, Vec<DbValue>)> {
     if fields.is_empty() {
         return Err(Error::Model(format!(
             "表 {} 的插入语句至少需要一个字段",
@@ -32,7 +42,7 @@ pub fn insert_sql(
 
     // InfluxDB：直接生成行协议文本（非 SQL），写入由驱动 POST 到 /write
     if kind == DatabaseKind::InfluxDb {
-        return Ok((influx_line_protocol(table, fields)?, Vec::new()));
+        return Ok((influx_line_protocol(table, table_name, fields)?, Vec::new()));
     }
 
     let mut columns = Vec::with_capacity(fields.len() + 1);
@@ -55,7 +65,7 @@ pub fn insert_sql(
             .iter()
             .any(|(field, _)| field.eq_ignore_ascii_case(&identity.name))
     {
-        let sequence = oracle_identity_sequence(table.effective_table_name());
+        let sequence = oracle_identity_sequence(table_name);
         let expression = match kind {
             // Oracle："SEQ_x".NEXTVAL（引号保持大小写）
             DatabaseKind::Oracle => format!("{}.NEXTVAL", kind.quote(&sequence)),
@@ -70,7 +80,7 @@ pub fn insert_sql(
 
     let sql = format!(
         "INSERT INTO {} ({}) VALUES ({})",
-        kind.quote(table.effective_table_name()),
+        kind.quote(table_name),
         columns.join(", "),
         marks.join(", ")
     );
@@ -81,7 +91,11 @@ pub fn insert_sql(
 ///
 /// 与 DH.NCode 的批量写入规则一致：主键/主列（`PrimaryKey`/`Master`）作为 tag，
 /// 其余作为 field；名为 `Time`/`CreateTime`/`UpdateTime` 的时间列作为时间戳（纳秒）。
-fn influx_line_protocol(table: &TableMeta, fields: &[(&str, DbValue)]) -> Result<String> {
+fn influx_line_protocol(
+    table: &TableMeta,
+    table_name: &str,
+    fields: &[(&str, DbValue)],
+) -> Result<String> {
     let time_column = fields.iter().find_map(|(name, value)| {
         let is_time = name.eq_ignore_ascii_case("Time")
             || name.eq_ignore_ascii_case("CreateTime")
@@ -89,7 +103,7 @@ fn influx_line_protocol(table: &TableMeta, fields: &[(&str, DbValue)]) -> Result
         (is_time && matches!(value, DbValue::DateTime(_))).then_some(*name)
     });
 
-    let mut line = escape_influx(table.effective_table_name());
+    let mut line = escape_influx(table_name);
     let mut values = String::new();
     let mut timestamp: Option<i64> = None;
 
@@ -182,6 +196,17 @@ pub fn update_sql(
     sets: &[(&str, DbValue)],
     filter: &Where,
 ) -> Result<(String, Vec<DbValue>)> {
+    update_sql_named(kind, table, table.effective_table_name(), sets, filter)
+}
+
+/// 组装 UPDATE 语句（指定物理表名；分表场景使用）。
+pub fn update_sql_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    sets: &[(&str, DbValue)],
+    filter: &Where,
+) -> Result<(String, Vec<DbValue>)> {
     if sets.is_empty() {
         return Err(Error::Model(format!(
             "表 {} 的更新语句至少需要一个待更新字段",
@@ -201,7 +226,7 @@ pub fn update_sql(
     let where_sql = filter.render(kind, &mut params);
     let mut sql = format!(
         "UPDATE {} SET {}",
-        kind.quote(table.effective_table_name()),
+        kind.quote(table_name),
         parts.join(", ")
     );
     if !where_sql.is_empty() {
@@ -214,10 +239,19 @@ pub fn update_sql(
 
 /// 组装 DELETE 语句（`filter` 为空时清空全表，慎用）。
 pub fn delete_sql(kind: DatabaseKind, table: &TableMeta, filter: &Where) -> (String, Vec<DbValue>) {
+    delete_sql_named(kind, table.effective_table_name(), filter)
+}
+
+/// 组装 DELETE 语句（指定物理表名；分表场景使用）。
+pub fn delete_sql_named(
+    kind: DatabaseKind,
+    table_name: &str,
+    filter: &Where,
+) -> (String, Vec<DbValue>) {
     let mut params = Vec::with_capacity(4);
     let where_sql = filter.render(kind, &mut params);
 
-    let mut sql = format!("DELETE FROM {}", kind.quote(table.effective_table_name()));
+    let mut sql = format!("DELETE FROM {}", kind.quote(table_name));
     if !where_sql.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&where_sql);
@@ -231,11 +265,17 @@ pub fn count_sql(
     table: &TableMeta,
     filter: Option<&Where>,
 ) -> (String, Vec<DbValue>) {
+    count_sql_named(kind, table.effective_table_name(), filter)
+}
+
+/// 组装 COUNT 语句（指定物理表名；分表场景使用）。
+pub fn count_sql_named(
+    kind: DatabaseKind,
+    table_name: &str,
+    filter: Option<&Where>,
+) -> (String, Vec<DbValue>) {
     let mut params = Vec::new();
-    let mut sql = format!(
-        "SELECT COUNT(*) FROM {}",
-        kind.quote(table.effective_table_name())
-    );
+    let mut sql = format!("SELECT COUNT(*) FROM {}", kind.quote(table_name));
     if let Some(filter) = filter {
         let where_sql = filter.render(kind, &mut params);
         if !where_sql.is_empty() {
@@ -252,6 +292,16 @@ pub fn count_sql(
 /// - `query.select` 中的列名会校验并引用；不是列名的内容按原始表达式使用（如 `COUNT(*)`）
 /// - 分页：`page_index >= 1 && page_size > 0` 时启用；SQL Server/Oracle 无排序时按主键兜底
 pub fn select_sql(kind: DatabaseKind, table: &TableMeta, query: &Query) -> (String, Vec<DbValue>) {
+    select_sql_named(kind, table, table.effective_table_name(), query)
+}
+
+/// 组装 SELECT 语句（指定物理表名；分表场景使用）。
+pub fn select_sql_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    query: &Query,
+) -> (String, Vec<DbValue>) {
     // 查询列
     let columns = if query.select.is_empty() {
         "*".to_string()
@@ -268,10 +318,7 @@ pub fn select_sql(kind: DatabaseKind, table: &TableMeta, query: &Query) -> (Stri
     };
 
     let mut params = Vec::new();
-    let mut sql = format!(
-        "SELECT {columns} FROM {}",
-        kind.quote(table.effective_table_name())
-    );
+    let mut sql = format!("SELECT {columns} FROM {}", kind.quote(table_name));
 
     if let Some(filter) = &query.filter {
         let where_sql = filter.render(kind, &mut params);
@@ -286,14 +333,20 @@ pub fn select_sql(kind: DatabaseKind, table: &TableMeta, query: &Query) -> (Stri
 
     // 分页/取前 N 条场景下，未显式排序时按主键兜底，保证结果稳定
     let paging = query.page_index >= 1 && query.page_size > 0;
-    if order_sql.is_empty() && (paging || query.limit.is_some()) && !table.primary_keys().is_empty() {
+    if order_sql.is_empty()
+        && (paging || query.limit.is_some() || query.offset.is_some())
+        && !table.primary_keys().is_empty()
+    {
         order_sql = render_order_of(kind, table, &default_order_columns(table));
     }
 
-    // 分页优先于取前 N
+    // 分页优先于 offset/limit；offset 无 limit 时按"跳到末尾取全部"处理（BIGINT 上限）
     if paging {
         let offset = (query.page_index - 1) * query.page_size;
         sql = kind.apply_paging_with_style(&sql, &order_sql, offset, query.page_size, query.page_style);
+    } else if let Some(offset) = query.offset {
+        let size = query.limit.unwrap_or(i64::MAX as usize);
+        sql = kind.apply_paging_with_style(&sql, &order_sql, offset, size, query.page_style);
     } else if let Some(limit) = query.limit {
         sql = kind.apply_paging(&sql, &order_sql, 0, limit);
     } else if !order_sql.is_empty() {
@@ -489,6 +542,80 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT * FROM \"DH_Order\" WHERE (\"Status\" = ?) ORDER BY \"Id\" LIMIT 10 OFFSET 20"
+        );
+    }
+
+    #[test]
+    fn offset_paging_supports_raw_skip() {
+        let t = table();
+
+        // offset + take：原始"跳过 N 取 M"
+        let q = Query::new().offset(10).take(5);
+        let (sql, _) = select_sql(DatabaseKind::Sqlite, &t, &q);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"DH_Order\" ORDER BY \"Id\" LIMIT 5 OFFSET 10"
+        );
+
+        // 仅 offset：跳过 N 后取全部（LIMIT 取 BIGINT 上限）
+        let q = Query::new().offset(10);
+        let (sql, _) = select_sql(DatabaseKind::Sqlite, &t, &q);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"DH_Order\" ORDER BY \"Id\" LIMIT 9223372036854775807 OFFSET 10"
+        );
+
+        // 分页参数优先于 offset
+        let q = Query::new().offset(10).take(5).page(2, 10);
+        let (sql, _) = select_sql(DatabaseKind::Sqlite, &t, &q);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"DH_Order\" ORDER BY \"Id\" LIMIT 10 OFFSET 10"
+        );
+    }
+
+    #[test]
+    fn named_variants_target_physical_table() {
+        let t = table();
+
+        // 分表物理表名覆盖（模型元数据不变）
+        let (sql, _) = select_sql_named(DatabaseKind::Sqlite, &t, "DH_Order_202609", &Query::new());
+        assert_eq!(sql, "SELECT * FROM \"DH_Order_202609\"");
+
+        let (sql, _) = count_sql_named(DatabaseKind::Sqlite, "DH_Order_202609", None);
+        assert_eq!(sql, "SELECT COUNT(*) FROM \"DH_Order_202609\"");
+
+        let (sql, params) = delete_sql_named(
+            DatabaseKind::Sqlite,
+            "DH_Order_202609",
+            &Where::new().eq("Id", 1),
+        );
+        assert_eq!(sql, "DELETE FROM \"DH_Order_202609\" WHERE (\"Id\" = ?)");
+        assert_eq!(params.len(), 1);
+
+        let (sql, _) = update_sql_named(
+            DatabaseKind::Sqlite,
+            &t,
+            "DH_Order_202609",
+            &[("Status", 2.into())],
+            &Where::new().eq("Id", 1),
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE \"DH_Order_202609\" SET \"Status\" = ? WHERE (\"Id\" = ?)"
+        );
+
+        let (sql, _) = insert_sql_named(
+            DatabaseKind::Sqlite,
+            &t,
+            "DH_Order_202609",
+            &[("Code", "A".into())],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"DH_Order_202609\" (\"Code\") VALUES (?)"
         );
     }
 }

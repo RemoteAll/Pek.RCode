@@ -491,7 +491,83 @@ impl Dal {
         let table = model
             .table(name)
             .ok_or_else(|| Error::Model(format!("模型中不存在表/实体 {name}")))?;
-        Ok(TableRef { dal: self, table })
+        Ok(TableRef {
+            dal: self,
+            table,
+            table_name: None,
+        })
+    }
+
+    /// 获取表操作句柄（**指定物理表名**）：列元数据仍取模型定义，SQL 操作落到指定表。
+    ///
+    /// 用于分表场景（如 `Log2` → `Log2_20260927`，见 [`crate::shards`]）与手工别名表操作；
+    /// 不会自动建表，分表建表用 [`Dal::ensure_shard_table`]。
+    pub fn table_as(&self, name: &str, table_name: &str) -> Result<TableRef<'_>> {
+        let mut handle = self.table(name)?;
+        handle.table_name = Some(table_name.to_string());
+        Ok(handle)
+    }
+
+    /// 创建分表物理表（不存在时），结构照抄模型表（含索引，单表 DDL 与 `sync_schema` 一致）。
+    ///
+    /// 对齐 C# `EntitySession.CheckTable` → `dal.SetTables` 的"新表名自动建表"行为：
+    /// - 已存在 / 迁移档位为 `Off` / 只读档（`ReadOnly`）→ 返回 `false` 不做任何事；
+    /// - `On` / `Full` → 建表 + 建索引，返回 `true`。
+    pub fn ensure_shard_table(&self, name: &str, table_name: &str) -> Result<bool> {
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| Error::Model("尚未加载数据模型，无法创建分表".into()))?;
+        let table = model
+            .table(name)
+            .ok_or_else(|| Error::Model(format!("模型中不存在表/实体 {name}")))?;
+
+        // 时序/文档库无建表 DDL（写入时自动创建）
+        if !self.kind.supports_ddl() {
+            return Ok(false);
+        }
+
+        let mode = self.migration.tighten(table.migration);
+        if mode == Migration::Off || mode.is_readonly() {
+            return Ok(false);
+        }
+
+        let mut session = self.open_session()?;
+        if session.table_exists(table_name)? {
+            return Ok(false);
+        }
+
+        // 克隆表元数据并替换物理表名（对应 C# `table.Clone()` + `TableName = name`）
+        let mut cloned = table.clone();
+        cloned.table_name = table_name.to_string();
+
+        for stmt in self.kind.create_table_sql(&cloned) {
+            self.log_sql(&stmt);
+            session.execute(&stmt, &[])?;
+        }
+        for index in &cloned.indexes {
+            if let Some(sql) = self.kind.create_index_sql(&cloned, index) {
+                self.log_sql(&sql);
+                session.execute(&sql, &[])?;
+            }
+        }
+        // 序列型自增（Oracle/DB2/Firebird/DuckDB）：补建 `SEQ_{表名}` 序列
+        if cloned.identity().is_some()
+            && matches!(
+                self.kind,
+                DatabaseKind::Oracle
+                    | DatabaseKind::Db2
+                    | DatabaseKind::Firebird
+                    | DatabaseKind::DuckDb
+            )
+        {
+            let mut report = SchemaReport {
+                mode,
+                ..Default::default()
+            };
+            self.ensure_identity_sequence(&mut *session, mode, &mut report, table_name)?;
+        }
+        Ok(true)
     }
 
     /// 按模型同步数据库结构（建表 / 补列 / 补索引；`Full` 档含修改与删除），返回本次变更清单。
@@ -1187,16 +1263,25 @@ pub struct TableRef<'a> {
     dal: &'a Dal,
     /// 表定义
     table: &'a TableMeta,
+    /// 物理表名覆盖（分表场景：模型表 → 分表物理表；None 时用模型的物理名）
+    table_name: Option<String>,
 }
 
 impl<'a> TableRef<'a> {
     /// 表定义。
-    pub fn meta(&self) -> &TableMeta {
+    pub fn meta(&self) -> &'a TableMeta {
         self.table
     }
 
+    /// 实际操作的物理表名（分表覆盖优先，否则取模型物理名）。
+    pub fn physical_name(&self) -> &str {
+        self.table_name
+            .as_deref()
+            .unwrap_or_else(|| self.table.effective_table_name())
+    }
+
     /// 所属数据访问层。
-    pub(crate) fn dal(&self) -> &Dal {
+    pub(crate) fn dal(&self) -> &'a Dal {
         self.dal
     }
 
@@ -1216,7 +1301,8 @@ impl<'a> TableRef<'a> {
         );
         let fields: Vec<(&str, DbValue)> =
             values.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-        let (mut sql, params) = sqlbuild::insert_sql(self.dal.kind, self.table, &fields)?;
+        let (mut sql, params) =
+            sqlbuild::insert_sql_named(self.dal.kind, self.table, self.physical_name(), &fields)?;
 
         if let Some(id_col) = identity
             && matches!(
@@ -1229,7 +1315,7 @@ impl<'a> TableRef<'a> {
             self.dal.log_sql(&sql);
             let set = session.query(&sql, &params)?;
             // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
-            self.dal.invalidate_cache(self.table.effective_table_name());
+            self.dal.invalidate_cache(self.physical_name());
             return Ok(set
                 .first()
                 .and_then(|row| row.get(0))
@@ -1239,17 +1325,13 @@ impl<'a> TableRef<'a> {
 
         self.dal.log_sql(&sql);
         let id = if identity.is_some() {
-            session.insert_and_get_identity(
-                &sql,
-                &params,
-                Some(self.table.effective_table_name()),
-            )?
+            session.insert_and_get_identity(&sql, &params, Some(self.physical_name()))?
         } else {
             session.execute(&sql, &params)?;
             0
         };
         // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
-        self.dal.invalidate_cache(self.table.effective_table_name());
+        self.dal.invalidate_cache(self.physical_name());
         Ok(id)
     }
 
@@ -1257,7 +1339,8 @@ impl<'a> TableRef<'a> {
     pub fn find_by_pk(&self, session: &mut dyn SqlSession, pk: &[DbValue]) -> Result<Option<DbRow>> {
         let filter = self.pk_filter(pk)?;
         let query = Query::new().filter(filter).take(1);
-        let (sql, params) = sqlbuild::select_sql(self.dal.kind, self.table, &query);
+        let (sql, params) =
+            sqlbuild::select_sql_named(self.dal.kind, self.table, self.physical_name(), &query);
         self.dal.log_sql(&sql);
         let set = session.query(&sql, &params)?;
         Ok(set.rows.into_iter().next())
@@ -1279,12 +1362,18 @@ impl<'a> TableRef<'a> {
         );
         let sets: Vec<(&str, DbValue)> =
             values.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-        let (sql, params) = sqlbuild::update_sql(self.dal.kind, self.table, &sets, &filter)?;
+        let (sql, params) = sqlbuild::update_sql_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            &sets,
+            &filter,
+        )?;
         self.dal.log_sql(&sql);
         let affected = session.execute(&sql, &params)?;
         if affected > 0 {
             // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
-            self.dal.invalidate_cache(self.table.effective_table_name());
+            self.dal.invalidate_cache(self.physical_name());
         }
         Ok(affected)
     }
@@ -1292,6 +1381,13 @@ impl<'a> TableRef<'a> {
     /// 按主键删除，返回受影响行数。
     pub fn delete_by_pk(&self, session: &mut dyn SqlSession, pk: &[DbValue]) -> Result<u64> {
         let filter = self.pk_filter(pk)?;
+        self.delete_where(session, &filter)
+    }
+
+    /// 按条件删除，返回受影响行数（空条件会清空全表，请先用 [`Where::is_empty`] 防护）。
+    ///
+    /// 对应 C# `Entity.Delete(Expression)` 的单表部分；分表删除见 [`TableRef::delete_sharded`](crate::shards::TableRef::delete_sharded)。
+    pub fn delete_where(&self, session: &mut dyn SqlSession, filter: &Where) -> Result<u64> {
         // 拦截器通知（对应 OnValid/Delete；默认拦截器不处理删除，保留扩展点）
         let mut notify: Vec<(String, DbValue)> = Vec::new();
         crate::interceptor::apply_registered(
@@ -1299,12 +1395,13 @@ impl<'a> TableRef<'a> {
             crate::interceptor::DataMethod::Delete,
             &mut notify,
         );
-        let (sql, params) = sqlbuild::delete_sql(self.dal.kind, self.table, &filter);
+        let (sql, params) =
+            sqlbuild::delete_sql_named(self.dal.kind, self.physical_name(), filter);
         self.dal.log_sql(&sql);
         let affected = session.execute(&sql, &params)?;
         if affected > 0 {
             // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
-            self.dal.invalidate_cache(self.table.effective_table_name());
+            self.dal.invalidate_cache(self.physical_name());
         }
         Ok(affected)
     }
@@ -1398,7 +1495,8 @@ impl<'a> TableRef<'a> {
 
     /// 统计行数。
     pub fn count(&self, session: &mut dyn SqlSession, filter: Option<&Where>) -> Result<i64> {
-        let (sql, params) = sqlbuild::count_sql(self.dal.kind, self.table, filter);
+        let (sql, params) =
+            sqlbuild::count_sql_named(self.dal.kind, self.physical_name(), filter);
         self.dal.log_sql(&sql);
         let set = session.query(&sql, &params)?;
         Ok(set
@@ -1410,7 +1508,8 @@ impl<'a> TableRef<'a> {
 
     /// 查询。
     pub fn query(&self, session: &mut dyn SqlSession, query: &Query) -> Result<RowSet> {
-        let (sql, params) = sqlbuild::select_sql(self.dal.kind, self.table, query);
+        let (sql, params) =
+            sqlbuild::select_sql_named(self.dal.kind, self.table, self.physical_name(), query);
         self.dal.log_sql(&sql);
         session.query(&sql, &params)
     }

@@ -47,7 +47,9 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `catalog` | 各 `DbBase.OnGetTables` 元数据 | ✅ 全驱动目录读取（表/列/索引；MongoDB 除外；Access 走 ODBC 元数据） |
 | `cache` | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | ✅ 整表实体缓存 + 单对象缓存（默认 60s 过期；写入自动失效）；✅ Redis 版本号（feature `redis`，底层为 **Pek.RRedis** 自研客户端） |
 | `reverse` | `DAL.GetTables`（反向工程） | ✅ 数据库 → `EntityModel` / `Model.xml`（**全部驱动**、含索引/唯一约束；`rcodegen --conn`） |
-| `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count`；`AuditExt` 审计字段访问；`#[derive(Entity)]` 宏 |
+| `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count`；`AuditExt` 审计字段访问；`#[derive(Entity)]` 宏；分表变体 `insert_sharded` / `find_sharded` / `query_sharded` 等 |
+| `shards` | `Shards/TimeShardPolicy`（`EntitySplit`） | ✅ 时间分表策略（`TablePolicy` / `ConnPolicy` / `Step` 模板与 C# 完全一致 + .NET 日期格式子集）；实体分表增删改查、**跨表查询/分页/计数/条件删除**、`auto_shard` 区间遍历、分表自动建表（对齐 C# `EntitySession.CheckTable`） |
+| `snowflake` | `NewLife.Data.Snowflake` | ✅ 位结构与 C# 互通（1+41+10+12；`GetId` / `TryParse` 语义一致）：`now_id` / `new_id_at` / `id_at` / `parse`，进程级共享实例 `shared()` |
 | `db_service` | `Services`（`DbServer` / `DbClient`） | ✅ 远程服务层 + HTTP 客户端；`/Db/Query` 为 **DbTable v3 二进制**（与 C# `DbClient` 双向互通，黄金样本逐字节验证）；配套 `provider=network` 驱动与 `examples/dbserver` 参考宿主 |
 | `backup` | `DAL_Backup` / `DbPackage` | ✅ 单表备份/恢复（DbTable v3 文件、`.gz` 自动压缩）、多表 zip 包（`{连接名}.xml` + `{实体名}.table`）、跨库同步 `sync_table`/`sync_all`；**与 C# 备份文件互认** |
 | `meta` | `DbMetaData` / `IMetaData` | ✅ 建库/删库/存在性、建表/删表、列增/改/删、索引建/删、表列注释（按方言，语句逐一对齐各驱动覆写） |
@@ -56,7 +58,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --kind entity,model,interface,biz / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`；`biz` 业务扩展**永不覆盖**、只合并缺失区块） |
 
-测试：**250 项全部通过**（库单测 223 + 集成 17 + 文档测试 10；`--features duckdb` 全量 257 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 251 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 250 项（rustls TLS 后端），`--no-default-features` 全量 248 项（完全不含 TLS 依赖）；
+测试：**286 项全部通过**（库单测 250 + 集成 25 + 文档测试 11；`--features duckdb` 全量 293 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 287 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 247 项（rustls TLS 后端），`--no-default-features` 全量 247 项（完全不含 TLS 依赖）；
 MySQL / PostgreSQL / SQL Server / Oracle / network 端到端用例在有真实库/服务时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -332,6 +334,48 @@ order.delete(&dal, session.as_mut())?;
 
 > 生成产物已用真实模型（`JiLiYu`、`VerifyCode`）做过编译与运行验证。
 
+### 分表（与 DH.NCode 共用同一批分表）
+
+对应 DH.NCode 的 `Shards/TimeShardPolicy`：按时间把同一实体的数据落到不同物理表（`WmsLog` → `WmsLog_202609`），
+**表名 / 连接名生成规则与 C# 完全一致**（`TablePolicy` / `ConnPolicy` 模板 + .NET 日期格式子集），
+两边可直接共用同一批数据库表。模型列标注 `DataScale="timeShard:表模板[:连接模板]"` 后，`rcodegen` 会生成 `shard_policy()`。
+
+```rust
+let policy = WmsLog::shard_policy();
+// 或手工构造：
+// 时间列：TimeShardPolicy::new("CreateTime").with_table_policy("{0}_{1:yyyyMMdd}")
+// 雪花Id：TimeShardPolicy::new("Id").with_table_policy("{0}_{1:yyyy}").with_snow(pek_rcode::snowflake::shared())
+
+let mut log = WmsLog::new();
+log.create_time = chrono::Local::now().naive_local();
+log.insert_sharded(&dal, session.as_mut(), &policy)?;          // 路由到 WmsLog_20260927（不存在时自动建表）
+log.update_sharded(&dal, session.as_mut(), &policy)?;
+log.delete_sharded(&dal, session.as_mut(), &policy)?;
+let one = WmsLog::find_sharded(&dal, session.as_mut(), &policy,
+    &log.create_time.into(), &[log.id.into()])?;               // 不存在的分表直接返回 None
+
+// 跨表查询：条件能推导出分表字段区间时自动展开多表；分页跨表续页（与 C# FindAll 分表分支同语义）
+let filter = Where::new().ge("CreateTime", start).lt("CreateTime", end);
+let list = WmsLog::query_sharded(&dal, session.as_mut(), &policy,
+    &Query::new().filter(filter.clone()).order_by("CreateTime", false).page(1, 20))?;
+let n = WmsLog::count_sharded(&dal, session.as_mut(), &policy, Some(&filter))?;
+let removed = WmsLog::delete_where_sharded(&dal, session.as_mut(), &policy, &filter)?;
+
+// 区间遍历（对应 Meta.AutoShard；只走已存在的分表，start > end 时倒序）
+let counts = dal.table("WmsLog")?.auto_shard(&policy, start, end, |t, s| t.count(s, None))?;
+
+// 删除区间分表（对应 C# 生成代码的 DropWith；只删已存在的分表，基础表不受影响）
+let dropped = dal.table("WmsLog")?.drop_shards(&policy, start, end)?;
+```
+
+- 表句柄层同样可用：`dal.table_as("WmsLog", "WmsLog_202609")` 以物理表名操作（列元数据仍取模型），
+  以及 `TableRef::query_sharded` / `count_sharded` / `delete_sharded` / `auto_shard`、`Where` 条件推导 `shards_of` / `shards_of_trim`；
+- 分表**写操作自动建表**（结构照抄模型含索引；`Migration=Off` / 只读档不建——对齐 C# `EntitySession.CheckTable`）；读操作跳过不存在的分表；
+- 雪花 Id 分表：`insert_sharded` 在 Id 为空时自动生成并回写实体（对应 `AutoFillSnowIdPrimaryKey`）；
+  `snowflake::Snowflake` 与 C# 位级互通，`id_at(t)`（对应 C# `GetId`）可用于构建 Id 区间条件；
+- 与 C# 的差异：连接级分表（`ConnPolicy`）只参与连接名 / 表名计算，跨连接执行需消费方按连接名路由多个 `Dal`；
+  `BETWEEN` 条件按 SQL 闭区间处理（右端 +1 秒参与扫描，只会多扫、不会漏）。
+
 ### 结构迁移档位（对应 DH.NCode 的 `Migration` 枚举）
 
 `Dal::sync_schema()` 按档位执行结构迁移，语义与 DH.NCode 逐档对齐（默认 `On`）：
@@ -435,6 +479,8 @@ Pek.RCode/
 │   ├── cache.rs      实体缓存 / 单对象缓存（对应 Meta.Cache / Meta.SingleCache）
 │   ├── reverse.rs    反向工程：数据库结构 → EntityModel / Model.xml（对应 DAL.GetTables）
 │   ├── entity.rs     Entity trait（对象实体的 CRUD/查询默认实现）
+│   ├── shards.rs     分表（TimeShardPolicy：路由/跨表查询分页/自动建表，对齐 C# Shards）
+│   ├── snowflake.rs  雪花算法（与 C# NewLife.Data.Snowflake 位级互通）
 │   ├── db_service.rs 远程服务层 + HTTP 客户端（DbServer/DbClient，DbTable v3 二进制互通）
 │   ├── network.rs    provider=network 驱动（转发 SQL、登录探明远端类型、远端表结构探测）
 │   ├── driver_pack.rs 驱动包按需分发（DriverManager：下载/验签/拉起 dbserver，`--features driver-pack`）
@@ -456,6 +502,7 @@ Pek.RCode/
     ├── mysql_e2e.rs                    MySQL 真实库端到端（RCODE_MYSQL 门控）
     ├── remote_e2e.rs                   PostgreSQL / SQL Server / Oracle / network 端到端（环境变量门控）
     ├── reverse_e2e.rs                  反向工程 roundtrip（固件建库 → 反向 → 逐列对比 → 再生成实体）
+    ├── shards_e2e.rs                   分表端到端（时间/雪花分表、跨表分页、自动建表、AutoShard）
     └── live_sqlite_e2e.rs              真实 SQLite 历史库副本兼容性验证（RCODE_LIVE_DB + RCODE_MODEL 门控）
 ```
 
@@ -480,6 +527,7 @@ Pek.RCode/
 13. **`DbMetaData` 在线库管理** ✅ `meta` 模块：建库/删库/存在性（文件库=文件操作；SQL 库按方言语句与元数据查询，逐一对齐各驱动覆写）、建表/删表（Firebird 连带序列）、列增/改/删、索引建/删、表列注释（`Comment On`/`Alter .. Comment`/`sp_addextendedproperty`）；无能力库返回 `false`（对齐 C# 空语句）
 14. **导航属性与行访问器** ✅ `navigation` 模块：`NavigationRegistry`（HasOne/HasMany，本地或进程级）+ `load_one`/`load_many` + `Entity::load`/`from_rows`（行集→实体，对应 `DataRowEntityAccessor.LoadData`）；C# 的 LINQ `Include`/反射注值在 Rust 无对应机制，以“注册表 + 显式装载”为对等能力面
 15. **驱动包按需分发（DriverManager）** ✅ `driver_pack` 模块（feature `driver-pack`）：应用按 `driver-*` 特性裁剪后，运行时从 **Pek.RPanlServer 组件源**（管理员「下载管理」；`/components/catalog.json` 同址 `.sig` 为 Ed25519 签名，与插件源同一把平台密钥）按需下载 `dbserver` 驱动包（SHA-256 强制校验）→ 解压本地缓存（`{cache}/{组件}/{版本}/`，临时目录 + 原子改名）→ 回环拉起宿主（端口 0 自动分配 + 一次性令牌）→ 解析就绪行 → 返回 `provider=network` 连接串；相同连接串复用宿主、`ensure_updated` 联网检查新版本、组件源不可用时回退本地缓存、`reap_idle` 空闲回收、析构自动停止全部宿主；驱动包由 `scripts/pack-drivers.ps1` 按驱动裁剪构建（实测 MySQL 2.4MB / PostgreSQL 2.2MB zip）；`examples/driver_fetch` 演示全流程（本机实测：平台下载 → 验签 → 拉起 → network 登录探明类型 → 回收，组件源不可达时离线降级正常）
+16. **分表（`Shards` / `EntitySplit`）** ✅ `shards` 模块 + `snowflake` 模块：`TimeShardPolicy`（`TablePolicy`/`ConnPolicy`/`Step`/Level 与 C# 逐语义对齐，表名渲染含 .NET 日期格式子集 → 与 C# 共用同一批分表）；实体分表 CRUD（`insert_sharded`/`update_sharded`/`delete_sharded`/`save_sharded`/`find_sharded`，**写入自动建表**对齐 `EntitySession.CheckTable`、雪花主键自动生成并回写对应 `AutoFillSnowIdPrimaryKey`）；跨表查询 `query_sharded`（条件推导多表 + `FixOrder` + 跨表续页/跳过扣减，即 C# `FindAll` 分表分支全语义）、`count_sharded`（逐表求和）、`delete_where_sharded`、`auto_shard`（区间遍历仅走已存在分表）；`Where` 条件推导 `shards_of`/`shards_of_trim`（含 C# Trim 优化）；`rcodegen` 识别 `DataScale="timeShard:..."` 生成 `shard_policy()` 与 `set_field`（生成代码已编译验证）
 
 **完整性审计缺口已全部落地（2026-09-27）**：
 

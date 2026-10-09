@@ -39,13 +39,13 @@ pub enum Op {
 
 /// 单个条件项。
 #[derive(Debug, Clone, PartialEq)]
-struct Cond {
+pub struct Cond {
     /// 列名（渲染时按方言引用；含 SQL 函数时请直接使用原始表达式）
-    column: String,
+    pub column: String,
     /// 运算符
-    op: Op,
+    pub op: Op,
     /// 参数列表（IsNull/NotNull 为空）
-    values: Vec<DbValue>,
+    pub values: Vec<DbValue>,
 }
 
 /// WHERE 条件构建器（多个条件之间为 AND）。
@@ -63,6 +63,26 @@ impl Where {
     /// 是否没有任何条件。
     pub fn is_empty(&self) -> bool {
         self.conds.is_empty()
+    }
+
+    /// 条件列表（只读；分表推导等结构化分析使用）。
+    pub fn conds(&self) -> &[Cond] {
+        &self.conds
+    }
+
+    /// 按条件保留（回调收到 `(序号, 条件)`；返回 false 的条件被移除）。
+    ///
+    /// 供分表 `Trim` 等需要从条件集中移除特定项的场景使用。
+    pub fn retain_conds<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(usize, &Cond) -> bool,
+    {
+        let mut index = 0;
+        self.conds.retain(|cond| {
+            let keep_it = keep(index, cond);
+            index += 1;
+            keep_it
+        });
     }
 
     /// 追加自定义条件（低层接口，列表达式原样使用）。
@@ -260,6 +280,9 @@ pub struct Query {
     pub order_by: Vec<OrderBy>,
     /// 取前 N 条（与分页互斥，分页优先）
     pub limit: Option<usize>,
+    /// 跳过行数（原始偏移；与 `limit` 搭配可表达"跳过 N 取 M"，
+    /// 分页参数（`page_index`/`page_size`）优先。留空时不跳过）
+    pub offset: Option<usize>,
     /// 页码（1 基；与 `page_size` 同时有效才启用分页）
     pub page_index: usize,
     /// 每页条数
@@ -305,6 +328,12 @@ impl Query {
     /// 仅取前 N 条。
     pub fn take(mut self, n: usize) -> Self {
         self.limit = Some(n);
+        self
+    }
+
+    /// 跳过 N 行（原始偏移；与 [`Query::take`] 搭配表达"跳过 N 取 M"；分页参数优先）。
+    pub fn offset(mut self, n: usize) -> Self {
+        self.offset = Some(n);
         self
     }
 

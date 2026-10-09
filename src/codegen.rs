@@ -106,7 +106,50 @@ pub fn generate(table: &TableMeta) -> String {
         let field = safe_field_name(&to_snake_case(&col.name));
         out.push_str(&format!("            {field}: {},\n", default_expr(col)));
     }
-    out.push_str("        }\n    }\n}\n\n");
+    out.push_str("        }\n    }\n");
+
+    // —— 分表策略（DataScale 含 `timeShard:` 时生成，对应 C# 静态构造的 Meta.ShardPolicy）——
+    if let Some((column, table_policy, conn_policy)) = time_shard_spec(table) {
+        let field_name = table.effective_column_name(column);
+        out.push_str(
+            "\n    /// 分表策略（对应 C# 静态构造中的 `Meta.ShardPolicy = new TimeShardPolicy(...)`）。\n    ///\n    /// 由 `DataScale=\"timeShard:...\"` 生成；用法见 `pek_rcode::shards` 模块文档。\n    pub fn shard_policy() -> pek_rcode::shards::TimeShardPolicy {\n",
+        );
+        out.push_str(&format!(
+            "        pek_rcode::shards::TimeShardPolicy::new(\"{field_name}\")\n"
+        ));
+        // 与 C# `BuildShardPolicy` 一致：把 DataScale 段包装成 `{0}_{1:段}` 模板
+        if !table_policy.is_empty() {
+            out.push_str(&format!(
+                "            .with_table_policy(\"{{0}}_{{1:{table_policy}}}\")\n"
+            ));
+        }
+        if !conn_policy.is_empty() {
+            out.push_str(&format!(
+                "            .with_conn_policy(\"{{0}}_{{1:{conn_policy}}}\")\n"
+            ));
+        }
+        // 步进推断与 C# `BuildShardPolicy` 一致（HH→小时、dd→天、MM→30 天、yy→365 天）
+        let haystack = format!("{table_policy}{conn_policy}");
+        let step = if haystack.contains("HH") {
+            "            .with_step_hours(1)\n"
+        } else if haystack.contains("dd") {
+            "            .with_step_days(1)\n"
+        } else if haystack.contains("MM") {
+            "            .with_step_days(30)\n"
+        } else if haystack.contains("yy") {
+            "            .with_step_days(365)\n"
+        } else {
+            "            .with_step_days(1)\n"
+        };
+        out.push_str(step);
+        if column.data_type == DataType::Int64 {
+            // 雪花 Id 分表：使用进程级共享雪花实例（对应 C# `Factory.Snow`）
+            out.push_str("            .with_snow(pek_rcode::snowflake::shared())\n");
+        }
+        out.push_str("    }\n");
+    }
+
+    out.push_str("}\n\n");
     out.push_str(&format!(
         "impl Default for {name} {{\n    fn default() -> Self {{\n        Self::new()\n    }}\n}}\n\n",
         name = table.name
@@ -190,6 +233,22 @@ pub fn generate(table: &TableMeta) -> String {
         };
         methods.push(format!(
             "fn set_identity(&mut self, value: i64) -> Result<()> {{\n        self.{field} = {cast};\n        Ok(())\n    }}"
+        ));
+    }
+
+    // 分表实体：生成按列回写（雪花主键自动生成后回写实体，对齐 C# AutoFillSnowIdPrimaryKey 的对象同步）
+    if time_shard_spec(table).is_some() {
+        let mut arms = String::new();
+        for col in &table.columns {
+            let field = safe_field_name(&to_snake_case(&col.name));
+            let name = table.effective_column_name(col);
+            arms.push_str(&format!(
+                "        if column.eq_ignore_ascii_case(\"{name}\") {{\n            self.{field} = {};\n            return Ok(true);\n        }}\n",
+                set_field_expr(col)
+            ));
+        }
+        methods.push(format!(
+            "fn set_field(&mut self, column: &str, value: DbValue) -> Result<bool> {{\n{arms}        Ok(false)\n    }}"
         ));
     }
 
@@ -323,6 +382,50 @@ fn value_converter(t: DataType) -> &'static str {
         DataType::Decimal => "DbValue::as_decimal",
         DataType::DateTime => "DbValue::as_datetime",
         DataType::String | DataType::Binary => unreachable!("字符串/二进制由调用方特殊处理"),
+    }
+}
+
+/// 分表列解析（`DataScale` = `timeShard:表模板[:连接模板]`，对应 C# `ScaleColumn` / `BuildShardPolicy`）。
+fn time_shard_spec(table: &TableMeta) -> Option<(&ColumnMeta, String, String)> {
+    let column = table.columns.iter().find(|c| {
+        c.data_scale
+            .as_deref()
+            .is_some_and(|v| v.to_ascii_lowercase().starts_with("timeshard:"))
+    })?;
+    let spec = column.data_scale.as_deref().unwrap_or("");
+    let parts: Vec<&str> = spec.split(':').collect();
+    let table_policy = parts.get(1).copied().unwrap_or("").to_string();
+    let conn_policy = parts.get(2).copied().unwrap_or("").to_string();
+    Some((column, table_policy, conn_policy))
+}
+
+/// `set_field` 中每个字段的赋值表达式（`value: DbValue` → 字段类型）。
+fn set_field_expr(col: &ColumnMeta) -> String {
+    // 成员枚举：i32 → 枚举（未知值取默认成员）
+    if let Some((path, default_member)) = col.enum_type.as_deref().and_then(known_enum) {
+        return if col.nullable {
+            format!("value.as_i32().and_then({path}::from_i32)")
+        } else {
+            format!("value.as_i32().and_then({path}::from_i32).unwrap_or({default_member})")
+        };
+    }
+    if col.nullable {
+        return match col.data_type {
+            DataType::String => "(!value.is_null()).then(|| value.to_text())".into(),
+            DataType::Binary => "value.as_blob().map(<[u8]>::to_vec)".into(),
+            other => format!("value.{}()", value_converter(other).trim_start_matches("DbValue::")),
+        };
+    }
+    match col.data_type {
+        DataType::String => "value.to_text()".into(),
+        DataType::Binary => "value.as_blob().map(<[u8]>::to_vec).unwrap_or_default()".into(),
+        DataType::DateTime => {
+            "value.as_datetime().unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc())".into()
+        }
+        other => format!(
+            "value.{}().unwrap_or_default()",
+            value_converter(other).trim_start_matches("DbValue::")
+        ),
     }
 }
 
@@ -905,6 +1008,62 @@ mod tests {
         let files = generate_all(&model);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, "order_item.rs");
+    }
+
+    #[test]
+    fn generate_shard_policy_for_time_shard_columns() {
+        // 雪花 Id 主键按年分表（对应 C# `[BindColumn(..., DataScale = "timeShard:yyyy")]`）
+        let model = EntityModel::parse(
+            r#"<EntityModel><Tables><Table Name="ExpressLogs" TableName="ExpressLogs">
+              <Columns>
+                <Column Name="Id" DataType="Int64" PrimaryKey="True" DataScale="timeShard:yyyy" />
+                <Column Name="CreateTime" DataType="DateTime" />
+              </Columns>
+            </Table></Tables></EntityModel>"#,
+        )
+        .unwrap();
+        let code = generate(&model.tables[0]);
+        assert!(
+            code.contains("pub fn shard_policy() -> pek_rcode::shards::TimeShardPolicy {"),
+            "{code}"
+        );
+        assert!(code.contains("TimeShardPolicy::new(\"Id\")"), "{code}");
+        assert!(code.contains(".with_table_policy(\"{0}_{1:yyyy}\")"), "{code}");
+        assert!(code.contains(".with_step_days(365)"), "{code}");
+        assert!(
+            code.contains(".with_snow(pek_rcode::snowflake::shared())"),
+            "雪花主键分表应携带进程级雪花实例：{code}"
+        );
+        assert!(
+            code.contains("fn set_field(&mut self, column: &str, value: DbValue) -> Result<bool> {"),
+            "{code}"
+        );
+        assert!(code.contains("if column.eq_ignore_ascii_case(\"Id\")"), "{code}");
+
+        // 时间列分表 + 连接模板（`timeShard:表模板:连接模板`，对应 C# BuildShardPolicy 的三段解析）
+        let model = EntityModel::parse(
+            r#"<EntityModel><Tables><Table Name="WmsLog" TableName="WmsLog">
+              <Columns>
+                <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+                <Column Name="CreateTime" DataType="DateTime" DataScale="timeShard:yyyyMMdd:yyyy" />
+              </Columns>
+            </Table></Tables></EntityModel>"#,
+        )
+        .unwrap();
+        let code = generate(&model.tables[0]);
+        assert!(code.contains("TimeShardPolicy::new(\"CreateTime\")"), "{code}");
+        assert!(code.contains(".with_table_policy(\"{0}_{1:yyyyMMdd}\")"), "{code}");
+        assert!(code.contains(".with_conn_policy(\"{0}_{1:yyyy}\")"), "{code}");
+        assert!(code.contains(".with_step_days(1)"), "{code}");
+        assert!(
+            !code.contains("with_snow"),
+            "时间字段分表不应携带雪花实例：{code}"
+        );
+
+        // 无分表列的表不生成 shard_policy
+        let table = EntityModel::parse(MODEL).unwrap();
+        let code = generate(&table.tables[0]);
+        assert!(!code.contains("shard_policy"), "{code}");
     }
 
     #[test]
