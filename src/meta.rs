@@ -167,11 +167,11 @@ impl Dal {
                     escape_text(file)
                 ),
             },
-            // PG 系（含 KingBase/HighGo/VastBase，Rust 统一映射为 PostgreSql）
-            DatabaseKind::PostgreSql => format!(
-                "Create Database If Not Exists {} ENCODING \"UTF8\"",
-                kind.quote(name)
-            ),
+            // PG 系（含 KingBase/HighGo/VastBase，Rust 统一映射为 PostgreSql）；
+            // VastBase 不支持 `IF NOT EXISTS`/`ENCODING` 子句（对齐 C# `VastBaseMetaData.CreateDatabaseSQL`）
+            DatabaseKind::PostgreSql => {
+                pg_create_database_sql(kind, name, self.connection_string().provider())
+            }
             DatabaseKind::Oracle => {
                 format!("CREATE DATABASE {} CHARACTER SET AL32UTF8", kind.quote(name))
             }
@@ -619,6 +619,22 @@ fn escape_like(text: &str) -> String {
         .replace('\'', "''")
 }
 
+/// PG 系建库语句（VastBase 变体对齐 C# `VastBaseMetaData.CreateDatabaseSQL`：
+/// 该内核不支持 `IF NOT EXISTS` 与 `ENCODING` 子句，仅 `Create Database "name"`）。
+fn pg_create_database_sql(kind: DatabaseKind, name: &str, provider: Option<&str>) -> String {
+    let is_vastbase = provider
+        .map(|p| p.trim().eq_ignore_ascii_case("vastbase"))
+        .unwrap_or(false);
+    if is_vastbase {
+        format!("Create Database {}", kind.quote(name))
+    } else {
+        format!(
+            "Create Database If Not Exists {} ENCODING \"UTF8\"",
+            kind.quote(name)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,10 +751,7 @@ mod tests {
                     "Create Database If Not Exists {} DEFAULT CHARACTER SET utf8mb4",
                     kind.quote(name)
                 ),
-                DatabaseKind::PostgreSql => format!(
-                    "Create Database If Not Exists {} ENCODING \"UTF8\"",
-                    kind.quote(name)
-                ),
+                DatabaseKind::PostgreSql => pg_create_database_sql(kind, name, None),
                 DatabaseKind::SqlServer => {
                     format!("CREATE DATABASE {} COLLATE Chinese_PRC_CI_AS", kind.quote(name))
                 }
@@ -753,6 +766,20 @@ mod tests {
             };
             assert_eq!(sql, expect, "{kind:?}");
         }
+
+        // VastBase：独立建库语句（无 IF NOT EXISTS / ENCODING，对齐 C# VastBaseMetaData）
+        assert_eq!(
+            pg_create_database_sql(DatabaseKind::PostgreSql, "testdb", Some("vastbase")),
+            "Create Database \"testdb\""
+        );
+        assert_eq!(
+            pg_create_database_sql(DatabaseKind::PostgreSql, "testdb", Some("VASTBASE")),
+            "Create Database \"testdb\""
+        );
+        assert_eq!(
+            pg_create_database_sql(DatabaseKind::PostgreSql, "testdb", Some("postgresql")),
+            "Create Database If Not Exists \"testdb\" ENCODING \"UTF8\""
+        );
 
         // 文本转义
         assert_eq!(escape_text("it's"), "it''s");

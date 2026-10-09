@@ -101,6 +101,8 @@ struct PostgresSettings {
     password: String,
     /// 数据库名（缺省时由服务端使用与用户名同名的库）
     database: Option<String>,
+    /// 搜索路径（`Search Path`/`SearchPath`/`Current Schema`；经连接参数 `options` 传给服务端）
+    search_path: Option<String>,
     /// 应用名（出现在服务端 `pg_stat_activity`，便于识别 Pek.RCode 连接）
     application_name: String,
     /// 连接超时
@@ -189,6 +191,16 @@ fn parse_settings(cs: &ConnectionString) -> Result<PostgresSettings> {
         .or(cs.get("db"))
         .map(str::to_string);
 
+    // Search Path（VastBase/openGauss 部署常用、PG 系通用）：经 `options` 连接参数传给服务端，
+    // 使 `current_schema()` 等指向期望的 schema（C# 的 VastBase 连接串要求提供该参数）
+    let search_path = cs
+        .get("search path")
+        .or(cs.get("searchpath"))
+        .or(cs.get("current schema"))
+        .or(cs.get("currentschema"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
     let application_name = cs
         .get("applicationname")
         .or(cs.get("application name"))
@@ -209,6 +221,7 @@ fn parse_settings(cs: &ConnectionString) -> Result<PostgresSettings> {
         user,
         password,
         database,
+        search_path,
         application_name,
         connect_timeout,
         ssl_mode,
@@ -232,12 +245,31 @@ fn build_config(settings: &PostgresSettings) -> PgConfig {
     if let Some(db) = &settings.database {
         config.dbname(db.as_str());
     }
+    if let Some(sp) = &settings.search_path {
+        config.options(&search_path_options(sp));
+    }
     config.application_name(settings.application_name.as_str());
     if let Some(timeout) = settings.connect_timeout {
         config.connect_timeout(timeout);
     }
     config.ssl_mode(settings.ssl_mode.to_driver());
     config
+}
+
+/// `Search Path` 值 → 连接参数 options 文本（`-c search_path=...`）。
+///
+/// 值含空白/引号/反斜杠时用双引号包裹并按服务端启动参数（`pg_split_opts`）规则转义，
+/// 如 `Search Path=tenant1, public` → `-c search_path="tenant1, public"`。
+fn search_path_options(value: &str) -> String {
+    let v = value.trim();
+    if v.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\') {
+        format!(
+            "-c search_path=\"{}\"",
+            v.replace('\\', "\\\\").replace('"', "\\\"")
+        )
+    } else {
+        format!("-c search_path={v}")
+    }
 }
 
 /// 统一的连接错误信息。
@@ -681,8 +713,40 @@ mod tests {
         assert_eq!(s.port, 5432);
         assert_eq!(s.user, "postgres");
         assert_eq!(s.database, None);
+        assert_eq!(s.search_path, None);
         // 缺省 → Prefer（对齐 Npgsql，先试 TLS、服务器不支持时回退）
         assert_eq!(s.ssl_mode, PgSslMode::Prefer);
+    }
+
+    /// Search Path（VastBase/openGauss 常用）→ 连接参数 options。
+    #[test]
+    fn search_path_becomes_connection_options() {
+        let cs = ConnectionString::parse(
+            "Server=x;Database=d;provider=vastbase;Search Path=tenant1, public",
+        );
+        let s = parse_settings(&cs).unwrap();
+        assert_eq!(s.search_path.as_deref(), Some("tenant1, public"));
+        // 含空白 → 双引号包裹
+        assert_eq!(
+            search_path_options("tenant1, public"),
+            "-c search_path=\"tenant1, public\""
+        );
+        assert_eq!(search_path_options("public"), "-c search_path=public");
+        // 内部引号/反斜杠转义
+        assert_eq!(
+            search_path_options("a\"b"),
+            "-c search_path=\"a\\\"b\""
+        );
+
+        // SearchPath 与 Current Schema 变体（Npgsql / JDBC 风格）
+        let cs = ConnectionString::parse("Server=x;provider=postgresql;SearchPath=app");
+        assert_eq!(parse_settings(&cs).unwrap().search_path.as_deref(), Some("app"));
+        let cs = ConnectionString::parse("Server=x;provider=postgresql;Current Schema=app");
+        assert_eq!(parse_settings(&cs).unwrap().search_path.as_deref(), Some("app"));
+
+        // 未提供时不影响（None）
+        let cs = ConnectionString::parse("Server=x;provider=postgresql");
+        assert_eq!(parse_settings(&cs).unwrap().search_path, None);
     }
 
     #[test]

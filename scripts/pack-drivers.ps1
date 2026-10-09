@@ -35,6 +35,7 @@ Set-Location $root
 $defs = @{
     'mysql'      = @{ kind = 'MySql';      title = 'MySQL';                         features = 'driver-mysql,tls-native' }
     'postgresql' = @{ kind = 'PostgreSql'; title = 'PostgreSQL';                    features = 'driver-postgresql,tls-native' }
+    'vastbase'   = @{ kind = 'VastBase';   title = 'VastBase';                      features = 'driver-postgresql,tls-native'; notes = 'PostgreSQL 协议系国产数据库（海量 VastBase），与 PostgreSQL 驱动共享实现；连接串 provider=vastbase' }
     'sqlserver'  = @{ kind = 'SqlServer';  title = 'SQL Server';                    features = 'driver-sqlserver,tls-native' }
     'oracle'     = @{ kind = 'Oracle';     title = 'Oracle';                        features = 'driver-oracle,tls-native' }
     'firebird'   = @{ kind = 'Firebird';   title = 'Firebird';                      features = 'driver-firebird,tls-native' }

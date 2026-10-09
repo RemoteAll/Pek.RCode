@@ -278,7 +278,8 @@ impl DriverManager {
         }
         let cs = ConnectionString::parse(key);
         let kind = resolve_provider_kind(&cs)?;
-        let component = component_id_for(kind).ok_or_else(|| {
+        let provider = cs.provider().map(str::trim).unwrap_or_default();
+        let component = component_id_for_provider(kind, provider).ok_or_else(|| {
             Error::Argument(format!(
                 "驱动管理器：{} 为内嵌驱动（本地直接打开即可），无需下载驱动包",
                 kind.name()
@@ -357,7 +358,8 @@ impl DriverManager {
         }
         let cs = ConnectionString::parse(key);
         let kind = resolve_provider_kind(&cs)?;
-        let component = component_id_for(kind).ok_or_else(|| {
+        let provider = cs.provider().map(str::trim).unwrap_or_default();
+        let component = component_id_for_provider(kind, provider).ok_or_else(|| {
             Error::Argument(format!(
                 "驱动管理器：{} 为内嵌驱动（本地直接打开即可），无需下载驱动包",
                 kind.name()
@@ -719,6 +721,18 @@ fn component_id_for(kind: DatabaseKind) -> Option<String> {
     Some(format!("dbserver-{slug}"))
 }
 
+/// 数据库类型 + provider 名 → 平台组件 id。
+///
+/// 在 kind 级映射（[`component_id_for`]）之上处理带**独立组件**的同协议国产库：
+/// VastBase（海量）与 PostgreSQL 同协议，但平台按独立组件 `dbserver-vastbase` 分发
+/// （对齐 C# 的独立 VastBase 实现）；HighGo/KingBase 继续共用 `dbserver-postgresql`。
+fn component_id_for_provider(kind: DatabaseKind, provider: &str) -> Option<String> {
+    if provider.trim().eq_ignore_ascii_case("vastbase") {
+        return Some("dbserver-vastbase".to_string());
+    }
+    component_id_for(kind)
+}
+
 /// 连接串的驱动包需求分类（供消费方判断是否需要 [`DriverManager`]）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DriverPackNeed {
@@ -739,7 +753,7 @@ pub fn driver_pack_need(conn_str: &str) -> Result<DriverPackNeed> {
         return Ok(DriverPackNeed::Direct);
     }
     let kind = DatabaseKind::from_provider(provider)?;
-    Ok(match component_id_for(kind) {
+    Ok(match component_id_for_provider(kind, provider) {
         None => DriverPackNeed::Direct,
         Some(id) => DriverPackNeed::Component(id),
     })
@@ -1126,6 +1140,25 @@ mod tests {
         // 内嵌驱动无需驱动包
         assert_eq!(component_id_for(DatabaseKind::Sqlite), None);
         assert_eq!(component_id_for(DatabaseKind::DuckDb), None);
+
+        // provider 级映射：VastBase 独立组件；HighGo/KingBase 共用 PostgreSQL 组件
+        assert_eq!(
+            component_id_for_provider(DatabaseKind::PostgreSql, "vastbase").as_deref(),
+            Some("dbserver-vastbase")
+        );
+        assert_eq!(
+            component_id_for_provider(DatabaseKind::PostgreSql, "postgresql").as_deref(),
+            Some("dbserver-postgresql")
+        );
+        assert_eq!(
+            component_id_for_provider(DatabaseKind::PostgreSql, "highgo").as_deref(),
+            Some("dbserver-postgresql")
+        );
+        // 其余 provider 走 kind 级映射兜底
+        assert_eq!(
+            component_id_for_provider(DatabaseKind::MySql, "mysql").as_deref(),
+            Some("dbserver-mysql")
+        );
     }
 
     #[test]
@@ -1241,6 +1274,11 @@ mod tests {
         assert_eq!(
             driver_pack_need("Server=x;Provider=postgres").unwrap(),
             DriverPackNeed::Component("dbserver-postgresql".to_string())
+        );
+        // VastBase：独立组件（PG 同协议但平台按独立条目分发）
+        assert_eq!(
+            driver_pack_need("Server=x;Provider=vastbase").unwrap(),
+            DriverPackNeed::Component("dbserver-vastbase".to_string())
         );
         assert_eq!(
             driver_pack_need("Server=x;Provider=dm").unwrap(),

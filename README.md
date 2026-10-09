@@ -28,7 +28,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `sqlite` | `SQLite.cs` | ✅ **可执行**（rusqlite 内嵌，无外部依赖） |
 | `mysql` | `MySql.cs` | ✅ **可执行**（mysql crate，纯 Rust；连接串与 XCode 一致；TLS 已启用：Preferred 缺省可回退，Required/VerifyCA/VerifyFull 强制） |
 | `mssql` | `SqlServer.cs` | ✅ **可执行**（tiberius，纯 Rust TDS；同步接口内部维护专用 tokio 运行时） |
-| `postgres` | `PostgreSQL.cs` | ✅ **可执行**（postgres crate；HighGo/金仓/VastBase 同协议直接复用） |
+| `postgres` | `PostgreSQL.cs` | ✅ **可执行**（postgres crate；HighGo/金仓/VastBase 同协议直接复用，支持 `Search Path` 连接参数） |
 | `oracle` | `Oracle.cs` | ✅ **可执行**（oracle crate / OCI；运行时需 Instant Client；自增用序列 `SEQ_{表名}`） |
 | `duckdb` | `DuckDb.cs` | ✅ **可执行**（duckdb crate 内嵌引擎；`--features duckdb`，需 CMake 工具链） |
 | `clickhouse` | `ClickHouse.cs` | ✅ **可执行**（HTTP 接口 `:8123`，`TSVWithNamesAndTypes`） |
@@ -59,7 +59,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --kind entity,model,interface,biz / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`；`biz` 业务扩展**永不覆盖**、只合并缺失区块） |
 
-测试：**299 项全部通过**（库单测 254 + 集成 33 + 文档测试 12；`--features duckdb` 全量 306 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 300 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 260 项（rustls TLS 后端），`--no-default-features` 全量 260 项（完全不含 TLS 依赖）；
+测试：**309 项全部通过**（库单测 259 + 集成 38 + 文档测试 12；另 1 项忽略——批量基准 `--ignored` 手动运行；`--features driver-pack` 库单测 282 项）；`--features duckdb`（内嵌引擎全链路）、`--features redis`（版本号，`RCODE_REDIS` 门控）、`--no-default-features --features tls-rustls`（rustls TLS 后端）等组合按特性门控增减用例；
 MySQL / PostgreSQL / SQL Server / Oracle / network 端到端用例在有真实库/服务时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -77,7 +77,7 @@ DH.NCode 内置的全部数据库驱动均已接入（provider 名称与 XCode �
 
 | 状态 | 数据库 |
 |------|--------|
-| ✅ 已接入驱动 | SQLite、MySQL/MariaDB、SQL Server、PostgreSQL（含 HighGo/瀚高、KingBase/金仓、VastBase/海量）、Oracle、DuckDB、ClickHouse、TDengine、InfluxDB、SAP HANA、Firebird、DB2、达梦（DaMeng）、IRIS、Access、MongoDB、NovaDb（复用 MySQL 协议）、**network**（XCode 远程服务协议：SQL 转发到远端 DbServer，服务端可为 C# `DbServer` 或本仓 `examples/dbserver`） |
+| ✅ 已接入驱动 | SQLite、MySQL/MariaDB、SQL Server、PostgreSQL（含 HighGo/瀚高、KingBase/金仓）、VastBase/海量（PostgreSQL 协议，独立驱动组件）、Oracle、DuckDB、ClickHouse、TDengine、InfluxDB、SAP HANA、Firebird、DB2、达梦（DaMeng）、IRIS、Access、MongoDB、NovaDb（复用 MySQL 协议）、**network**（XCode 远程服务协议：SQL 转发到远端 DbServer，服务端可为 C# `DbServer` 或本仓 `examples/dbserver`） |
 | ⚠️ 边界 | `sqlce`（SSCE 已停止维护且无可行运行时；建议迁移 SQLite） |
 
 ---
@@ -232,6 +232,7 @@ let dal = Dal::open_with_model(
     "Server=10.0.0.6;Port=1521;ServiceName=xepdb1;Uid=dbuser;Pwd=***;provider=oracle", model)?;
 ```
 
+- VastBase（海量）：`provider=vastbase`（驱动组件 `dbserver-vastbase`）。连接串支持 `Search Path`/`SearchPath`/`Current Schema`（经连接参数下发，`current_schema()` 与表结构探测跟随该 schema）；建库语句为 `Create Database "x"`（内核不支持 `IF NOT EXISTS`/`ENCODING`，对齐 C# `VastBaseMetaData`）
 - 自增回写：PostgreSQL 用 `INSERT ... RETURNING`（对齐 DH.NCode 的 `RETURNING *`）；SQL Server 用 `SCOPE_IDENTITY()`；
   Oracle 用序列 `SEQ_{表名}`（建表/同步结构时自动创建，插入时写 `NEXTVAL`、随后读 `CURRVAL`）
 - 事务：PostgreSQL/MySQL/SQL Server 显式 `BEGIN`；Oracle 隐式事务（`begin()` 为空操作）
@@ -576,7 +577,7 @@ Pek.RCode/
 12. **`DAL_Backup`（备份/恢复/同步）** ✅ `backup` 模块：单表备份到 DbTable v3 文件（`.gz` 自动 GZip）、多表 zip 包（`{连接名}.xml` 模型 + `{实体名}.table`）、`restore`/`restore_all`（表名可从包内推导、`set_schema` 自动建表）、跨库 `sync_table`/`sync_all`；表头列名为实体属性名、行数上限 i32、NULL 折叠为类型默认值，均与 C# 一致；**C#↔Rust 双向实测互认**（C# `DbPackage` 导出 → Rust 恢复、Rust 备份 → C# 恢复，逐值核对一致，`RCODE_BACKUP_IMPORT`/`RCODE_BACKUP_EXPORT` 门控用例）
 13. **`DbMetaData` 在线库管理** ✅ `meta` 模块：建库/删库/存在性（文件库=文件操作；SQL 库按方言语句与元数据查询，逐一对齐各驱动覆写）、建表/删表（Firebird 连带序列）、列增/改/删、索引建/删、表列注释（`Comment On`/`Alter .. Comment`/`sp_addextendedproperty`）；无能力库返回 `false`（对齐 C# 空语句）
 14. **导航属性与行访问器** ✅ `navigation` 模块：`NavigationRegistry`（HasOne/HasMany，本地或进程级）+ `load_one`/`load_many` + `Entity::load`/`from_rows`（行集→实体，对应 `DataRowEntityAccessor.LoadData`）；C# 的 LINQ `Include`/反射注值在 Rust 无对应机制，以“注册表 + 显式装载”为对等能力面
-15. **驱动包按需分发（DriverManager）** ✅ `driver_pack` 模块（feature `driver-pack`）：应用按 `driver-*` 特性裁剪后，运行时从 **Pek.RPanlServer 组件源**（管理员「下载管理」；`/components/catalog.json` 同址 `.sig` 为 Ed25519 签名，与插件源同一把平台密钥）按需下载 `dbserver` 驱动包（SHA-256 强制校验）→ 解压本地缓存（`{cache}/{组件}/{版本}/`，临时目录 + 原子改名）→ 回环拉起宿主（端口 0 自动分配 + 一次性令牌）→ 解析就绪行 → 返回 `provider=network` 连接串；相同连接串复用宿主、`ensure_updated` 联网检查新版本、组件源不可用时回退本地缓存、`reap_idle` 空闲回收、析构自动停止全部宿主；驱动包由 `scripts/pack-drivers.ps1` 按驱动裁剪构建（实测 MySQL 2.4MB / PostgreSQL 2.2MB zip）；`examples/driver_fetch` 演示全流程（本机实测：平台下载 → 验签 → 拉起 → network 登录探明类型 → 回收，组件源不可达时离线降级正常）
+15. **驱动包按需分发（DriverManager）** ✅ `driver_pack` 模块（feature `driver-pack`）：应用按 `driver-*` 特性裁剪后，运行时从 **Pek.RPanlServer 组件源**（管理员「下载管理」；`/components/catalog.json` 同址 `.sig` 为 Ed25519 签名，与插件源同一把平台密钥）按需下载 `dbserver` 驱动包（SHA-256 强制校验）→ 解压本地缓存（`{cache}/{组件}/{版本}/`，临时目录 + 原子改名）→ 回环拉起宿主（端口 0 自动分配 + 一次性令牌）→ 解析就绪行 → 返回 `provider=network` 连接串；相同连接串复用宿主、`ensure_updated` 联网检查新版本、组件源不可用时回退本地缓存、`reap_idle` 空闲回收、析构自动停止全部宿主；驱动包由 `scripts/pack-drivers.ps1` 按驱动裁剪构建（实测 MySQL 2.4MB / PostgreSQL 2.2MB zip；VastBase 为独立组件 `dbserver-vastbase`，与 PostgreSQL 共享驱动实现）；`examples/driver_fetch` 演示全流程（本机实测：平台下载 → 验签 → 拉起 → network 登录探明类型 → 回收，组件源不可达时离线降级正常）
 16. **分表（`Shards` / `EntitySplit`）** ✅ `shards` 模块 + `snowflake` 模块：`TimeShardPolicy`（`TablePolicy`/`ConnPolicy`/`Step`/Level 与 C# 逐语义对齐，表名渲染含 .NET 日期格式子集 → 与 C# 共用同一批分表）；实体分表 CRUD（`insert_sharded`/`update_sharded`/`delete_sharded`/`save_sharded`/`find_sharded`，**写入自动建表**对齐 `EntitySession.CheckTable`、雪花主键自动生成并回写对应 `AutoFillSnowIdPrimaryKey`）；跨表查询 `query_sharded`（条件推导多表 + `FixOrder` + 跨表续页/跳过扣减，即 C# `FindAll` 分表分支全语义）、`count_sharded`（逐表求和）、`delete_where_sharded`、`auto_shard`（区间遍历仅走已存在分表）；`Where` 条件推导 `shards_of`/`shards_of_trim`（含 C# Trim 优化）；`rcodegen` 识别 `DataScale="timeShard:..."` 生成 `shard_policy()` 与 `set_field`（生成代码已编译验证）；**自动分库执行**：连接注册表（`register_connection`/`unregister_connection`，对应 C# `DAL.AddConnStr`/`DAL.Create`，名称大小写不敏感）按连接名自动路由，未注册连接名按 C# 规则自动落为 `{数据目录}/{连接名}.db`（`set_auto_db_dir` 可覆盖，连接名合法性校验同 C#）——跨库查询/计数/删除/遍历/删表与实体 CRUD **全自动切换会话**（跨库端到端用例已覆盖）
 17. **批量写入（`EntityExtension` / 数据库批能力）** ✅ `dialect`/`sqlbuild`/`dal`/`entity`/`entity_queue`：`TableRef::insert_batch`（**多行 `VALUES`**，按数据库单语句参数上限与 `batch_size` 分块；SQLite/MySQL/PostgreSQL/SQL Server/DuckDB 方言直写，其余数据库自动回退逐行）、`TableRef::delete_by_pk_values`（主键 `IN` 分批）；实体层 `insert_batch` / `insert_batch_sharded`（**对齐 C# `Insert(list)` 分表分支：提前计算分片 → 按（连接, 物理表）分组 → 分组批量插入**；跨库自动路由、雪花主键逐行生成回写、首行自增列为 0 时整批排除自增列——与 C# `BuildInsertColumns`/`BatchInsert` 一致）/ `save_batch` / `save_batch_sharded`（**对齐 C# `Save(list)`**：逐实体按 `save` 规则拆分——自增列 0/缺失或主键全空视为新增，其余更新/查库判定——新增合并批插、已存在逐条更新；分表版自动路由）/ `delete_batch` / `delete_batch_sharded`；**`SaveAsync` 等价物**：`Entity::enqueue_save` 入队（新增 → 插入入队合并批插；其余 → Upsert 入队）+ `EntityQueue::flush` 连续段自动合并批量（对应 C# `OnProcess` 的 `batch.Insert`/`batch.Save`；差异：无内置定时器与 `msDelay` 延迟集合、无同实体去重、不感知分表——定时刷入由调用方用 `dhrust::threading::Timer` 或异步任务驱动，分表批量落库用 `save_batch_sharded`）；默认批 5000/删除批 1000（对齐 C# `GetBatchSize`/删除分批；事务由调用方按需 `begin/commit` 包裹，同 C# 不做隐式事务）；**实测（SQLite, release 构建）**：普通插入 2000 行 62.2ms → 4.1ms（**15.3x**）、分表插入 3000 行/30 表 164.4ms → 31.5ms（**5.2x**）、分库分表 1000 行/2 库 56.9ms → 43.5ms（**1.3x**，分片越小单表批越小、收益越低）、主键删除 2000 行 23.3ms → 0.9ms（**25.8x**）；基准用例 `cargo test --test batch_e2e -- --ignored --nocapture`。**批量族全量补全（2026-10-09，对照 DH.NCode 逐项审计）**：`TableRef::write_batch`（Insert/InsertIgnore/Replace/Upsert 四模式多行实现 + 方言不支持时回退逐行/报错——与 C# 同矩阵）、实体族 `insert_ignore_batch` / `replace_batch` / `upsert_batch` / `upsert_batch_sharded` / `update_batch` / `update_batch_sharded`、`TableRef::delete_where_batched`（对应 C# `EntityPersistence.Delete(where, maximumRows)`：默认 10000/批、100ms 批间隙、`max_rows` 截断；MySQL `LIMIT`、SQL Server `TOP`、PostgreSQL `ctid`、Oracle `ROWID+ROWNUM`、SQLite `rowid`（本库增强）、其余方言回退一次性删除）、导航批量装载 `Navigation::load_ones` / `load_manys`（对应 LINQ `BatchLoadNavigations`：一次 `IN` 查询按值分组）；**审计已核对无需补齐**：备份分页读取（`DbPackage` 5000/页）、`BatchFinder`、队列连续段合并；**有意不做**：`Transform` 抽取器、脏跟踪（`Dirtys`/`UpdateColumns`）、Oracle/MySQL 参数数组式批量 Update（逐条回退语义等价）
 
