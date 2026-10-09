@@ -1704,6 +1704,47 @@ impl<'a> TableRef<'a> {
         self.delete_where(session, &filter)
     }
 
+    /// 自然键 upsert：按 `keys` 查行（取主键），命中则 `update_by_pk` 更新 `values`，
+    /// 未命中则插入 `keys + values + insert_extra`（`insert_extra` 为“仅插入”初值列，
+    /// 如统计计数置零；更新路径不碰这些列）；返回是否为插入（true = 新增）。
+    ///
+    /// `keys` 不得为空（空键会退化为“取首行更新”的危险语义，直接拒绝）。
+    pub fn upsert_by_key(
+        &self,
+        session: &mut dyn SqlSession,
+        keys: &[(&str, DbValue)],
+        values: &[(&str, DbValue)],
+        insert_extra: &[(&str, DbValue)],
+    ) -> Result<bool> {
+        if keys.is_empty() {
+            return Err(Error::Argument("自然键不能为空".into()));
+        }
+        let mut filter = Where::new();
+        for (name, value) in keys {
+            filter = filter.eq(*name, value.clone());
+        }
+        let found = self.query(
+            session,
+            &Query::new().column("Id").filter(filter).take(1),
+        )?;
+        if let Some(row) = found.first() {
+            let id = row
+                .get_by_name("Id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default();
+            self.update_by_pk(session, values, &[id.into()])?;
+            Ok(false)
+        } else {
+            let mut fields: Vec<(&str, DbValue)> =
+                Vec::with_capacity(keys.len() + values.len() + insert_extra.len());
+            fields.extend(keys.iter().map(|(k, v)| (*k, v.clone())));
+            fields.extend(values.iter().map(|(k, v)| (*k, v.clone())));
+            fields.extend(insert_extra.iter().map(|(k, v)| (*k, v.clone())));
+            self.insert(session, &fields)?;
+            Ok(true)
+        }
+    }
+
     /// 按条件删除，返回受影响行数（空条件会清空全表，请先用 [`Where::is_empty`] 防护）。
     ///
     /// 对应 C# `Entity.Delete(Expression)` 的单表部分；分表删除见 [`TableRef::delete_sharded`](crate::dal::TableRef::delete_sharded)。
@@ -1974,7 +2015,65 @@ mod tests {
     }
 
     #[test]
-    fn diff_schema_reports_and_exports_alter() {
+    fn upsert_by_key_inserts_then_updates() {
+        let dir = temp_dir("upsert");
+        let db = dir.join("test.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
+        dal.sync_schema().unwrap();
+
+        let mut session = dal.open_session().unwrap();
+        let table = dal.table("Order").unwrap();
+        let now = chrono::Local::now().naive_local();
+
+        // 首次：插入（CreateTime 为“仅插入”初值列）
+        let keys: [(&str, DbValue); 1] = [("Code", "A001".into())];
+        assert!(table
+            .upsert_by_key(
+                session.as_mut(),
+                &keys,
+                &[("Status", 1i32.into())],
+                &[("CreateTime", now.into())],
+            )
+            .unwrap());
+
+        // 再次：更新（不新增行；insert_extra 不参与更新）
+        let later = now + chrono::Duration::seconds(5);
+        assert!(!table
+            .upsert_by_key(
+                session.as_mut(),
+                &keys,
+                &[("Status", 2i32.into())],
+                &[("CreateTime", later.into())],
+            )
+            .unwrap());
+        let rows = table
+            .query(
+                session.as_mut(),
+                &Query::new().filter(Where::new().eq("Code", "A001")),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "自然键不应产生重复行");
+        assert_eq!(
+            rows.rows[0].get_by_name("Status").and_then(|v| v.as_i32()),
+            Some(2)
+        );
+        assert_eq!(
+            rows.rows[0].get_by_name("CreateTime").and_then(|v| v.as_datetime()),
+            Some(now),
+            "insert_extra 不应在更新时被覆盖"
+        );
+
+        // 空自然键：直接拒绝
+        assert!(table
+            .upsert_by_key(session.as_mut(), &[], &[], &[])
+            .is_err());
+
+        drop(session);
+        dal.clear_pool();
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
         let dir = temp_dir("diff");
         let db = dir.join("test.db");
         let conn = format!("Data Source={};Provider=SQLite", db.display());
