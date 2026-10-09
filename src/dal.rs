@@ -2074,6 +2074,9 @@ mod tests {
         drop(dal);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn diff_schema_reports_and_exports_alter() {
         let dir = temp_dir("diff");
         let db = dir.join("test.db");
         let conn = format!("Data Source={};Provider=SQLite", db.display());
