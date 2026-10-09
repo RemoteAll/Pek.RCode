@@ -158,7 +158,7 @@ impl Entity for EventLog {
 
 // ================= 测试基础设施 =================
 
-const MODEL: &str = r#"<EntityModel><Tables>
+const MODEL: &str = r#"<EntityModel><Option><ConnName>DH</ConnName></Option><Tables>
   <Table Name="TradeLog" TableName="TradeLog" Description="交易日志">
     <Columns>
       <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
@@ -653,6 +653,72 @@ fn drop_shards_removes_only_existing() {
             .drop_shards(&policy, day(2026, 9, 1), day(2026, 9, 3))
             .unwrap(),
         0
+    );
+
+    dal.clear_pool();
+    drop(session);
+    drop(dal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 连接级分片（`ConnPolicy`）：分片连接与当前连接不同时**显式报错**，绝不静默落到当前库。
+///
+/// 与 C# 的差异（有意）：C# 通过全局连接串注册表自动切库；Rust 侧跨连接执行需消费方
+/// 按 `ShardModel::conn_name` 路由多个 `Dal`（见 `shards` 模块文档）。
+#[test]
+fn cross_connection_shard_is_rejected_without_routing() {
+    let (dir, db) = temp_db("crossconn");
+    let dal = open_dal(&db);
+    dal.sync_schema().unwrap();
+
+    // 含连接模板的策略：模型 ConnName=DH → 分片连接 "DH_2026" ≠ "DH"
+    let policy = TimeShardPolicy::new("CreateTime")
+        .with_conn_policy("{0}_{1:yyyy}")
+        .with_table_policy("{0}_{1:yyyyMMdd}");
+    let mut session = dal.open_session().unwrap();
+
+    // 写：显式报错，且不会静默建表/写数据
+    let mut row = TradeLog::new(day(2026, 9, 1), "x");
+    let err = row
+        .insert_sharded(&dal, session.as_mut(), &policy)
+        .unwrap_err();
+    assert!(err.to_string().contains("分片连接"), "{err}");
+    assert!(
+        !session.table_exists("TradeLog_20260901").unwrap(),
+        "报错后不得静默创建分表"
+    );
+
+    // 先用"纯表分片"策略写入一行，再验证跨连接策略的读/计数/删除/遍历/删表均报错
+    let table_policy = day_policy();
+    TradeLog::new(day(2026, 9, 1), "y")
+        .insert_sharded(&dal, session.as_mut(), &table_policy)
+        .unwrap();
+
+    let table = dal.table("TradeLog").unwrap();
+    let filter = Where::new().eq("CreateTime", day(2026, 9, 1));
+    assert!(
+        table
+            .query_sharded(session.as_mut(), &policy, &Query::new().filter(filter.clone()))
+            .is_err()
+    );
+    assert!(table.count_sharded(session.as_mut(), &policy, Some(&filter)).is_err());
+    assert!(table.delete_sharded(session.as_mut(), &policy, &filter).is_err());
+    assert!(
+        table
+            .auto_shard(&policy, day(2026, 9, 1), day(2026, 9, 2), |t, s| t.count(s, None))
+            .is_err()
+    );
+    assert!(table.drop_shards(&policy, day(2026, 9, 1), day(2026, 9, 2)).is_err());
+
+    // 同一策略在"连接名与当前连接一致"时正常执行（消费方可按连接名路由后复用同一引擎）
+    let same_conn_policy = TimeShardPolicy::new("CreateTime")
+        .with_conn_policy("{0}")
+        .with_table_policy("{0}_{1:yyyyMMdd}");
+    assert_eq!(
+        table
+            .count_sharded(session.as_mut(), &same_conn_policy, Some(&filter))
+            .unwrap(),
+        1
     );
 
     dal.clear_pool();

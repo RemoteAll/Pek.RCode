@@ -58,7 +58,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `codegen` | `xcode` 命令（XCodeTool） | ✅ `Model.xml` → Rust **对象实体**（结构体 + `Entity` 实现 + `new()/Default`） |
 | `rcodegen` 工具 | `xcode` 命令行 | ✅ 独立生成工具（`--list / --table / --kind entity,model,interface,biz / --dry-run / --force`；`--conn` 反向工程：库 → `Model.xml`；`biz` 业务扩展**永不覆盖**、只合并缺失区块） |
 
-测试：**286 项全部通过**（库单测 250 + 集成 25 + 文档测试 11；`--features duckdb` 全量 293 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 287 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 247 项（rustls TLS 后端），`--no-default-features` 全量 247 项（完全不含 TLS 依赖）；
+测试：**287 项全部通过**（库单测 250 + 集成 26 + 文档测试 11；`--features duckdb` 全量 294 项（另含 DuckDB 内嵌引擎全链路用例），`--features redis` 全量 288 项（另含 Redis 版本号用例，`RCODE_REDIS` 门控），`--no-default-features --features tls-rustls` 全量 248 项（rustls TLS 后端），`--no-default-features` 全量 248 项（完全不含 TLS 依赖）；
 MySQL / PostgreSQL / SQL Server / Oracle / network 端到端用例在有真实库/服务时自动启用），
 其中包括生产模型快照固件（7 张真实表，覆盖全部 8 种数据类型）的端到端回归、
 **对象实体（Entity）在 SQLite 与 MySQL / PostgreSQL / SQL Server / Oracle 各条链路的端到端用例**
@@ -373,7 +373,8 @@ let dropped = dal.table("WmsLog")?.drop_shards(&policy, start, end)?;
 - 分表**写操作自动建表**（结构照抄模型含索引；`Migration=Off` / 只读档不建——对齐 C# `EntitySession.CheckTable`）；读操作跳过不存在的分表；
 - 雪花 Id 分表：`insert_sharded` 在 Id 为空时自动生成并回写实体（对应 `AutoFillSnowIdPrimaryKey`）；
   `snowflake::Snowflake` 与 C# 位级互通，`id_at(t)`（对应 C# `GetId`）可用于构建 Id 区间条件；
-- 与 C# 的差异：连接级分表（`ConnPolicy`）只参与连接名 / 表名计算，跨连接执行需消费方按连接名路由多个 `Dal`；
+- 与 C# 的差异：连接级分表（`ConnPolicy`）只参与连接名 / 表名计算，跨连接执行需消费方按连接名路由多个 `Dal`
+  （分片连接与当前连接不同时引擎**显式报错**，不会静默落到当前库）；
   `BETWEEN` 条件按 SQL 闭区间处理（右端 +1 秒参与扫描，只会多扫、不会漏）。
 
 ### 结构迁移档位（对应 DH.NCode 的 `Migration` 枚举）

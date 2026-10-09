@@ -520,9 +520,12 @@ fn resolve_shard_table<'a, E: Entity>(
     ensure: bool,
 ) -> Result<Option<TableRef<'a>>> {
     let handle = dal.table(E::table())?;
-    let Some(model) = policy.shard_of_value(handle.shard_base(), value)? else {
+    let base = handle.shard_base();
+    let Some(model) = policy.shard_of_value(base, value)? else {
         return Ok(None);
     };
+    // 连接级分片（ConnPolicy）与当前连接不一致时显式报错（不静默落到当前库）
+    crate::shards::ensure_conn_in_sync(base, &model)?;
     let physical = model
         .table_name
         .unwrap_or_else(|| handle.meta().effective_table_name().to_string());

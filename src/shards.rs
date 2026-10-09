@@ -24,7 +24,8 @@
 //!   分表表名以显式表句柄（[`crate::dal::Dal::table_as`]）承载，由本模块的引擎方法自动切换；
 //! - `Where` 中的 `BETWEEN` 按 SQL 闭区间语义处理（右端 +1 秒参与扫描），只会多扫一个边界分表，不会漏数据；
 //! - 连接级分表（`ConnPolicy`）只参与**连接名 / 表名计算**（见 [`ShardModel::conn_name`]）；
-//!   跨连接执行需要消费方按连接名自行路由多个 `Dal`，本库里单次执行只切换表名部分；
+//!   跨连接执行需要消费方按连接名自行路由多个 `Dal`——若分片连接与当前连接不同，引擎会
+//!   **显式报错**（绝不静默落到当前库），不会自动切换连接；
 //! - 日期格式只实现了 .NET 自定义格式的常用子集：`y/yy/yyyy`、`M/MM`、`d/dd`、`H/HH`、`m/mm`、`s/ss`、`f...`（小数秒截断）
 //!   以及 `\x` / `'...'` 字面量转义；`ddd` / `MMMM` 等名称形式按数字处理。
 
@@ -665,6 +666,21 @@ fn push_number(out: &mut String, value: i64, run: usize) {
     }
 }
 
+/// 校验分片连接：分片连接名与基础连接一致（或未产生连接名）才能在当前 `Dal` 内执行。
+///
+/// 连接级分片（`ConnPolicy`）在 C# 中通过全局连接串注册表（`DAL.Create(connName)`）切换连接；
+/// Rust 侧不引入全局连接注册表，**跨连接执行需消费方按连接名路由**。为避免静默把数据写到
+/// 当前库，这里对"分片连接 ≠ 当前连接"显式返回错误（而非忽略连接名）。
+pub(crate) fn ensure_conn_in_sync(base: ShardBase<'_>, model: &ShardModel) -> Result<()> {
+    match &model.conn_name {
+        Some(conn) if Some(conn.as_str()) != base.conn_name => Err(Error::Unsupported(format!(
+            "分片连接 [{conn}] 与当前连接 [{}] 不同：跨连接（分库）执行需要消费方按连接名路由（参见 shards 模块文档），当前连接内无法安全执行",
+            base.conn_name.unwrap_or("（未配置）")
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// 调整分表顺序（对应 C# `FixOrder`）：按分表字段排序时，分表按"连接名、表名"升/降序排列。
 fn fix_shard_order(
     shards: Vec<ShardModel>,
@@ -767,6 +783,7 @@ impl<'a> TableRef<'a> {
         let mut rows: Vec<DbRow> = Vec::new();
 
         for (index, shard) in shards.iter().enumerate() {
+            ensure_conn_in_sync(base, shard)?;
             let physical = shard
                 .table_name
                 .clone()
@@ -836,6 +853,7 @@ impl<'a> TableRef<'a> {
         let meta = self.meta();
         let mut total = 0i64;
         for shard in shards {
+            ensure_conn_in_sync(base, &shard)?;
             let physical = shard
                 .table_name
                 .clone()
@@ -873,6 +891,7 @@ impl<'a> TableRef<'a> {
         let meta = self.meta();
         let mut total = 0u64;
         for shard in shards {
+            ensure_conn_in_sync(base, &shard)?;
             let physical = shard
                 .table_name
                 .clone()
@@ -907,6 +926,7 @@ impl<'a> TableRef<'a> {
 
         let mut results = Vec::new();
         for shard in shards {
+            ensure_conn_in_sync(base, &shard)?;
             // 与 C# `AutoShard` 一致：未计算表名的分表跳过
             let Some(physical) = shard.table_name else {
                 continue;
@@ -939,6 +959,7 @@ impl<'a> TableRef<'a> {
         let mut session = self.dal().open_session()?;
         let mut dropped = 0;
         for shard in shards {
+            ensure_conn_in_sync(base, &shard)?;
             let Some(physical) = shard.table_name else {
                 continue;
             };
