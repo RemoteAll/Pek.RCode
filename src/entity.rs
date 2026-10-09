@@ -59,6 +59,8 @@
 //! # }
 //! ```
 
+use std::sync::Arc;
+
 use crate::{
     dal::{Dal, TableRef},
     error::{Error, Result},
@@ -321,13 +323,21 @@ pub trait Entity: Sized {
             generated = Some(new_id);
         }
 
-        let table = match resolve_shard_table::<Self>(dal, policy, &value, true)? {
-            Some(table) => table,
-            None => dal.table(Self::table())?,
-        };
-        let id = self.insert_with(&table, session)?;
-        // 雪花主键（无自增列）时返回生成值，便于调用方直接使用
-        Ok(generated.unwrap_or(id))
+        match resolve_shard_target::<Self>(dal, policy, &value)? {
+            Some(target) => {
+                ensure_shard_target(&target, dal, Self::table())?;
+                let id = run_on_shard_target(&target, dal, Self::table(), session, |t, s| {
+                    self.insert_with(t, s)
+                })?;
+                // 雪花主键（无自增列）时返回生成值，便于调用方直接使用
+                Ok(generated.unwrap_or(id))
+            }
+            None => {
+                let table = dal.table(Self::table())?;
+                let id = self.insert_with(&table, session)?;
+                Ok(generated.unwrap_or(id))
+            }
+        }
     }
 
     /// 更新本对象所在分表的行（按 `policy.field` 字段值路由；分表不存在时自动建表，对齐 C#）。
@@ -338,11 +348,18 @@ pub trait Entity: Sized {
         policy: &TimeShardPolicy,
     ) -> Result<u64> {
         let value = shard_value_of(self, policy)?;
-        let table = match resolve_shard_table::<Self>(dal, policy, &value, true)? {
-            Some(table) => table,
-            None => dal.table(Self::table())?,
-        };
-        self.update_with(&table, session)
+        match resolve_shard_target::<Self>(dal, policy, &value)? {
+            Some(target) => {
+                ensure_shard_target(&target, dal, Self::table())?;
+                run_on_shard_target(&target, dal, Self::table(), session, |t, s| {
+                    self.update_with(t, s)
+                })
+            }
+            None => {
+                let table = dal.table(Self::table())?;
+                self.update_with(&table, session)
+            }
+        }
     }
 
     /// 删除本对象所在分表的行（按 `policy.field` 字段值路由；分表不存在时自动建表，对齐 C#）。
@@ -353,11 +370,18 @@ pub trait Entity: Sized {
         policy: &TimeShardPolicy,
     ) -> Result<u64> {
         let value = shard_value_of(self, policy)?;
-        let table = match resolve_shard_table::<Self>(dal, policy, &value, true)? {
-            Some(table) => table,
-            None => dal.table(Self::table())?,
-        };
-        self.delete_with(&table, session)
+        match resolve_shard_target::<Self>(dal, policy, &value)? {
+            Some(target) => {
+                ensure_shard_target(&target, dal, Self::table())?;
+                run_on_shard_target(&target, dal, Self::table(), session, |t, s| {
+                    self.delete_with(t, s)
+                })
+            }
+            None => {
+                let table = dal.table(Self::table())?;
+                self.delete_with(&table, session)
+            }
+        }
     }
 
     /// 保存到分表（对应 C# `Save()` 的分表分支）：
@@ -411,14 +435,19 @@ pub trait Entity: Sized {
                 let fields = self.to_fields();
                 let pk = pk_values_of(&fields, Self::primary_keys())?;
                 let value = shard_value_of(self, policy)?;
-                match resolve_shard_table::<Self>(dal, policy, &value, false)? {
-                    Some(table) => {
-                        if !session.table_exists(table.physical_name())? {
-                            true
-                        } else {
-                            table.find_by_pk(session, &pk)?.is_none()
-                        }
-                    }
+                match resolve_shard_target::<Self>(dal, policy, &value)? {
+                    Some(target) => run_on_shard_target(
+                        &target,
+                        dal,
+                        Self::table(),
+                        session,
+                        |t, s| {
+                            if !s.table_exists(t.physical_name())? {
+                                return Ok(true);
+                            }
+                            Ok(t.find_by_pk(s, &pk)?.is_none())
+                        },
+                    )?,
                     None => Self::find(dal, session, &pk)?.is_none(),
                 }
             }
@@ -442,16 +471,15 @@ pub trait Entity: Sized {
         value: &DbValue,
         pk: &[DbValue],
     ) -> Result<Option<Self>> {
-        match resolve_shard_table::<Self>(dal, policy, value, false)? {
-            Some(table) => {
-                if !session.table_exists(table.physical_name())? {
+        match resolve_shard_target::<Self>(dal, policy, value)? {
+            Some(target) => run_on_shard_target(&target, dal, Self::table(), session, |t, s| {
+                if !s.table_exists(t.physical_name())? {
                     return Ok(None);
                 }
-                table
-                    .find_by_pk(session, pk)?
+                t.find_by_pk(s, pk)?
                     .map(|row| Self::from_row(&row))
                     .transpose()
-            }
+            }),
             None => Self::find(dal, session, pk),
         }
     }
@@ -509,30 +537,76 @@ fn shard_value_of<E: Entity>(entity: &E, policy: &TimeShardPolicy) -> Result<DbV
         })
 }
 
-/// 解析分表句柄（对应 C# `Meta.CreateShard`）：
+/// 分表目标（对应 C# `Meta.CreateShard` 的解析结果）：物理表名 + 目标数据访问层。
+struct ShardTarget {
+    /// 目标连接（`None` = 当前基础连接）
+    dal: Option<Arc<Dal>>,
+    /// 物理表名
+    physical: String,
+}
+
+/// 解析分表目标（对应 C# `Meta.CreateShard`）：
 ///
-/// - 策略未配置模板 → `Ok(None)`（调用方回退基础表）；
-/// - `ensure = true` 时对分表自动建表（写操作路径，对齐 C# `EntitySession.CheckTable`）。
-fn resolve_shard_table<'a, E: Entity>(
-    dal: &'a Dal,
+/// - 策略未配置分表模板 → `Ok(None)`（调用方回退基础表）；
+/// - 分库（`ConnPolicy`）：目标连接由 [`crate::shards::resolve_shard_dal`] 解析
+///   （注册连接 / 未注册时按 C# 规则自动落 SQLite 库），执行时自动切换会话；
+/// - 写操作对分表自动建表（对齐 C# `EntitySession.CheckTable`），见 [`ensure_shard_target`]。
+fn resolve_shard_target<E: Entity>(
+    dal: &Dal,
     policy: &TimeShardPolicy,
     value: &DbValue,
-    ensure: bool,
-) -> Result<Option<TableRef<'a>>> {
+) -> Result<Option<ShardTarget>> {
     let handle = dal.table(E::table())?;
     let base = handle.shard_base();
     let Some(model) = policy.shard_of_value(base, value)? else {
         return Ok(None);
     };
-    // 连接级分片（ConnPolicy）与当前连接不一致时显式报错（不静默落到当前库）
-    crate::shards::ensure_conn_in_sync(base, &model)?;
+    let target = crate::shards::resolve_shard_dal(&model, base, dal)?;
     let physical = model
         .table_name
         .unwrap_or_else(|| handle.meta().effective_table_name().to_string());
-    if ensure {
-        dal.ensure_shard_table(E::table(), &physical)?;
+    Ok(Some(ShardTarget {
+        dal: target,
+        physical,
+    }))
+}
+
+/// 确保分表在目标连接上存在（`Off` / 只读档不建，对齐 C# `EntitySession.CheckTable`）。
+fn ensure_shard_target(target: &ShardTarget, base_dal: &Dal, table: &str) -> Result<()> {
+    match &target.dal {
+        None => {
+            base_dal.ensure_shard_table(table, &target.physical)?;
+        }
+        Some(d) => {
+            d.ensure_shard_table(table, &target.physical)?;
+        }
     }
-    Ok(Some(dal.table_as(E::table(), &physical)?))
+    Ok(())
+}
+
+/// 在分表目标上执行单行操作：基础连接沿用调用方会话，跨库连接自动打开独立会话
+/// （来自目标连接的会话池，随本次调用归还）。
+fn run_on_shard_target<T, F>(
+    target: &ShardTarget,
+    base_dal: &Dal,
+    table: &str,
+    session: &mut dyn SqlSession,
+    func: F,
+) -> Result<T>
+where
+    F: FnOnce(&TableRef<'_>, &mut dyn SqlSession) -> Result<T>,
+{
+    match &target.dal {
+        None => {
+            let handle = base_dal.table_as(table, &target.physical)?;
+            func(&handle, session)
+        }
+        Some(d) => {
+            let handle = d.table_as(table, &target.physical)?;
+            let mut own = d.open_session()?;
+            func(&handle, own.as_mut())
+        }
+    }
 }
 
 /// 从字段列表按主键顺序提取主键值。

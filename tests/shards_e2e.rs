@@ -6,6 +6,7 @@
 //! - 跨表分页 / 计数 / 条件删除 / AutoShard / 缺失分表跳过 / 迁移档位 Off 不建表
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use pek_rcode::shards::{self, TimeShardPolicy};
@@ -661,66 +662,192 @@ fn drop_shards_removes_only_existing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 连接级分片（`ConnPolicy`）：分片连接与当前连接不同时**显式报错**，绝不静默落到当前库。
+/// 连接级分片（`ConnPolicy`）：按 C# `DAL.Create` 语义**自动跨库执行**。
 ///
-/// 与 C# 的差异（有意）：C# 通过全局连接串注册表自动切库；Rust 侧跨连接执行需消费方
-/// 按 `ShardModel::conn_name` 路由多个 `Dal`（见 `shards` 模块文档）。
+/// - 分片连接与基础连接一致 → 沿用当前连接；
+/// - 已注册连接（[`shards::register_connection`]，对应 `DAL.AddConnStr`）→ 路由到注册的 `Dal`；
+/// - 未注册连接名 → 按 C# 规则自动落为 `{自动目录}/{连接名}.db` 的 SQLite 库；
+/// - 连接名大小写不敏感；跨库查询 / 计数 / 删除 / 遍历 / 删表全自动路由。
 #[test]
-fn cross_connection_shard_is_rejected_without_routing() {
+fn cross_connection_shards_route_by_conn_name() {
     let (dir, db) = temp_db("crossconn");
     let dal = open_dal(&db);
     dal.sync_schema().unwrap();
 
-    // 含连接模板的策略：模型 ConnName=DH → 分片连接 "DH_2026" ≠ "DH"
+    // "DH_2027" 注册为独立库（模拟分库：另一个 SQLite 文件，结构同模型）
+    let db27 = dir.join("dh2027.db");
+    let dal27 = Arc::new(
+        Dal::open_with_model(
+            &format!("Data Source={};Provider=SQLite", db27.display()),
+            EntityModel::parse(MODEL).unwrap(),
+        )
+        .unwrap(),
+    );
+    dal27.sync_schema().unwrap();
+    shards::register_connection("DH_2027", dal27.clone()).unwrap();
+    // 未注册连接的自动 SQLite 回退目录指向测试目录（默认是 {程序目录}/Data）
+    shards::set_auto_db_dir(dir.join("auto"));
+
+    // 连接名大小写不敏感（对齐 C# ConnStrs 的 OrdinalIgnoreCase）
+    assert!(shards::registered_connection("dh_2027").is_some());
+    assert!(shards::registered_connection("DH_2027").is_some());
+
     let policy = TimeShardPolicy::new("CreateTime")
         .with_conn_policy("{0}_{1:yyyy}")
         .with_table_policy("{0}_{1:yyyyMMdd}");
     let mut session = dal.open_session().unwrap();
 
-    // 写：显式报错，且不会静默建表/写数据
-    let mut row = TradeLog::new(day(2026, 9, 1), "x");
-    let err = row
+    // 写：2026（未注册 → 自动库）/ 2027（已注册 → 指定库）
+    let id26 = TradeLog::new(day(2026, 9, 1), "a")
         .insert_sharded(&dal, session.as_mut(), &policy)
-        .unwrap_err();
-    assert!(err.to_string().contains("分片连接"), "{err}");
-    assert!(
-        !session.table_exists("TradeLog_20260901").unwrap(),
-        "报错后不得静默创建分表"
-    );
-
-    // 先用"纯表分片"策略写入一行，再验证跨连接策略的读/计数/删除/遍历/删表均报错
-    let table_policy = day_policy();
-    TradeLog::new(day(2026, 9, 1), "y")
-        .insert_sharded(&dal, session.as_mut(), &table_policy)
         .unwrap();
+    TradeLog::new(day(2027, 9, 1), "b")
+        .insert_sharded(&dal, session.as_mut(), &policy)
+        .unwrap();
+    assert!(id26 > 0);
 
+    // 各库落表正确，基础库无跨库分表
+    let auto_db = dir.join("auto").join("DH_2026.db");
+    assert!(
+        auto_db.exists(),
+        "未注册连接应自动创建 SQLite 库：{}",
+        auto_db.display()
+    );
+    let auto_dal = open_dal(&auto_db);
+    assert!(
+        auto_dal
+            .open_session()
+            .unwrap()
+            .table_exists("TradeLog_20260901")
+            .unwrap()
+    );
+    assert!(
+        dal27
+            .open_session()
+            .unwrap()
+            .table_exists("TradeLog_20270901")
+            .unwrap()
+    );
+    assert!(!session.table_exists("TradeLog_20260901").unwrap());
+    assert!(!session.table_exists("TradeLog_20270901").unwrap());
+
+    // 跨库单行读取（自动库） + 更新回自动库
+    let mut found = TradeLog::find_sharded(
+        &dal,
+        session.as_mut(),
+        &policy,
+        &DbValue::DateTime(day(2026, 9, 1)),
+        &[id26.into()],
+    )
+    .unwrap()
+    .expect("应能跨库找到 2026 行");
+    assert_eq!(found.note, "a");
+    found.note = "a2".into();
+    assert_eq!(
+        found.update_sharded(&dal, session.as_mut(), &policy).unwrap(),
+        1
+    );
+
+    // 跨库查询：2026（自动库）+ 2027（注册库）自动合并
+    let filter = Where::new()
+        .ge("CreateTime", day(2026, 1, 1))
+        .lt("CreateTime", day(2028, 1, 1));
     let table = dal.table("TradeLog").unwrap();
-    let filter = Where::new().eq("CreateTime", day(2026, 9, 1));
-    assert!(
-        table
-            .query_sharded(session.as_mut(), &policy, &Query::new().filter(filter.clone()))
-            .is_err()
-    );
-    assert!(table.count_sharded(session.as_mut(), &policy, Some(&filter)).is_err());
-    assert!(table.delete_sharded(session.as_mut(), &policy, &filter).is_err());
-    assert!(
-        table
-            .auto_shard(&policy, day(2026, 9, 1), day(2026, 9, 2), |t, s| t.count(s, None))
-            .is_err()
-    );
-    assert!(table.drop_shards(&policy, day(2026, 9, 1), day(2026, 9, 2)).is_err());
+    let set = table
+        .query_sharded(
+            session.as_mut(),
+            &policy,
+            &Query::new()
+                .filter(filter.clone())
+                .order_by("CreateTime", false),
+        )
+        .unwrap();
+    let notes: Vec<String> = set
+        .rows
+        .iter()
+        .map(|r| r.get_by_name("Note").map(DbValue::to_text).unwrap_or_default())
+        .collect();
+    assert_eq!(notes, vec!["a2".to_string(), "b".to_string()]);
 
-    // 同一策略在"连接名与当前连接一致"时正常执行（消费方可按连接名路由后复用同一引擎）
-    let same_conn_policy = TimeShardPolicy::new("CreateTime")
-        .with_conn_policy("{0}")
-        .with_table_policy("{0}_{1:yyyyMMdd}");
+    // 跨库分页：第 2 页（每页 1 条）应为 2027 行（跳过自动库中的 1 行，对应 C# `row -= skipCount`）
+    let page2 = table
+        .query_sharded(
+            session.as_mut(),
+            &policy,
+            &Query::new()
+                .filter(filter.clone())
+                .order_by("CreateTime", false)
+                .page(2, 1),
+        )
+        .unwrap();
+    let page2_notes: Vec<String> = page2
+        .rows
+        .iter()
+        .map(|r| r.get_by_name("Note").map(DbValue::to_text).unwrap_or_default())
+        .collect();
+    assert_eq!(page2_notes, vec!["b".to_string()]);
+
+    // 跨库计数
     assert_eq!(
         table
-            .count_sharded(session.as_mut(), &same_conn_policy, Some(&filter))
+            .count_sharded(session.as_mut(), &policy, Some(&filter))
+            .unwrap(),
+        2
+    );
+
+    // 跨库遍历（AutoShard）：2026-09-01 所在分表在自动库
+    let seen = table
+        .auto_shard(&policy, day(2026, 9, 1), day(2026, 9, 2), |t, s| {
+            Ok((t.physical_name().to_string(), t.count(s, None)?))
+        })
+        .unwrap();
+    assert_eq!(seen, vec![("TradeLog_20260901".to_string(), 1)]);
+
+    // 跨库条件删除：只删 2027（注册库）那行
+    let del = Where::new().eq("CreateTime", day(2027, 9, 1));
+    assert_eq!(
+        table.delete_sharded(session.as_mut(), &policy, &del).unwrap(),
+        1
+    );
+    assert_eq!(
+        table
+            .count_sharded(session.as_mut(), &policy, Some(&filter))
             .unwrap(),
         1
     );
 
+    // 跨库删表（DropWith）：删掉 2027 分表
+    assert_eq!(
+        table
+            .drop_shards(&policy, day(2027, 9, 1), day(2027, 9, 2))
+            .unwrap(),
+        1
+    );
+    assert!(
+        !dal27
+            .open_session()
+            .unwrap()
+            .table_exists("TradeLog_20270901")
+            .unwrap()
+    );
+
+    // 连接名与基础连接一致（"{0}" → "DH"）→ 沿用当前连接（写基础库分表）
+    let same_conn = TimeShardPolicy::new("CreateTime")
+        .with_conn_policy("{0}")
+        .with_table_policy("{0}_{1:yyyyMMdd}");
+    TradeLog::new(day(2026, 9, 2), "same")
+        .insert_sharded(&dal, session.as_mut(), &same_conn)
+        .unwrap();
+    assert!(session.table_exists("TradeLog_20260902").unwrap());
+
+    // 清理：注销注册连接并回收连接池，避免 Windows 下文件占用
+    if let Some(d) = shards::registered_connection("DH_2026") {
+        d.clear_pool();
+    }
+    shards::unregister_connection("DH_2026");
+    dal27.clear_pool();
+    shards::unregister_connection("DH_2027");
+    auto_dal.clear_pool();
     dal.clear_pool();
     drop(session);
     drop(dal);

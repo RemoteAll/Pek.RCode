@@ -17,24 +17,27 @@
 //! | `FindAll` 分表分支（跨表分页） | [`TableRef::query_sharded`] |
 //! | `FindCount` 分表求和 | [`TableRef::count_sharded`] |
 //! | `Delete(expression)` 分表 | [`TableRef::delete_sharded`] |
+//! | `DAL.AddConnStr` / `DAL.Create`（连接解析） | [`register_connection`] / [`registered_connection`]（未注册连接名自动 SQLite 回退，同 C#） |
 //!
 //! ## 与 C# 的差异（有意为之，均已在代码注释说明）
 //!
-//! - C# 通过全局可变的 `Meta.TableName` 切换分表上下文；Rust **不引入全局可变状态**，
+//! - C# 通过全局可变的 `Meta.TableName` 切换分表上下文；Rust **不引入分表上下文全局状态**，
 //!   分表表名以显式表句柄（[`crate::dal::Dal::table_as`]）承载，由本模块的引擎方法自动切换；
 //! - `Where` 中的 `BETWEEN` 按 SQL 闭区间语义处理（右端 +1 秒参与扫描），只会多扫一个边界分表，不会漏数据；
-//! - 连接级分表（`ConnPolicy`）只参与**连接名 / 表名计算**（见 [`ShardModel::conn_name`]）；
-//!   跨连接执行需要消费方按连接名自行路由多个 `Dal`——若分片连接与当前连接不同，引擎会
-//!   **显式报错**（绝不静默落到当前库），不会自动切换连接；
+//! - 连接级分表（`ConnPolicy`）**支持自动跨库执行**：按连接名从命名连接注册表
+//!   （[`register_connection`]，对应 C# `DAL.AddConnStr`）解析目标 `Dal`；未注册的连接名按
+//!   C# 规则**自动落为 SQLite 库** `{数据目录}/{连接名}.db`（默认 `{程序目录}/Data`，
+//!   可用 [`set_auto_db_dir`] 覆盖）——与 C# `DAL.Init` 的自动建库行为一致；
 //! - 日期格式只实现了 .NET 自定义格式的常用子集：`y/yy/yyyy`、`M/MM`、`d/dd`、`H/HH`、`m/mm`、`s/ss`、`f...`（小数秒截断）
 //!   以及 `\x` / `'...'` 字面量转义；`ddd` / `MMMM` 等名称形式按数字处理。
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeDelta, Timelike};
 
-use crate::dal::TableRef;
+use crate::dal::{Dal, TableRef};
 use crate::error::{Error, Result};
 use crate::model::TableMeta;
 use crate::query::{Op, OrderBy, Query, Where};
@@ -666,18 +669,172 @@ fn push_number(out: &mut String, value: i64, run: usize) {
     }
 }
 
-/// 校验分片连接：分片连接名与基础连接一致（或未产生连接名）才能在当前 `Dal` 内执行。
+// ==================== 命名连接注册表（对应 C# `DAL.AddConnStr` / `DAL.Create`） ====================
+
+/// 命名连接注册表：分库（`ConnPolicy`）执行时按连接名解析目标 [`Dal`]。
 ///
-/// 连接级分片（`ConnPolicy`）在 C# 中通过全局连接串注册表（`DAL.Create(connName)`）切换连接；
-/// Rust 侧不引入全局连接注册表，**跨连接执行需消费方按连接名路由**。为避免静默把数据写到
-/// 当前库，这里对"分片连接 ≠ 当前连接"显式返回错误（而非忽略连接名）。
-pub(crate) fn ensure_conn_in_sync(base: ShardBase<'_>, model: &ShardModel) -> Result<()> {
-    match &model.conn_name {
-        Some(conn) if Some(conn.as_str()) != base.conn_name => Err(Error::Unsupported(format!(
-            "分片连接 [{conn}] 与当前连接 [{}] 不同：跨连接（分库）执行需要消费方按连接名路由（参见 shards 模块文档），当前连接内无法安全执行",
-            base.conn_name.unwrap_or("（未配置）")
-        ))),
-        _ => Ok(()),
+/// 名称匹配**大小写不敏感**（对齐 C# `ConnStrs` 的 `StringComparer.OrdinalIgnoreCase`）；
+/// 未注册的连接名在解析时按 C# 规则自动创建 SQLite 库（见 [`resolve_shard_dal`]）并缓存于此。
+static CONNECTIONS: OnceLock<Mutex<HashMap<String, Arc<Dal>>>> = OnceLock::new();
+
+/// 未注册连接名的自动 SQLite 数据目录覆盖（`None` = 默认 `{程序目录}/Data`，对齐 C# `Setting.DataPath`）。
+static AUTO_DB_DIR: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+
+fn connections() -> &'static Mutex<HashMap<String, Arc<Dal>>> {
+    CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn auto_db_dir_slot() -> &'static RwLock<Option<PathBuf>> {
+    AUTO_DB_DIR.get_or_init(|| RwLock::new(None))
+}
+
+/// 注册命名连接（对应 C# `DAL.AddConnStr(connName, connStr)`）：`ConnPolicy` 生成的分片连接名
+/// 在执行时经此表解析到目标 [`Dal`]。
+///
+/// - 名称匹配**大小写不敏感**；同名重复注册覆盖旧值；
+/// - 注册的 `Dal` 应加载与主库**相同的模型**（同一实体的分库表结构一致），可直接克隆主连接
+///   的模型：`Dal::open_with_model(conn_str, dal.model().unwrap().as_ref().clone())`；
+/// - `Dal` 以 [`Arc`] 传入，注册后可在多处共享（其连接池随该实例存续）。
+///
+/// ```
+/// use std::sync::Arc;
+/// use pek_rcode::shards;
+/// use pek_rcode::Dal;
+///
+/// let other = Arc::new(Dal::open("Data Source=:memory:;Provider=SQLite").unwrap());
+/// shards::register_connection("DH_2027", other).unwrap();
+/// assert!(shards::registered_connection("dh_2027").is_some());
+/// ```
+pub fn register_connection(name: &str, dal: Arc<Dal>) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(Error::Unsupported(
+            "连接名不能为空（对应 C# DAL.AddConnStr 的 ArgumentNullException）".into(),
+        ));
+    }
+    let mut map = connections().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(name.to_lowercase(), dal);
+    Ok(())
+}
+
+/// 注销命名连接，返回是否实际移除（自动创建的回退连接同样可注销）。
+pub fn unregister_connection(name: &str) -> bool {
+    let mut map = connections().lock().unwrap_or_else(|e| e.into_inner());
+    map.remove(&name.trim().to_lowercase()).is_some()
+}
+
+/// 按名称解析已注册连接（大小写不敏感；未注册返回 `None`，**不做自动创建**）。
+pub fn registered_connection(name: &str) -> Option<Arc<Dal>> {
+    let map = connections().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&name.trim().to_lowercase()).cloned()
+}
+
+/// 当前已注册的连接名（小写形式，含未注册回退时自动创建的连接；已排序）。
+pub fn registered_connection_names() -> Vec<String> {
+    let map = connections().lock().unwrap_or_else(|e| e.into_inner());
+    let mut names: Vec<String> = map.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// 清空连接注册表（测试用；不影响已打开的业务库与会话）。
+pub fn clear_connections() {
+    let mut map = connections().lock().unwrap_or_else(|e| e.into_inner());
+    map.clear();
+}
+
+/// 设置未注册连接名的**自动 SQLite 目录**（对应 C# `Setting.DataPath` 的角色）。
+///
+/// 未注册的分片连接名会解析为 `{目录}/{连接名}.db` 的 SQLite 库；默认目录为 `{程序目录}/Data`
+/// （程序目录解析规则同 dhrust `io::base_dir`，可用环境变量 `PEK_RCODE_BASE` 覆盖）。
+pub fn set_auto_db_dir(dir: impl Into<PathBuf>) {
+    *auto_db_dir_slot().write().unwrap_or_else(|e| e.into_inner()) = Some(dir.into());
+}
+
+/// 当前生效的自动 SQLite 目录（默认 `{程序目录}/Data`）。
+pub fn auto_db_dir() -> PathBuf {
+    if let Some(dir) = auto_db_dir_slot()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return dir;
+    }
+    dhrust::io::base_dir(&["PEK_RCODE_BASE"]).join("Data")
+}
+
+/// 校验连接名合法字符（对应 C# `DAL.Init` 的"非法连接名"检查）：字母 / 数字 / `-` `_` `.`。
+fn validate_conn_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|c| !c.is_alphanumeric() && !matches!(c, '-' | '_' | '.'))
+    {
+        return Err(Error::Unsupported(format!(
+            "非法连接名[{name}]：只允许字母、数字或 - _ .（对应 C# XCodeException）"
+        )));
+    }
+    Ok(())
+}
+
+/// 未注册连接名的自动解析（对应 C# `DAL.Init` 的"自动为连接名设置 SQLite 连接字符串"分支）：
+/// `Data Source={自动目录}/{连接名}.db`；模型沿用基础连接（分库表结构与主库一致）。
+fn open_auto_sqlite(name: &str, base_dal: &Dal) -> Result<Arc<Dal>> {
+    validate_conn_name(name)?;
+    let model = base_dal
+        .model()
+        .cloned()
+        .ok_or_else(|| Error::Model("基础连接未加载数据模型，无法按连接名自动创建 SQLite 库".into()))?;
+    let dir = auto_db_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let conn = format!(
+        "Data Source={};Provider=SQLite",
+        dir.join(format!("{name}.db")).display()
+    );
+    Ok(Arc::new(Dal::open_with_model(&conn, (*model).clone())?))
+}
+
+/// 解析分片对应的数据访问层（对应 C# `DAL.Create(shard.ConnName)` 的连接解析）：
+///
+/// - 分片未指定 / 连接名为空 / 与基础连接相同（大小写不敏感）→ `Ok(None)`（沿用当前 `Dal` 与会话）；
+/// - 已注册连接（[`register_connection`]）→ 返回注册的 `Dal`（引擎自动切换到该连接的会话）；
+/// - 未注册 → 按 C# 规则自动创建并缓存 SQLite 库（见 [`open_auto_sqlite`] / [`set_auto_db_dir`]）。
+pub(crate) fn resolve_shard_dal(
+    model: &ShardModel,
+    base: ShardBase<'_>,
+    base_dal: &Dal,
+) -> Result<Option<Arc<Dal>>> {
+    let Some(conn) = model.conn_name.as_deref() else {
+        return Ok(None);
+    };
+    if conn.is_empty() || base.conn_name.is_some_and(|c| c.eq_ignore_ascii_case(conn)) {
+        return Ok(None);
+    }
+    if let Some(dal) = registered_connection(conn) {
+        return Ok(Some(dal));
+    }
+    // 并发首用同一连接名：锁外先建（可能重复创建、代价可控），锁内以先到者为准
+    let auto = open_auto_sqlite(conn, base_dal)?;
+    let mut map = connections().lock().unwrap_or_else(|e| e.into_inner());
+    Ok(Some(map.entry(conn.to_lowercase()).or_insert(auto).clone()))
+}
+
+/// 分片执行上下文：基础连接沿用调用方会话；跨库分片持有目标连接的独立会话
+/// （来自会话池，随作用域结束自动归还）。
+enum ShardSession<'a> {
+    /// 基础连接：`(基础 Dal, 调用方会话)`
+    Base(&'a Dal, &'a mut dyn SqlSession),
+    /// 跨库连接：`(目标 Dal, 独立会话)`
+    Owned(Arc<Dal>, Box<dyn SqlSession>),
+}
+
+impl ShardSession<'_> {
+    /// 取出目标 `(Dal, 会话)`。
+    fn parts(&mut self) -> (&Dal, &mut dyn SqlSession) {
+        match self {
+            ShardSession::Base(dal, session) => (&**dal, &mut **session),
+            ShardSession::Owned(dal, session) => (&**dal, &mut **session),
+        }
     }
 }
 
@@ -783,15 +940,24 @@ impl<'a> TableRef<'a> {
         let mut rows: Vec<DbRow> = Vec::new();
 
         for (index, shard) in shards.iter().enumerate() {
-            ensure_conn_in_sync(base, shard)?;
             let physical = shard
                 .table_name
                 .clone()
                 .unwrap_or_else(|| meta.effective_table_name().to_string());
-            if !session.table_exists(&physical)? {
+            // 连接级分片：解析目标连接（已注册连接 / 未注册按 C# 规则自动 SQLite 库）；
+            // 跨库时持有目标连接的独立会话
+            let mut ctx = match resolve_shard_dal(shard, base, self.dal())? {
+                None => ShardSession::Base(self.dal(), &mut *session),
+                Some(reg) => {
+                    let own = reg.open_session()?;
+                    ShardSession::Owned(reg, own)
+                }
+            };
+            let (shard_dal, shard_session) = ctx.parts();
+            if !shard_session.table_exists(&physical)? {
                 continue;
             }
-            let shard_table = self.dal().table_as(&meta.name, &physical)?;
+            let shard_table = shard_dal.table_as(&meta.name, &physical)?;
 
             let mut per_shard = query.clone();
             per_shard.filter = Some(trimmed.clone());
@@ -801,7 +967,7 @@ impl<'a> TableRef<'a> {
             per_shard.offset = (row > 0).then_some(row);
             per_shard.limit = remaining;
 
-            let set = shard_table.query(session, &per_shard)?;
+            let set = shard_table.query(shard_session, &per_shard)?;
             if columns.is_none() {
                 columns = Some(set.columns.clone());
             }
@@ -817,7 +983,7 @@ impl<'a> TableRef<'a> {
 
             // 前序分表消耗的偏移量：当前分表满足条件的总行数（对应 C# `row -= skipCount`）
             if row > 0 && index + 1 < shards.len() {
-                let skip = shard_table.count(session, Some(&trimmed))?;
+                let skip = shard_table.count(shard_session, Some(&trimmed))?;
                 row = row.saturating_sub(skip.max(0) as usize);
             }
 
@@ -853,16 +1019,23 @@ impl<'a> TableRef<'a> {
         let meta = self.meta();
         let mut total = 0i64;
         for shard in shards {
-            ensure_conn_in_sync(base, &shard)?;
             let physical = shard
                 .table_name
                 .clone()
                 .unwrap_or_else(|| meta.effective_table_name().to_string());
-            if !session.table_exists(&physical)? {
+            let mut ctx = match resolve_shard_dal(&shard, base, self.dal())? {
+                None => ShardSession::Base(self.dal(), &mut *session),
+                Some(reg) => {
+                    let own = reg.open_session()?;
+                    ShardSession::Owned(reg, own)
+                }
+            };
+            let (shard_dal, shard_session) = ctx.parts();
+            if !shard_session.table_exists(&physical)? {
                 continue;
             }
-            let shard_table = self.dal().table_as(&meta.name, &physical)?;
-            total += shard_table.count(session, Some(&trimmed))?;
+            let shard_table = shard_dal.table_as(&meta.name, &physical)?;
+            total += shard_table.count(shard_session, Some(&trimmed))?;
         }
         Ok(total)
     }
@@ -891,16 +1064,23 @@ impl<'a> TableRef<'a> {
         let meta = self.meta();
         let mut total = 0u64;
         for shard in shards {
-            ensure_conn_in_sync(base, &shard)?;
             let physical = shard
                 .table_name
                 .clone()
                 .unwrap_or_else(|| meta.effective_table_name().to_string());
-            if !session.table_exists(&physical)? {
+            let mut ctx = match resolve_shard_dal(&shard, base, self.dal())? {
+                None => ShardSession::Base(self.dal(), &mut *session),
+                Some(reg) => {
+                    let own = reg.open_session()?;
+                    ShardSession::Owned(reg, own)
+                }
+            };
+            let (shard_dal, shard_session) = ctx.parts();
+            if !shard_session.table_exists(&physical)? {
                 continue;
             }
-            let shard_table = self.dal().table_as(&meta.name, &physical)?;
-            total += shard_table.delete_where(session, &trimmed)?;
+            let shard_table = shard_dal.table_as(&meta.name, &physical)?;
+            total += shard_table.delete_where(shard_session, &trimmed)?;
         }
         Ok(total)
     }
@@ -918,7 +1098,7 @@ impl<'a> TableRef<'a> {
         mut func: F,
     ) -> Result<Vec<T>>
     where
-        F: FnMut(&TableRef<'a>, &mut dyn SqlSession) -> Result<T>,
+        F: FnMut(&TableRef<'_>, &mut dyn SqlSession) -> Result<T>,
     {
         let base = self.shard_base();
         let shards = policy.shards_between(base, start, end)?;
@@ -926,17 +1106,29 @@ impl<'a> TableRef<'a> {
 
         let mut results = Vec::new();
         for shard in shards {
-            ensure_conn_in_sync(base, &shard)?;
-            // 与 C# `AutoShard` 一致：未计算表名的分表跳过
-            let Some(physical) = shard.table_name else {
+            // 与 C# `AutoShard` 一致：未计算表名的分表跳过（纯连接级分片不建库）
+            let Some(physical) = shard.table_name.clone() else {
                 continue;
             };
-            let mut session = self.dal().open_session()?;
-            if !session.table_exists(&physical)? {
-                continue;
+            // 连接级分片：解析目标连接并在其会话上执行（未注册连接自动落 SQLite 库）
+            match resolve_shard_dal(&shard, base, self.dal())? {
+                None => {
+                    let mut session = self.dal().open_session()?;
+                    if !session.table_exists(&physical)? {
+                        continue;
+                    }
+                    let shard_table = self.dal().table_as(&meta.name, &physical)?;
+                    results.push(func(&shard_table, session.as_mut())?);
+                }
+                Some(reg) => {
+                    let mut session = reg.open_session()?;
+                    if !session.table_exists(&physical)? {
+                        continue;
+                    }
+                    let shard_table = reg.table_as(&meta.name, &physical)?;
+                    results.push(func(&shard_table, session.as_mut())?);
+                }
             }
-            let shard_table = self.dal().table_as(&meta.name, &physical)?;
-            results.push(func(&shard_table, session.as_mut())?);
         }
         Ok(results)
     }
@@ -956,21 +1148,36 @@ impl<'a> TableRef<'a> {
         let base = self.shard_base();
         let shards = policy.shards_between(base, start, end)?;
 
-        let mut session = self.dal().open_session()?;
         let mut dropped = 0;
         for shard in shards {
-            ensure_conn_in_sync(base, &shard)?;
-            let Some(physical) = shard.table_name else {
+            let Some(physical) = shard.table_name.clone() else {
                 continue;
             };
-            if !session.table_exists(&physical)? {
-                continue;
+            // 连接级分片：在目标连接上删表（未注册连接自动落 SQLite 库）
+            match resolve_shard_dal(&shard, base, self.dal())? {
+                None => {
+                    let mut session = self.dal().open_session()?;
+                    if !session.table_exists(&physical)? {
+                        continue;
+                    }
+                    let sql = format!("DROP TABLE {}", self.dal().kind().quote(&physical));
+                    self.dal().log_sql(&sql);
+                    session.execute(&sql, &[])?;
+                    self.dal().invalidate_cache(&physical);
+                    dropped += 1;
+                }
+                Some(reg) => {
+                    let mut session = reg.open_session()?;
+                    if !session.table_exists(&physical)? {
+                        continue;
+                    }
+                    let sql = format!("DROP TABLE {}", reg.kind().quote(&physical));
+                    reg.log_sql(&sql);
+                    session.execute(&sql, &[])?;
+                    reg.invalidate_cache(&physical);
+                    dropped += 1;
+                }
             }
-            let sql = format!("DROP TABLE {}", self.dal().kind().quote(&physical));
-            self.dal().log_sql(&sql);
-            session.execute(&sql, &[])?;
-            self.dal().invalidate_cache(&physical);
-            dropped += 1;
         }
         Ok(dropped)
     }
@@ -1275,5 +1482,39 @@ mod tests {
             }],
         );
         assert_eq!(desc[0].table_name.as_deref(), Some("Log2_20240531"));
+    }
+
+    #[test]
+    fn conn_name_validation_matches_dotnet_rules() {
+        // 对应 C# `DAL.Init`：字母 / 数字 / `-` `_` `.` 之外报"非法连接名"
+        for ok in ["DH_2026", "test.2026-1", "日志_2026", "a1"] {
+            assert!(validate_conn_name(ok).is_ok(), "{ok} 应合法");
+        }
+        for bad in ["", "a/b", "a b", "a;b", "a\\b", "a?b"] {
+            assert!(validate_conn_name(bad).is_err(), "{bad} 应非法");
+        }
+    }
+
+    #[test]
+    fn connection_registry_is_case_insensitive() {
+        let dal = Arc::new(Dal::open("Data Source=:memory:;Provider=SQLite").unwrap());
+        register_connection("Rcode_Unit_Conn", dal.clone()).unwrap();
+        // 大小写不敏感解析（对齐 C# `ConnStrs` 的 OrdinalIgnoreCase）
+        assert!(Arc::ptr_eq(
+            &registered_connection("rcode_unit_conn").unwrap(),
+            &dal
+        ));
+        assert!(registered_connection_names().contains(&"rcode_unit_conn".to_string()));
+        assert!(unregister_connection("RCODE_UNIT_CONN"));
+        assert!(registered_connection("rcode_unit_conn").is_none());
+        // 空连接名拒绝（对应 C# ArgumentNullException）
+        assert!(register_connection("   ", dal).is_err());
+    }
+
+    #[test]
+    fn auto_db_dir_default_under_data() {
+        // 默认目录 = {程序目录}/Data（未经 set_auto_db_dir 覆盖时；对齐 C# `Setting.DataPath`）
+        let dir = auto_db_dir();
+        assert!(dir.ends_with("Data"), "默认自动目录应以 Data 结尾：{dir:?}");
     }
 }

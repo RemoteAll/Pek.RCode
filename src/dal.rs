@@ -1386,7 +1386,7 @@ impl<'a> TableRef<'a> {
 
     /// 按条件删除，返回受影响行数（空条件会清空全表，请先用 [`Where::is_empty`] 防护）。
     ///
-    /// 对应 C# `Entity.Delete(Expression)` 的单表部分；分表删除见 [`TableRef::delete_sharded`](crate::shards::TableRef::delete_sharded)。
+    /// 对应 C# `Entity.Delete(Expression)` 的单表部分；分表删除见 [`TableRef::delete_sharded`](crate::dal::TableRef::delete_sharded)。
     pub fn delete_where(&self, session: &mut dyn SqlSession, filter: &Where) -> Result<u64> {
         // 拦截器通知（对应 OnValid/Delete；默认拦截器不处理删除，保留扩展点）
         let mut notify: Vec<(String, DbValue)> = Vec::new();
