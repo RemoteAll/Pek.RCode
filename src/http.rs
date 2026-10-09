@@ -227,29 +227,10 @@ pub fn get_text(url: &str, auth: Option<(&str, &str)>, timeout: Duration) -> Res
     Ok(text)
 }
 
-/// 极简 Base64 编码（Basic 认证用，避免为一个小功能引入额外依赖）。
+/// Base64 编码（Basic 认证用）——实现已下沉 `dhrust::sign::base64_encode`（2026-10-09 收编；
+/// 原"避免引入额外依赖"的内联实现不再需要——dhrust 本就是本仓依赖）。
 fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[(triple >> 18) as usize & 0x3f] as char);
-        out.push(TABLE[(triple >> 12) as usize & 0x3f] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[(triple >> 6) as usize & 0x3f] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[triple as usize & 0x3f] as char
-        } else {
-            '='
-        });
-    }
-    out
+    dhrust::sign::base64_encode(input)
 }
 
 #[cfg(test)]
