@@ -888,7 +888,7 @@ fn extract_zip_bytes(data: &[u8], dest: &Path) -> Result<()> {
         let Some(rel) = entry.enclosed_name() else {
             return Err(Error::Model(format!(
                 "驱动包含非法路径：{}",
-                entry.name()
+                entry.name().unwrap_or_default()
             )));
         };
         let out = dest.join(rel);

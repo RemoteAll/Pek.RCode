@@ -210,8 +210,8 @@ impl Dal {
                     let entry = zip.by_index(index).ok()?;
                     entry
                         .name()
-                        .strip_suffix(".table")
-                        .map(str::to_string)
+                        .ok()
+                        .and_then(|n| n.strip_suffix(".table").map(str::to_string))
                         .filter(|s| !s.is_empty())
                 })
                 .collect(),
@@ -663,7 +663,7 @@ mod tests {
             let fs = File::open(&file).unwrap();
             let mut zip = zip::ZipArchive::new(fs).unwrap();
             let names: Vec<String> = (0..zip.len())
-                .map(|i| zip.by_index(i).unwrap().name().to_string())
+                .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
                 .collect();
             assert_eq!(names.len(), 3, "{names:?}");
             assert!(names.iter().any(|n| n.ends_with(".xml")), "{names:?}");

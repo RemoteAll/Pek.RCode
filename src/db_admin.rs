@@ -286,7 +286,11 @@ impl DbAdmin {
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
                 .map_err(|e| format!("不是有效的备份包（zip）：{e}"))?;
             let names: Vec<String> = (0..zip.len())
-                .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+                .filter_map(|i| {
+                    zip.by_index(i)
+                        .ok()
+                        .and_then(|f| f.name().ok().map(|n| n.to_string()))
+                })
                 .collect();
             for entity in &self.tables {
                 let entry_name = format!("{entity}.table");
