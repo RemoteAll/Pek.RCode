@@ -98,7 +98,7 @@ if (Test-Path $outFile) {
             $name = if ($nl -ge 0) { $chunk.Substring(0, $nl).Trim() } else { $chunk.Trim() }
             if ($name) {
                 $body = if ($nl -ge 0) { $chunk.Substring($nl + 1) } else { '' }
-                $sections[$name] = $body.TrimEnd()
+                $sections[$name] = $body.Trim()
             }
         }
     }
@@ -106,7 +106,7 @@ if (Test-Path $outFile) {
 
 # 本次同步的文件覆盖同名章节（文件名即章节名）
 foreach ($f in $files) {
-    $sections[$f.Name] = [IO.File]::ReadAllText($f.FullName, [Text.Encoding]::UTF8).TrimEnd()
+    $sections[$f.Name] = [IO.File]::ReadAllText($f.FullName, [Text.Encoding]::UTF8).Trim()
 }
 
 $sb = New-Object System.Text.StringBuilder
