@@ -83,20 +83,47 @@ if ($files.Count -eq 0 -and -not $Force -and (Test-Path $outFile)) {
     }
 }
 
+# ———— 合并模式：保留镜像中「本次未同步」的章节（防稀疏记忆覆盖完整镜像）————
+# 历史事故（2026-10-19）：旧版为全量覆盖，本机只新建 1 个记忆文件就同步，
+# 导致 docs\项目记忆.md 原有 100+ 行内容被清掉。改为按 `## <文件名>` 章节合并：
+#   同名章节用本机最新内容替换，其余章节原样保留。
+$sections = @{}
+if (Test-Path $outFile) {
+    $old = [IO.File]::ReadAllText($outFile, [Text.Encoding]::UTF8)
+    if ($old.Trim().Length -gt 0) {
+        $parts = [regex]::Split($old, '(?m)^## ')
+        for ($i = 1; $i -lt $parts.Count; $i++) {
+            $chunk = $parts[$i]
+            $nl = $chunk.IndexOf("`n")
+            $name = if ($nl -ge 0) { $chunk.Substring(0, $nl).Trim() } else { $chunk.Trim() }
+            if ($name) {
+                $body = if ($nl -ge 0) { $chunk.Substring($nl + 1) } else { '' }
+                $sections[$name] = $body.TrimEnd()
+            }
+        }
+    }
+}
+
+# 本次同步的文件覆盖同名章节（文件名即章节名）
+foreach ($f in $files) {
+    $sections[$f.Name] = [IO.File]::ReadAllText($f.FullName, [Text.Encoding]::UTF8).TrimEnd()
+}
+
 $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("# $projectName · 项目记忆（本机工作记忆同步）")
 [void]$sb.AppendLine('')
 [void]$sb.AppendLine('> 本文由 `tools/continuity/sync-memory.ps1` 自动同步（来源：本机 Copilot 工作记忆）。')
+[void]$sb.AppendLine('> 合并模式：本机未同步的既有章节原样保留（防稀疏覆盖）；同名章节以本机最新内容替换。')
 [void]$sb.AppendLine("> 同步时间：" + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
 [void]$sb.AppendLine('')
 
-if ($files.Count -eq 0) {
+if ($sections.Count -eq 0) {
     [void]$sb.AppendLine('（本机工作记忆为空——尚无 repo 记忆文件。）')
 } else {
-    foreach ($f in $files) {
-        [void]$sb.AppendLine("## $($f.Name)")
+    foreach ($name in ($sections.Keys | Sort-Object)) {
+        [void]$sb.AppendLine("## $name")
         [void]$sb.AppendLine('')
-        [void]$sb.AppendLine([IO.File]::ReadAllText($f.FullName, [Text.Encoding]::UTF8))
+        [void]$sb.AppendLine($sections[$name])
         [void]$sb.AppendLine('')
     }
 }
@@ -104,4 +131,4 @@ if ($files.Count -eq 0) {
 $dir = Split-Path $outFile
 if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
 [IO.File]::WriteAllText($outFile, $sb.ToString(), (New-Object Text.UTF8Encoding($false)))
-Write-Host "[记忆同步] 已同步 $($files.Count) 个记忆文件 -> docs\项目记忆.md"
+Write-Host "[记忆同步] 已同步 $($files.Count) 个记忆文件（合并模式，保留既有 $($sections.Count - $files.Count) 个章节）-> docs\项目记忆.md"
