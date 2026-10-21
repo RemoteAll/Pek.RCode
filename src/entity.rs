@@ -98,6 +98,32 @@ pub trait Entity: Sized {
     /// 从查询行装载实体。
     fn from_row(row: &DbRow) -> Result<Self>;
 
+    /// 脏数据状态（由 `rcodegen` 生成的实体返回 `Some`；手写/`derive` 实体默认 `None`）。
+    ///
+    /// 返回 `Some` 表示启用脏追踪：`set_xxx` 写入时登记脏列，[`Entity::update`] 只写脏列，
+    /// 无脏数据时**不发 SQL**；返回 `None` 表示未启用，更新时写全部非主键列（向后兼容）。
+    fn dirty_state(&self) -> Option<&crate::dirty::DirtyState> {
+        None
+    }
+
+    /// 指定列是否有未写入数据库的修改。
+    fn is_dirty(&self, column: &str) -> bool {
+        self.dirty_state()
+            .is_some_and(|state| state.contains(column))
+    }
+
+    /// 是否有任意脏数据（决定是否需要 UPDATE）。
+    fn has_dirty(&self) -> bool {
+        self.dirty_state().is_some_and(|state| !state.is_empty())
+    }
+
+    /// 清空脏数据（写入成功后由实体层自动调用；也可手工调用）。
+    fn clear_dirty(&self) {
+        if let Some(state) = self.dirty_state() {
+            state.clear();
+        }
+    }
+
     /// 由查询行集合装载实体集合（对应 C# `DataRowEntityAccessor.LoadData`）。
     /// <param name="rows">数据行</param>
     /// <returns>实体集合</returns>
@@ -147,6 +173,8 @@ pub trait Entity: Sized {
         if id != 0 {
             self.set_identity(id)?;
         }
+        // 插入成功后清空脏数据（对齐 C# `EntityPersistence.Insert` 的 `Dirtys.Clear()`）
+        self.clear_dirty();
         Ok(id)
     }
 
@@ -207,7 +235,12 @@ pub trait Entity: Sized {
             })
             .collect();
         let table = dal.table(Self::table())?;
-        table.write_batch(session, &rows, mode, batch_size)
+        let affected = table.write_batch(session, &rows, mode, batch_size)?;
+        // 批量写入成功后清空各实体的脏数据（对齐 C# 批量写入后 `Dirtys.Clear()`）
+        for entity in list {
+            entity.clear_dirty();
+        }
+        Ok(affected)
     }
 
     /// 批量忽略重复插入（对应 C# `EntityExtension.BatchInsertIgnore`）：重复键静默跳过。
@@ -333,6 +366,13 @@ pub trait Entity: Sized {
     }
 
     /// 按主键更新指定表句柄（分表场景使用）。
+    ///
+    /// 启用脏追踪的实体（[`Entity::dirty_state`] 返回 `Some`）：
+    /// - 脏数据为空时**直接返回 0、不发 SQL**（对齐 C# `if (!entity.HasDirty) return 0;`）；
+    /// - 只把脏列拼入 `SET`（对齐 C# `UpdateSQL` 的 `if (!entity.IsDirty(fi.Name)) continue;`）；
+    /// - 执行后清空脏数据（成功与"行不存在"都清，对齐 C# 生成 SQL 后即 `Dirtys.Clear()`）。
+    ///
+    /// 未启用脏追踪的实体保持原有行为：写全部非主键列。
     fn update_with(&self, table: &TableRef<'_>, session: &mut dyn SqlSession) -> Result<u64> {
         let pks = Self::primary_keys();
         if pks.is_empty() {
@@ -340,25 +380,36 @@ pub trait Entity: Sized {
         }
 
         let identity = Self::identity_column();
+        let dirty = self.dirty_state();
+        if dirty.is_some_and(crate::dirty::DirtyState::is_empty) {
+            // 没有任何修改：不产生数据库写入
+            return Ok(0);
+        }
+
         let fields = self.to_fields();
         let sets: Vec<(&'static str, DbValue)> = fields
             .iter()
             .filter(|pair| {
-                !pks.iter().any(|pk| pk.eq_ignore_ascii_case(pair.0))
-                    && !identity.is_some_and(|id| id.eq_ignore_ascii_case(pair.0))
+                if pks.iter().any(|pk| pk.eq_ignore_ascii_case(pair.0))
+                    || identity.is_some_and(|id| id.eq_ignore_ascii_case(pair.0))
+                {
+                    return false;
+                }
+                // 启用脏追踪时只写脏列
+                dirty.is_none_or(|state| state.contains(pair.0))
             })
             .map(|pair| (pair.0, pair.1.clone()))
             .collect();
 
         if sets.is_empty() {
-            return Err(Error::Model(format!(
-                "实体 {} 除主键/自增列外没有可更新字段",
-                Self::table()
-            )));
+            self.clear_dirty();
+            return Ok(0);
         }
 
         let pk_values = pk_values_of(&fields, pks)?;
-        table.update_by_pk(session, &sets, &pk_values)
+        let affected = table.update_by_pk(session, &sets, &pk_values)?;
+        self.clear_dirty();
+        Ok(affected)
     }
 
     /// 保存（对应 XCode 的 `Save`）：
@@ -438,6 +489,13 @@ pub trait Entity: Sized {
         if is_new {
             queue.insert(dal, session, &fields)
         } else {
+            // 启用脏追踪且没有任何修改：不入队，避免无谓写入
+            if self
+                .dirty_state()
+                .is_some_and(crate::dirty::DirtyState::is_empty)
+            {
+                return Ok(());
+            }
             let pk = pk_values_of(&fields, Self::primary_keys())?;
             queue.upsert(dal, session, &pk, &fields)
         }

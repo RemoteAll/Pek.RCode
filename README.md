@@ -47,7 +47,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `catalog` | 各 `DbBase.OnGetTables` 元数据 | ✅ 全驱动目录读取（表/列/索引；MongoDB 除外；Access 走 ODBC 元数据） |
 | `cache` | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | ✅ 整表实体缓存 + 单对象缓存（默认 60s 过期；写入自动失效）；✅ Redis 版本号（feature `redis`，底层为 **Pek.RRedis** 自研客户端） |
 | `reverse` | `DAL.GetTables`（反向工程） | ✅ 数据库 → `EntityModel` / `Model.xml`（**全部驱动**、含索引/唯一约束；`rcodegen --conn`） |
-| `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count`；`AuditExt` 审计字段访问；`#[derive(Entity)]` 宏；分表变体 `insert_sharded` / `find_sharded` / `query_sharded` 等 |
+| `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count`；**脏字段更新**（生成实体 `set_xxx` 登记脏列，`update` 只写变化列、无修改不发 SQL）；`AuditExt` 审计字段访问；`#[derive(Entity)]` 宏；分表变体 `insert_sharded` / `find_sharded` / `query_sharded` 等 |
 | `batch` | `BatchFinder` / `EntityExtension`（批量写入） | ✅ 批量写入全清单：`insert_batch`（多行 VALUES）/ `insert_batch_sharded`（**分片提前计算、按（连接, 物理表）分组批量插入**，跨库自动路由）/ `insert_ignore_batch` / `replace_batch` / `upsert_batch` / `upsert_batch_sharded`（On Conflict 多行 Upsert）/ `update_batch` / `update_batch_sharded` / `save_batch` / `save_batch_sharded`（新增合并批插、已存在逐条更新，对齐 `Save(list)`）/ `delete_batch` / `delete_batch_sharded`（主键 `IN` 分批）/ `TableRef::delete_where_batched`（C# 分批删除矩阵：LIMIT/TOP/ctid/ROWID/rowid，默认 10000/批 + 100ms 间隔）；导航批量装载 `load_ones` / `load_manys`（`BatchLoadNavigations` 等价）；`enqueue_save` 入队 + `EntityQueue` 批量刷入（**`SaveAsync` 等价物**）；批量查找 `BatchFinder`（主键 `IN` 合并） |
 | `shards` | `Shards/TimeShardPolicy`（`EntitySplit`） | ✅ 时间分表策略（`TablePolicy` / `ConnPolicy` / `Step` 模板与 C# 完全一致 + .NET 日期格式子集）；实体分表增删改查、**跨表查询/分页/计数/条件删除**、`auto_shard` 区间遍历、分表自动建表（对齐 C# `EntitySession.CheckTable`）；**自动分库执行**：连接注册表按连接名路由（对应 `DAL.AddConnStr` / `DAL.Create`），未注册连接名按 C# 规则自动落为 SQLite 库 |
 | `snowflake` | `NewLife.Data.Snowflake` | ✅ 位结构与 C# 互通（1+41+10+12；`GetId` / `TryParse` 语义一致）：`now_id` / `new_id_at` / `id_at` / `parse`，进程级共享实例 `shared()` |
@@ -319,20 +319,30 @@ cargo run --bin rcodegen -- --model <你的项目>\Entity\Model.xml --out src\en
 
 ### 对象实体用法（与 C# 侧 Entity 一致）
 
-生成文件自带 `Entity` 实现（对象化增删改查），用法与 C# 的 `entity.Save()` 对应：
+生成文件自带 `Entity` 实现（对象化增删改查），用法与 C# 的 `entity.Save()` 对应。
+
+生成的实体**字段私有**，通过 `列名()` 读取、`set_列名()` 写入；写入会自动记录脏数据
+（值未变化不登记），因此 `update`/`save` **只写变化列**，没有任何修改时**不发 SQL**
+（对齐 DH.NCode `EntityPersistence.Update` 的 `if (!entity.HasDirty) return 0;` 与脏列 `SET`）：
 
 ```rust
-let mut order = Order::new();          // 等价 C# 的 new Order()
-order.code = Some("HLT-001".into());
-order.insert(&dal, session.as_mut())?; // 插入并回写自增主键
-order.save(&dal, session.as_mut())?;   // Id=0 新增，否则按主键更新
+let mut order = Order::new();              // 等价 C# 的 new Order()
+order.set_code(Some("HLT-001".into()));    // 写入并记录脏列 Code
+order.insert(&dal, session.as_mut())?;     // 插入并回写自增主键；成功后清空脏数据
+order.set_amount("12.34".parse()?);        // 只登记 Amount
+order.save(&dal, session.as_mut())?;       // UPDATE 只含 Amount（+ 审计列）
+order.save(&dal, session.as_mut())?;       // 无修改：直接返回 0，不发 SQL
 
-let one  = Order::find(&dal, session.as_mut(), &[order.id.into()])?;      // 按主键查（对应 FindByID）
+let one  = Order::find(&dal, session.as_mut(), &[(*order.id()).into()])?; // 按主键查（FindByID）
 let list = Order::query(&dal, session.as_mut(),
     &Query::new().filter(Where::new().like("Code", "HLT%")).page(1, 20))?; // 条件 + 分页
 let n    = Order::count(&dal, session.as_mut(), None)?;
 order.delete(&dal, session.as_mut())?;
 ```
+
+> 生成的接口文件只定义访问器契约（`I{Name}`）；日常直接调用实体上的同名访问器即可，无需 `use` trait。
+> 手写实体与 `#[derive(Entity)]` 实体保持原有 `pub` 字段与"写全部非主键列"的行为（向后兼容），
+> 需要同样的优化时实现 `Entity::dirty_state()` 返回自己的 `DirtyState` 即可。
 
 > 生成产物已用真实模型（`JiLiYu`、`VerifyCode`）做过编译与运行验证。
 
@@ -349,12 +359,12 @@ let policy = WmsLog::shard_policy();
 // 雪花Id：TimeShardPolicy::new("Id").with_table_policy("{0}_{1:yyyy}").with_snow(pek_rcode::snowflake::shared())
 
 let mut log = WmsLog::new();
-log.create_time = chrono::Local::now().naive_local();
+log.set_create_time(chrono::Local::now().naive_local());
 log.insert_sharded(&dal, session.as_mut(), &policy)?;          // 路由到 WmsLog_20260927（不存在时自动建表）
 log.update_sharded(&dal, session.as_mut(), &policy)?;
 log.delete_sharded(&dal, session.as_mut(), &policy)?;
 let one = WmsLog::find_sharded(&dal, session.as_mut(), &policy,
-    &log.create_time.into(), &[log.id.into()])?;               // 不存在的分表直接返回 None
+    &log.create_time().clone().into(), &[(*log.id()).into()])?; // 不存在的分表直接返回 None
 
 // 跨表查询：条件能推导出分表字段区间时自动展开多表；分页跨表续页（与 C# FindAll 分表分支同语义）
 let filter = Where::new().ge("CreateTime", start).lt("CreateTime", end);
@@ -420,8 +430,11 @@ let removed = WmsLog::delete_batch(&dal, session.as_mut(), &batch, None)?;      
   - **批量导航装载** `Navigation::load_ones` / `load_manys`（一次 `IN` 查询按值分组，
     对应 C# LINQ `BatchLoadNavigations`，消除 HasOne/HasMany 的 N+1）；
   - `batch_size` 默认 5000（对齐 C# `DAL.GetBatchSize()`）；实体队列 `EntityQueue::flush` 的连续 Insert/Delete 段亦自动合并批量；
+  - **脏字段更新**：`rcodegen` 生成的实体字段私有，`set_列名()` 写入时比较新旧值并登记脏列；
+    `update`/`save` 只把脏列拼入 `SET`，脏数据为空时直接返回 0（不发 SQL），写入成功后清空脏数据
+    （对齐 C# `Dirtys` / `UpdateColumns` 列级跟踪）；批量写入（`insert_batch`/`upsert_batch` 等）成功后同样清空脏数据；
   - 有意不做（机制边界）：C# 的 `Transform` 抽取器（树状/递归实体显式化，Rust 侧用普通查询组装）、
-    脏跟踪（`Dirtys`/`UpdateColumns` 列级跟踪，Rust 实体为普通结构体）、Oracle/MySQL 参数数组式批量 Update（逐条回退等价）；
+    Oracle/MySQL 参数数组式批量 Update（逐条回退等价）；手写/`derive` 实体默认仍写全部非主键列（向后兼容）；
 - **`SaveAsync` 等价物**：`Entity::enqueue_save` 入队（新增 → 插入段合并批插；其余 → Upsert）
   + `EntityQueue::flush`（达到批大小自动 flush）；定时/延迟由调用方驱动（`dhrust::threading::Timer`
   或异步任务），Task 版异步可用 `async_dal::AsyncDal::with_session` 包裹任意同步实体操作；

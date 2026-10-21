@@ -90,6 +90,115 @@ impl Entity for Order {
     }
 }
 
+/// 与生成代码同构的"脏追踪"实体：字段私有 + `set_xxx` 登记脏列 + `dirty_state()`。
+#[derive(Debug, Clone, PartialEq)]
+struct TrackedOrder {
+    id: i32,
+    code: Option<String>,
+    amount: rust_decimal::Decimal,
+    ok: bool,
+    create_time: chrono::NaiveDateTime,
+    data: Option<Vec<u8>>,
+    dirty: pek_rcode::dirty::DirtyState,
+}
+
+impl TrackedOrder {
+    const TABLE_NAME: &'static str = "DH_Order";
+
+    fn new() -> Self {
+        Self {
+            id: 0,
+            code: None,
+            amount: Default::default(),
+            ok: false,
+            create_time: chrono::DateTime::UNIX_EPOCH.naive_utc(),
+            data: None,
+            dirty: pek_rcode::dirty::DirtyState::new(),
+        }
+    }
+
+    fn id(&self) -> &i32 {
+        &self.id
+    }
+
+    fn code(&self) -> &Option<String> {
+        &self.code
+    }
+
+    fn amount(&self) -> &rust_decimal::Decimal {
+        &self.amount
+    }
+
+    fn set_code(&mut self, value: Option<String>) {
+        if self.code == value {
+            return;
+        }
+        self.code = value;
+        self.dirty.mark("Code");
+    }
+
+    fn set_amount(&mut self, value: rust_decimal::Decimal) {
+        if self.amount == value {
+            return;
+        }
+        self.amount = value;
+        self.dirty.mark("Amount");
+    }
+}
+
+impl Entity for TrackedOrder {
+    fn table() -> &'static str {
+        Self::TABLE_NAME
+    }
+
+    fn columns() -> &'static [&'static str] {
+        &["Id", "Code", "Amount", "Ok", "CreateTime", "Data"]
+    }
+
+    fn primary_keys() -> &'static [&'static str] {
+        &["Id"]
+    }
+
+    fn identity_column() -> Option<&'static str> {
+        Some("Id")
+    }
+
+    fn to_fields(&self) -> Vec<(&'static str, DbValue)> {
+        vec![
+            ("Id", self.id.into()),
+            ("Code", self.code.clone().into()),
+            ("Amount", self.amount.into()),
+            ("Ok", self.ok.into()),
+            ("CreateTime", self.create_time.into()),
+            ("Data", self.data.clone().into()),
+        ]
+    }
+
+    fn from_row(row: &DbRow) -> Result<Self> {
+        Ok(Self {
+            id: row.get_by_name("Id").and_then(DbValue::as_i32).unwrap_or_default(),
+            code: row.get_by_name("Code").and_then(|v| (!v.is_null()).then(|| v.to_text())),
+            amount: row.get_by_name("Amount").and_then(DbValue::as_decimal).unwrap_or_default(),
+            ok: row.get_by_name("Ok").and_then(DbValue::as_bool).unwrap_or_default(),
+            create_time: row
+                .get_by_name("CreateTime")
+                .and_then(DbValue::as_datetime)
+                .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc()),
+            data: row.get_by_name("Data").and_then(|v| v.as_blob().map(<[u8]>::to_vec)),
+            dirty: pek_rcode::dirty::DirtyState::new(),
+        })
+    }
+
+    fn dirty_state(&self) -> Option<&pek_rcode::dirty::DirtyState> {
+        Some(&self.dirty)
+    }
+
+    fn set_identity(&mut self, value: i64) -> Result<()> {
+        self.id = value as i32;
+        Ok(())
+    }
+}
+
 const MODEL: &str = r#"<EntityModel><Tables><Table Name="Order" TableName="DH_Order" Description="订单">
   <Columns>
     <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
@@ -220,6 +329,72 @@ fn update_skips_pk_and_identity() {
     order.code = Some("X".into());
     let affected = order.save(&dal, session.as_mut()).unwrap();
     assert_eq!(affected, 0, "主键被改动后更新不到任何行（符合预期，避免误写）");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 脏追踪：更新只写变化列（用"两会话交叉更新"证明未变化列不会被旧值覆盖）。
+#[test]
+fn dirty_update_writes_only_changed_columns() {
+    let (dir, dal) = setup("dirty-cols");
+    let mut session = dal.open_session().unwrap();
+
+    let mut seed = TrackedOrder::new();
+    seed.set_code(Some("A".into()));
+    seed.set_amount("1".parse().unwrap());
+    let id = seed.insert(&dal, session.as_mut()).unwrap();
+    assert_eq!(*seed.id() as i64, id, "插入后主键应回写实体");
+    assert!(!seed.has_dirty(), "插入成功后应清空脏数据");
+
+    // 两个会话各自加载同一行（内存中都是旧值）
+    let mut a = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+    let mut b = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+
+    a.set_code(Some("A2".into()));
+    assert_eq!(a.update(&dal, session.as_mut()).unwrap(), 1);
+    assert!(!a.has_dirty(), "更新成功后应清空脏数据");
+
+    b.set_amount("2".parse().unwrap());
+    assert_eq!(b.update(&dal, session.as_mut()).unwrap(), 1);
+
+    let reloaded = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.code().as_deref(),
+        Some("A2"),
+        "只写脏列：B 的旧 Code 不应覆盖 A 已写入的新值"
+    );
+    assert_eq!(reloaded.amount().to_string(), "2");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 脏追踪：赋值相同值不标脏；无脏数据时 update 直接返回 0（不发 SQL）。
+#[test]
+fn dirty_setter_same_value_and_noop_update() {
+    let (dir, dal) = setup("dirty-noop");
+    let mut session = dal.open_session().unwrap();
+
+    let mut seed = TrackedOrder::new();
+    seed.set_code(Some("S".into()));
+    let id = seed.insert(&dal, session.as_mut()).unwrap();
+
+    let mut loaded = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+    loaded.set_code(Some("S".into()));
+    assert!(!loaded.has_dirty(), "赋相同值不应登记脏数据");
+    assert!(!loaded.is_dirty("Code"));
+    assert_eq!(
+        loaded.update(&dal, session.as_mut()).unwrap(),
+        0,
+        "无脏数据时应直接返回 0"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

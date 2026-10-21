@@ -151,6 +151,83 @@ impl EntityExtend {
     }
 }
 
+/// 实体脏数据状态（线程安全）。
+///
+/// 生成实体的字段私有，写入统一经过 `set_xxx`；值发生变化时把列名登记到本状态。
+/// [`crate::entity::Entity::update`] 据此**只写脏列**，脏数据为空时直接返回 0、不发 SQL
+/// （对齐 DH.NCode `EntityPersistence.Update` 的 `if (!entity.HasDirty) return 0;`）。
+///
+/// 实体被克隆时脏状态一并复制（副本独立）；比较相等时脏状态不参与（属于元数据）。
+#[derive(Debug, Default)]
+pub struct DirtyState {
+    items: Mutex<DirtyCollection>,
+}
+
+impl DirtyState {
+    /// 创建空状态。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 登记脏列（不记录旧值）。新登记返回 `true`。
+    pub fn mark(&self, name: &str) -> bool {
+        lock(&self.items).add(name)
+    }
+
+    /// 登记脏列并记录旧值（重复登记保留最早旧值）。
+    pub fn mark_with_old(&self, name: &str, old_value: DbValue) -> bool {
+        lock(&self.items).set(name, old_value)
+    }
+
+    /// 是否包含脏列（忽略大小写）。
+    pub fn contains(&self, name: &str) -> bool {
+        lock(&self.items).contains(name)
+    }
+
+    /// 脏列个数。
+    pub fn len(&self) -> usize {
+        lock(&self.items).len()
+    }
+
+    /// 是否为空。
+    pub fn is_empty(&self) -> bool {
+        lock(&self.items).is_empty()
+    }
+
+    /// 脏列名列表（按登记顺序）。
+    pub fn names(&self) -> Vec<String> {
+        let items = lock(&self.items);
+        items.names().into_iter().map(str::to_string).collect()
+    }
+
+    /// 清空（写入成功后由实体层调用）。
+    pub fn clear(&self) {
+        lock(&self.items).clear();
+    }
+
+    /// 当前脏数据快照。
+    pub fn snapshot(&self) -> DirtyCollection {
+        lock(&self.items).clone()
+    }
+}
+
+impl Clone for DirtyState {
+    fn clone(&self) -> Self {
+        Self {
+            items: Mutex::new(self.snapshot()),
+        }
+    }
+}
+
+/// 脏状态属于元数据，不参与实体相等性判断。
+impl PartialEq for DirtyState {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DirtyState {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

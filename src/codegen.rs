@@ -45,19 +45,13 @@ pub fn generate(table: &TableMeta) -> String {
     ));
     out.push_str("use pek_rcode::{DbRow, DbValue, Entity, Result};\n\n");
     out.push_str(&format!(
-        "/// {display}\n///\n/// 表名：`{table_name}`\n#[derive(Debug, Clone, PartialEq)]\npub struct {} {{\n",
+        "/// {display}\n///\n/// 表名：`{table_name}`\n///\n/// 字段私有：读取用 `列名()`，写入用 `set_列名()`（自动记录脏数据，\n/// 值未变化时不产生数据库写入，`update` 只写脏列）。\n#[derive(Debug, Clone, PartialEq)]\npub struct {} {{\n",
         table.name
     ));
 
     for col in &table.columns {
         let field = safe_field_name(&to_snake_case(&col.name));
-        let mut ty = match col.enum_type.as_deref().and_then(known_enum) {
-            Some((path, _)) => path.to_string(),
-            None => col.data_type.rust_type().to_string(),
-        };
-        if col.nullable {
-            ty = format!("Option<{ty}>");
-        }
+        let ty = entity_field_type(col);
 
         let mut tags = Vec::new();
         if col.primary_key {
@@ -90,11 +84,33 @@ pub fn generate(table: &TableMeta) -> String {
             _ => String::new(),
         };
         out.push_str(&format!(
-            "    /// {doc}{tag_text}{enum_note}\n    pub {field}: {ty},\n"
+            "    /// {doc}{tag_text}{enum_note}\n    {field}: {ty},\n"
         ));
     }
 
-    out.push_str("}\n\n");
+    out.push_str(
+        "    /// 脏数据状态（内部使用：`set_xxx` 自动登记，`update` 只写脏列）。\n    dirty: pek_rcode::dirty::DirtyState,\n}\n\n",
+    );
+
+    // —— 字段访问器（字段私有：读用 `列名()`，写用 `set_列名()`，写入自动记录脏数据）——
+    out.push_str(&format!("impl {} {{\n", table.name));
+    let mut accessors = Vec::new();
+    for col in &table.columns {
+        let field = safe_field_name(&to_snake_case(&col.name));
+        let setter = format!("set_{}", to_snake_case(&col.name));
+        let ty = entity_field_type(col);
+        let name = table.effective_column_name(col);
+        let doc = if col.description.is_empty() {
+            format!("{} 列", col.name)
+        } else {
+            clean_doc(&col.description)
+        };
+        accessors.push(format!(
+            "    /// 获取 {doc}。\n    pub fn {field}(&self) -> &{ty} {{\n        &self.{field}\n    }}\n\n    /// 设置 {doc}（值未变化时不产生数据库写入）。\n    pub fn {setter}(&mut self, value: {ty}) {{\n        if self.{field} == value {{\n            return;\n        }}\n        self.{field} = value;\n        self.dirty.mark(\"{name}\");\n    }}"
+        ));
+    }
+    out.push_str(&accessors.join("\n\n"));
+    out.push_str("\n}\n\n");
 
     // —— 常量、构造函数与默认值 ——
     out.push_str(&format!(
@@ -106,6 +122,7 @@ pub fn generate(table: &TableMeta) -> String {
         let field = safe_field_name(&to_snake_case(&col.name));
         out.push_str(&format!("            {field}: {},\n", default_expr(col)));
     }
+    out.push_str("            dirty: pek_rcode::dirty::DirtyState::new(),\n");
     out.push_str("        }\n    }\n");
 
     // —— 分表策略（DataScale 含 `timeShard:` 时生成，对应 C# 静态构造的 Meta.ShardPolicy）——
@@ -217,8 +234,12 @@ pub fn generate(table: &TableMeta) -> String {
         row_lines.push_str(&format!("            {field}: {},\n", from_row_expr(col, name)));
     }
     methods.push(format!(
-        "fn from_row(row: &DbRow) -> Result<Self> {{\n        Ok(Self {{\n{row_lines}        }})\n    }}"
+        "fn from_row(row: &DbRow) -> Result<Self> {{\n        Ok(Self {{\n{row_lines}            dirty: pek_rcode::dirty::DirtyState::new(),\n        }})\n    }}"
     ));
+    methods.push(
+        "fn dirty_state(&self) -> Option<&pek_rcode::dirty::DirtyState> {\n        Some(&self.dirty)\n    }"
+            .to_string(),
+    );
 
     if let Some(identity) = table.identity()
         && identity.data_type.is_integer()
@@ -478,6 +499,18 @@ fn clean_doc(text: &str) -> String {
 /// 列的 Rust 字段类型（可空则包裹 `Option<...>`；与实体生成规则一致）。
 fn column_rust_type(col: &ColumnMeta) -> String {
     let mut ty = col.data_type.rust_type().to_string();
+    if col.nullable {
+        ty = format!("Option<{ty}>");
+    }
+    ty
+}
+
+/// 实体结构体字段类型（含成员枚举映射与可空包裹；与 `to_fields`/访问器一致）。
+fn entity_field_type(col: &ColumnMeta) -> String {
+    let mut ty = match col.enum_type.as_deref().and_then(known_enum) {
+        Some((path, _)) => path.to_string(),
+        None => col.data_type.rust_type().to_string(),
+    };
     if col.nullable {
         ty = format!("Option<{ty}>");
     }
@@ -870,14 +903,16 @@ pub fn generate_interface(table: &TableMeta) -> String {
 
     let mut out = String::with_capacity(2048);
     out.push_str(&format!(
-        "//! {display}（{table_name}）实体接口。\n//!\n//! 由 pek-rcode 从 Model.xml 自动生成，请勿手工修改。\n\n"
+        "//! {display}（{table_name}）实体接口。\n//!\n//! 由 pek-rcode 从 Model.xml 自动生成，请勿手工修改。\n//!\n//! 这里只定义访问器**契约**（供抽象/文档参考）；实体文件已生成同名 inherent 访问器\n//! （`列名()` / `set_列名()`，写入自动记录脏数据），直接调用即可，无需 `use` 本 trait。\n\n",
     ));
-    out.push_str("use chrono::NaiveDateTime;\nuse rust_decimal::Decimal;\n\n");
+    out.push_str(
+        "#[allow(unused_imports)]\nuse chrono::NaiveDateTime;\n#[allow(unused_imports)]\nuse rust_decimal::Decimal;\n\n",
+    );
     out.push_str(&format!("/// {display} 实体接口\npub trait I{name} {{\n", name = table.name));
     for col in &columns {
         let field = safe_field_name(&to_snake_case(&col.name));
         let setter = format!("set_{}", to_snake_case(&col.name));
-        let ty = column_rust_type(col);
+        let ty = entity_field_type(col);
         let doc = if col.description.is_empty() {
             format!("{} 列", col.name)
         } else {
@@ -885,17 +920,6 @@ pub fn generate_interface(table: &TableMeta) -> String {
         };
         out.push_str(&format!(
             "    /// 获取 {doc}\n    fn {field}(&self) -> &{ty};\n    /// 设置 {doc}\n    fn {setter}(&mut self, value: {ty});\n"
-        ));
-    }
-    out.push_str("}\n\n");
-
-    out.push_str(&format!("impl I{name} for {name} {{\n", name = table.name));
-    for col in &columns {
-        let field = safe_field_name(&to_snake_case(&col.name));
-        let setter = format!("set_{}", to_snake_case(&col.name));
-        let ty = column_rust_type(col);
-        out.push_str(&format!(
-            "    fn {field}(&self) -> &{ty} {{\n        &self.{field}\n    }}\n    fn {setter}(&mut self, value: {ty}) {{\n        self.{field} = value;\n    }}\n"
         ));
     }
     out.push_str("}\n");
@@ -964,16 +988,26 @@ mod tests {
 
         let code = generate(table);
 
-        // 结构体与字段
+        // 结构体与字段（字段私有，通过访问器读写）
         assert!(code.contains("pub struct OrderItem {"), "{code}");
-        assert!(code.contains("pub id: i32"), "{code}");
-        assert!(code.contains("pub order_id: i32"), "{code}");
-        assert!(code.contains("pub s_id: Option<i64>"), "可空字段应加 Option：{code}");
-        assert!(code.contains("pub amount: rust_decimal::Decimal"), "{code}");
-        assert!(code.contains("pub create_time: chrono::NaiveDateTime"), "{code}");
-        assert!(code.contains("pub r#type: String"), "关键字字段名应转义：{code}");
+        assert!(code.contains("    id: i32,"), "{code}");
+        assert!(code.contains("    order_id: i32,"), "{code}");
+        assert!(code.contains("    s_id: Option<i64>,"), "可空字段应加 Option：{code}");
+        assert!(code.contains("    amount: rust_decimal::Decimal,"), "{code}");
+        assert!(code.contains("    create_time: chrono::NaiveDateTime,"), "{code}");
+        assert!(code.contains("    r#type: String,"), "关键字字段名应转义：{code}");
         assert!(code.contains("pub const TABLE_NAME: &'static str = \"DH_OrderItem\";"), "{code}");
         assert!(code.contains("/// 编号（主键、自增）"), "{code}");
+
+        // 访问器与脏追踪：写入自动登记脏列，更新只写脏列
+        assert!(code.contains("pub fn id(&self) -> &i32"), "{code}");
+        assert!(code.contains("pub fn set_id(&mut self, value: i32)"), "{code}");
+        assert!(code.contains("self.dirty.mark(\"Id\");"), "{code}");
+        assert!(
+            code.contains("fn dirty_state(&self) -> Option<&pek_rcode::dirty::DirtyState>"),
+            "{code}"
+        );
+        assert!(code.contains("dirty: pek_rcode::dirty::DirtyState::new(),"), "{code}");
 
         // 对象实体实现
         assert!(code.contains("use pek_rcode::{DbRow, DbValue, Entity, Result};"), "{code}");
@@ -1129,12 +1163,15 @@ mod tests {
         assert!(code.contains("pub fn from_row(row: &DbRow) -> Self {"), "{code}");
         assert!(!code.contains("create_user"), "Model=False 的列不应进入模型类：{code}");
 
-        // 接口
+        // 接口（只定义契约；实体自带 inherent 访问器）
         let code = generate_interface(table);
         assert!(code.contains("pub trait IOrderItem {"), "{code}");
         assert!(code.contains("fn code(&self) -> &String;"), "{code}");
         assert!(code.contains("fn set_code(&mut self, value: String);"), "{code}");
-        assert!(code.contains("impl IOrderItem for OrderItem {"), "{code}");
+        assert!(
+            !code.contains("impl IOrderItem for OrderItem"),
+            "接口不再生成实现（字段封装后由实体提供 inherent 访问器）：{code}"
+        );
         assert!(!code.contains("create_user"), "Model=False 的列不应进入接口：{code}");
 
         // 全量生成文件名
@@ -1180,11 +1217,15 @@ mod tests {
 
         // 已知成员枚举 → Rust 枚举类型（含 Option 与 i32 存取）
         assert!(
-            code.contains("pub sex: pek_rcode::membership::SexKinds"),
+            code.contains("    sex: pek_rcode::membership::SexKinds,"),
             "{code}"
         );
         assert!(
-            code.contains("pub menu: Option<pek_rcode::membership::MenuTypes>"),
+            code.contains("    menu: Option<pek_rcode::membership::MenuTypes>,"),
+            "{code}"
+        );
+        assert!(
+            code.contains("pub fn set_sex(&mut self, value: pek_rcode::membership::SexKinds)"),
             "{code}"
         );
         assert!(
@@ -1204,7 +1245,7 @@ mod tests {
             "{code}"
         );
         // 未知枚举 → 按整型生成并注明 C# 枚举
-        assert!(code.contains("pub custom: i32"), "{code}");
+        assert!(code.contains("    custom: i32,"), "{code}");
         assert!(code.contains("对应 C# 枚举 My.CustomKind"), "{code}");
     }
 

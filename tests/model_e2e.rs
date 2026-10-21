@@ -152,8 +152,10 @@ fn model_codegen_output() {
     let code = codegen::generate(dev);
 
     assert!(code.contains("pub struct HardwareDevices {"), "{code}");
-    assert!(code.contains("pub mac: String"), "{code}");
-    assert!(code.contains("pub h_type: i16"), "{code}");
+    assert!(code.contains("    mac: String,"), "字段私有：{code}");
+    assert!(code.contains("    h_type: i16,"), "{code}");
+    assert!(code.contains("pub fn set_mac(&mut self, value: String)"), "{code}");
+    assert!(code.contains("self.dirty.mark(\"Mac\");"), "{code}");
     assert!(
         code.contains("pub const TABLE_NAME: &'static str = \"DH_HardwareDevices\";"),
         "{code}"
