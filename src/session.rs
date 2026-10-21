@@ -19,6 +19,8 @@ pub struct RowSet {
     pub columns: Arc<Vec<String>>,
     /// 数据行
     pub rows: Vec<DbRow>,
+    /// 列名索引（同一结果集的所有行共享一份）
+    pub(crate) index: OnceLock<Arc<HashMap<String, usize>>>,
 }
 
 impl RowSet {
@@ -27,12 +29,19 @@ impl RowSet {
         Self {
             columns: Arc::new(columns),
             rows: Vec::new(),
+            index: OnceLock::new(),
         }
     }
 
     /// 追加一行。
     pub fn push(&mut self, values: Vec<DbValue>) {
-        self.rows.push(DbRow::new(self.columns.clone(), values));
+        // 同一结果集只构建一次列名索引，各行共享
+        let index = self
+            .index
+            .get_or_init(|| Arc::new(build_column_index(&self.columns)))
+            .clone();
+        self.rows
+            .push(DbRow::with_index(self.columns.clone(), values, index));
     }
 
     /// 行数。
@@ -52,9 +61,10 @@ impl RowSet {
 
     /// 按列名取列序号（忽略大小写）。
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns
-            .iter()
-            .position(|c| c.eq_ignore_ascii_case(name))
+        let index = self
+            .index
+            .get_or_init(|| Arc::new(build_column_index(&self.columns)));
+        index.get(&name.to_ascii_lowercase()).copied()
     }
 }
 
@@ -74,8 +84,17 @@ pub struct DbRow {
     columns: Arc<Vec<String>>,
     /// 值（与列一一对应）
     values: Vec<DbValue>,
-    /// 列名（ASCII 小写）→ 下标（首次按名取值时构建，宽表/多行装载避免 O(列数²) 比较）
-    index: OnceLock<HashMap<String, usize>>,
+    /// 列名（ASCII 小写）→ 下标（结果集共享；单行创建时惰性构建）
+    index: OnceLock<Arc<HashMap<String, usize>>>,
+}
+
+/// 构建列名索引（ASCII 小写 → 下标；重复列名保留首个）。
+fn build_column_index(columns: &[String]) -> HashMap<String, usize> {
+    let mut map = HashMap::with_capacity(columns.len());
+    for (position, name) in columns.iter().enumerate() {
+        map.entry(name.to_ascii_lowercase()).or_insert(position);
+    }
+    map
 }
 
 impl Clone for DbRow {
@@ -99,15 +118,23 @@ impl DbRow {
         }
     }
 
+    /// 创建一行并复用共享列名索引（[`RowSet`] 使用）。
+    pub(crate) fn with_index(
+        columns: Arc<Vec<String>>,
+        values: Vec<DbValue>,
+        index: Arc<HashMap<String, usize>>,
+    ) -> Self {
+        Self {
+            columns,
+            values,
+            index: OnceLock::from(index),
+        }
+    }
+
     /// 列名索引（惰性构建）。
     fn name_index(&self) -> &HashMap<String, usize> {
-        self.index.get_or_init(|| {
-            let mut map = HashMap::with_capacity(self.columns.len());
-            for (position, name) in self.columns.iter().enumerate() {
-                map.entry(name.to_ascii_lowercase()).or_insert(position);
-            }
-            map
-        })
+        self.index
+            .get_or_init(|| Arc::new(build_column_index(&self.columns)))
     }
 
     /// 全部值。

@@ -87,6 +87,71 @@ pub fn insert_sql_named(
     Ok((sql, params))
 }
 
+/// 组装 INSERT 语句（列集合已拥有：值直接移入参数，热路径少一次克隆）。
+pub fn insert_sql_owned_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    fields: Vec<(String, DbValue)>,
+) -> Result<(String, Vec<DbValue>)> {
+    if fields.is_empty() {
+        return Err(Error::Model(format!(
+            "表 {} 的插入语句至少需要一个字段",
+            table.name
+        )));
+    }
+
+    // InfluxDB：直接生成行协议文本（非 SQL），写入由驱动 POST 到 /write
+    if kind == DatabaseKind::InfluxDb {
+        let borrowed: Vec<(&str, DbValue)> = fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.clone()))
+            .collect();
+        return Ok((influx_line_protocol(table, table_name, &borrowed)?, Vec::new()));
+    }
+
+    // 序列型自增（Oracle/DB2/Firebird，XCode 约定 SEQ_{表名}）：未显式提供自增列时补序列表达式
+    let identity_name = table.identity().map(|c| c.name.clone());
+    let add_sequence = matches!(
+        kind,
+        DatabaseKind::Oracle | DatabaseKind::Db2 | DatabaseKind::Firebird
+    ) && identity_name
+        .as_ref()
+        .is_some_and(|name| !fields.iter().any(|(field, _)| field.eq_ignore_ascii_case(name)));
+
+    let mut columns = Vec::with_capacity(fields.len() + 1);
+    let mut marks = Vec::with_capacity(fields.len() + 1);
+    let mut params = Vec::with_capacity(fields.len());
+
+    for (index, (field, value)) in fields.into_iter().enumerate() {
+        columns.push(kind.quote(column_name(table, &field)?));
+        marks.push(kind.placeholder(index));
+        params.push(value);
+    }
+
+    if add_sequence && let Some(identity) = table.identity() {
+        let sequence = oracle_identity_sequence(table_name);
+        let expression = match kind {
+            // Oracle："SEQ_x".NEXTVAL（引号保持大小写）
+            DatabaseKind::Oracle => format!("{}.NEXTVAL", kind.quote(&sequence)),
+            // DB2（Oracle 兼容模式）：与 DH.NCode 一致使用未引号 SEQ_表名.nextval
+            DatabaseKind::Db2 => format!("{sequence}.nextval"),
+            // Firebird：next value for "SEQ_x"
+            _ => format!("next value for {}", kind.quote(&sequence)),
+        };
+        columns.push(kind.quote(table.effective_column_name(identity)));
+        marks.push(expression);
+    }
+
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        kind.quote(table_name),
+        columns.join(", "),
+        marks.join(", ")
+    );
+    Ok((sql, params))
+}
+
 /// 批量写入模式（对应 C# `IDbSession.Insert / InsertIgnore / Replace / Upsert` 的多行实现）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchWriteMode {
@@ -392,6 +457,47 @@ pub fn update_sql_named(
         let mark = kind.placeholder(params.len());
         parts.push(format!("{} = {mark}", kind.quote(column_name(table, field)?)));
         params.push(value.clone());
+    }
+
+    let where_sql = filter.render(kind, &mut params);
+    let mut sql = format!(
+        "UPDATE {} SET {}",
+        kind.quote(table_name),
+        parts.join(", ")
+    );
+    if !where_sql.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_sql);
+    }
+
+    Ok((sql, params))
+}
+
+/// 组装 UPDATE 语句（列集合已拥有：值直接移入参数，热路径少一次克隆）。
+pub fn update_sql_owned_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    sets: Vec<(String, DbValue)>,
+    filter: &Where,
+) -> Result<(String, Vec<DbValue>)> {
+    if sets.is_empty() {
+        return Err(Error::Model(format!(
+            "表 {} 的更新语句至少需要一个待更新字段",
+            table.name
+        )));
+    }
+
+    let mut params = Vec::with_capacity(sets.len() + 4);
+    let mut parts = Vec::with_capacity(sets.len());
+
+    for (field, value) in sets {
+        let mark = kind.placeholder(params.len());
+        parts.push(format!(
+            "{} = {mark}",
+            kind.quote(column_name(table, &field)?)
+        ));
+        params.push(value);
     }
 
     let where_sql = filter.render(kind, &mut params);

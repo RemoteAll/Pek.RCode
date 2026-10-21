@@ -173,13 +173,15 @@ pub trait Entity: Sized {
     fn insert_with(&mut self, table: &TableRef<'_>, session: &mut dyn SqlSession) -> Result<i64> {
         let identity = table.meta().identity().map(|c| c.name.clone());
 
-        let fields: Vec<(&'static str, DbValue)> = self
+        // 列集合转为 owned：值直接移入 SQL 参数（省一次克隆）
+        let fields: Vec<(String, DbValue)> = self
             .to_fields()
             .into_iter()
             .filter(|pair| !identity.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(pair.0)))
+            .map(|(name, value)| (name.to_string(), value))
             .collect();
 
-        let id = table.insert(session, &fields)?;
+        let id = table.insert_owned(session, fields)?;
         if id != 0 {
             self.set_identity(id)?;
         }
@@ -1263,40 +1265,126 @@ pub trait Entity: Sized {
         if list.is_empty() {
             return Ok(0);
         }
+        // 无自增列 + 单一主键：按 (连接, 物理表) 分组，每组一次 IN 查询判定存在性
+        // （逐条点查 → 每表一次查询）
+        let pks = Self::primary_keys();
+        let batch_exists = Self::identity_column().is_none() && pks.len() == 1;
+        let mut plans: Vec<Option<usize>> = vec![None; list.len()];
+        let mut existing: Vec<HashSet<String>> = Vec::new();
+        if batch_exists {
+            let pk = pks[0];
+            let handle = dal.table(Self::table())?;
+            let base = handle.shard_base();
+            let base_table = handle.meta().effective_table_name().to_string();
+            let mut groups: Vec<BatchGroup<DbValue>> = Vec::new();
+            let mut group_index: HashMap<String, usize> = HashMap::new();
+
+            for (index, entity) in list.iter().enumerate() {
+                let Some(value) = entity.column_value(pk) else {
+                    continue;
+                };
+                if is_empty_pk_value(&value) {
+                    continue;
+                }
+                let shard_value = shard_value_of(entity, policy)?;
+                let (target, conn, physical) = match policy.shard_of_value(base, &shard_value)? {
+                    Some(model) => {
+                        let physical = model
+                            .table_name
+                            .clone()
+                            .unwrap_or_else(|| base_table.clone());
+                        let target = crate::shards::resolve_shard_dal(&model, base, dal)?;
+                        let conn = match &target {
+                            Some(_) => model.conn_name.as_deref().unwrap_or("").to_lowercase(),
+                            None => String::new(),
+                        };
+                        (target, conn, physical)
+                    }
+                    None => (None, String::new(), base_table.clone()),
+                };
+                let key = format!("{conn}\u{1}{physical}");
+                let group = match group_index.get(&key) {
+                    Some(&group) => group,
+                    None => {
+                        let group = groups.len();
+                        groups.push(BatchGroup {
+                            dal: target.clone(),
+                            conn: conn.clone(),
+                            physical: physical.clone(),
+                            ensure: false,
+                            payload: Vec::new(),
+                        });
+                        group_index.insert(key, group);
+                        group
+                    }
+                };
+                groups[group].payload.push(value);
+                plans[index] = Some(group);
+            }
+
+            existing = vec![HashSet::new(); groups.len()];
+            let mut owned: HashMap<String, Box<dyn SqlSession>> = HashMap::new();
+            for (group_index, group) in groups.iter().enumerate() {
+                let (group_dal, group_session): (&Dal, &mut dyn SqlSession) = match &group.dal {
+                    None => (dal, &mut *session),
+                    Some(d) => {
+                        if !owned.contains_key(&group.conn) {
+                            owned.insert(group.conn.clone(), d.open_session()?);
+                        }
+                        (d.as_ref(), &mut **owned.get_mut(&group.conn).unwrap())
+                    }
+                };
+                if !group_session.table_exists(&group.physical)? {
+                    continue;
+                }
+                let table = group_dal.table_as(Self::table(), &group.physical)?;
+                for chunk in group.payload.chunks(1000) {
+                    let filter = Where::new().in_(pk, chunk.to_vec());
+                    let set = table.query(group_session, &Query::new().filter(filter))?;
+                    for row in set.rows {
+                        if let Some(value) = row.get_by_name(pk) {
+                            existing[group_index].insert(value.to_text());
+                        }
+                    }
+                }
+            }
+        }
+
         let mut news: Vec<usize> = Vec::new();
         let mut total = 0u64;
         for (index, entity) in list.iter().enumerate() {
-            let is_new = match Self::identity_column() {
-                Some(id) => {
-                    let value = entity
-                        .to_fields()
-                        .into_iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case(id))
-                        .map(|(_, value)| value);
-                    !matches!(value.and_then(|v| v.as_i64()), Some(v) if v != 0)
+            let is_new = if let Some(id) = Self::identity_column() {
+                let value = entity.column_value(id);
+                !matches!(value.and_then(|v| v.as_i64()), Some(v) if v != 0)
+            } else if batch_exists {
+                match (plans[index], entity.column_value(pks[0])) {
+                    (Some(group), Some(value)) if !is_empty_pk_value(&value) => {
+                        !existing[group].contains(&value.to_text())
+                    }
+                    _ => true,
                 }
-                None => {
-                    let fields = entity.to_fields();
-                    let pk = pk_values_of(&fields, Self::primary_keys())?;
-                    if pk.iter().all(is_empty_pk_value) {
-                        true
-                    } else {
-                        let value = shard_value_of(entity, policy)?;
-                        match resolve_shard_target::<Self>(dal, policy, &value)? {
-                            Some(target) => run_on_shard_target(
-                                &target,
-                                dal,
-                                Self::table(),
-                                session,
-                                |t, s| {
-                                    if !s.table_exists(t.physical_name())? {
-                                        return Ok(true);
-                                    }
-                                    Ok(t.find_by_pk(s, &pk)?.is_none())
-                                },
-                            )?,
-                            None => Self::find(dal, session, &pk)?.is_none(),
-                        }
+            } else {
+                // 复合主键：逐条点查（无法用单主键 IN 合并）
+                let fields = entity.to_fields();
+                let pk = pk_values_of(&fields, pks)?;
+                if pk.iter().all(is_empty_pk_value) {
+                    true
+                } else {
+                    let value = shard_value_of(entity, policy)?;
+                    match resolve_shard_target::<Self>(dal, policy, &value)? {
+                        Some(target) => run_on_shard_target(
+                            &target,
+                            dal,
+                            Self::table(),
+                            session,
+                            |t, s| {
+                                if !s.table_exists(t.physical_name())? {
+                                    return Ok(true);
+                                }
+                                Ok(t.find_by_pk(s, &pk)?.is_none())
+                            },
+                        )?,
+                        None => Self::find(dal, session, &pk)?.is_none(),
                     }
                 }
             };

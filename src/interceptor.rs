@@ -115,6 +115,16 @@ pub(crate) fn apply_registered(
     apply_to(&interceptors, table, method, values);
 }
 
+/// 把已 owned 的列集合就地应用全局拦截器（写入热路径使用，避免再次复制列名与值）。
+pub(crate) fn prepare_owned(
+    table: &TableMeta,
+    method: DataMethod,
+    mut values: Vec<(String, DbValue)>,
+) -> Vec<(String, DbValue)> {
+    apply_registered(table, method, &mut values);
+    values
+}
+
 /// 把 `&[(&str, DbValue)]` 转为 owned 列集合，并应用全局拦截器（写入路径使用）。
 pub(crate) fn prepare(
     table: &TableMeta,

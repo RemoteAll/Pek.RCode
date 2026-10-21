@@ -995,6 +995,7 @@ impl<'a> TableRef<'a> {
         Ok(RowSet {
             columns: columns.unwrap_or_default(),
             rows,
+            ..RowSet::default()
         })
     }
 

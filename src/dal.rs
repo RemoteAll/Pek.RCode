@@ -1300,9 +1300,21 @@ impl<'a> TableRef<'a> {
             crate::interceptor::DataMethod::Insert,
             fields,
         );
-        let fields: Vec<(&str, DbValue)> =
-            values.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-        self.insert_prepared(session, &fields)
+        self.insert_prepared_owned(session, values)
+    }
+
+    /// 插入一行（列集合已拥有：值直接移入 SQL 参数，省一次克隆）。
+    pub fn insert_owned(
+        &self,
+        session: &mut dyn SqlSession,
+        fields: Vec<(String, DbValue)>,
+    ) -> Result<i64> {
+        let values = crate::interceptor::prepare_owned(
+            self.table,
+            crate::interceptor::DataMethod::Insert,
+            fields,
+        );
+        self.insert_prepared_owned(session, values)
     }
 
     /// 插入一行（**已执行拦截器补全**的字段）。
@@ -1313,9 +1325,26 @@ impl<'a> TableRef<'a> {
         session: &mut dyn SqlSession,
         fields: &[(&str, DbValue)],
     ) -> Result<i64> {
+        let owned: Vec<(String, DbValue)> = fields
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect();
+        self.insert_prepared_owned(session, owned)
+    }
+
+    /// 插入一行（**已执行拦截器补全**且列集合已拥有：值移入 SQL 参数）。
+    pub(crate) fn insert_prepared_owned(
+        &self,
+        session: &mut dyn SqlSession,
+        fields: Vec<(String, DbValue)>,
+    ) -> Result<i64> {
         let identity = self.table.identity();
-        let (mut sql, params) =
-            sqlbuild::insert_sql_named(self.dal.kind, self.table, self.physical_name(), fields)?;
+        let (mut sql, params) = sqlbuild::insert_sql_owned_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            fields,
+        )?;
 
         if let Some(id_col) = identity
             && matches!(
@@ -1680,13 +1709,11 @@ impl<'a> TableRef<'a> {
             crate::interceptor::DataMethod::Update,
             sets,
         );
-        let sets: Vec<(&str, DbValue)> =
-            values.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-        let (sql, params) = sqlbuild::update_sql_named(
+        let (sql, params) = sqlbuild::update_sql_owned_named(
             self.dal.kind,
             self.table,
             self.physical_name(),
-            &sets,
+            values,
             &filter,
         )?;
         self.dal.log_sql(&sql);

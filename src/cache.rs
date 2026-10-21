@@ -88,6 +88,8 @@ struct EntityCacheState {
     data: Option<Arc<Vec<DbRow>>>,
     /// 加载完成时刻
     loaded_at: Option<Instant>,
+    /// 已向调用方返回过“过期旧值”，等待下次访问刷新
+    stale_served: bool,
 }
 
 impl EntityCache {
@@ -125,15 +127,23 @@ impl EntityCache {
             && state.data.is_some()
     }
 
-    /// 取得整表数据（首次访问或过期时同步重载）。
+    /// 取得整表数据（对应 C# `Meta.Cache.Entities` 的“旧值 + 延迟刷新”语义）。
+    ///
+    /// - 未过期：直接返回缓存；
+    /// - **首次发现过期：先返回旧数据（不阻塞调用方）**，并标记待刷新；
+    /// - 下一次访问：同步重载后返回新数据（无额外线程/连接，语义接近 C# 的异步刷新）。
     pub fn entities(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<Arc<Vec<DbRow>>> {
         {
             let expire = *lock(&self.expire);
-            let state = lock(&self.state);
-            if let (Some(data), Some(at)) = (&state.data, state.loaded_at)
-                && at.elapsed() < expire
-            {
-                return Ok(data.clone());
+            let mut state = lock(&self.state);
+            if let (Some(data), Some(at)) = (state.data.clone(), state.loaded_at) {
+                if at.elapsed() < expire {
+                    return Ok(data);
+                }
+                if !state.stale_served {
+                    state.stale_served = true;
+                    return Ok(data);
+                }
             }
         }
         self.reload(dal, session)
@@ -146,6 +156,7 @@ impl EntityCache {
         let mut state = lock(&self.state);
         state.data = Some(data.clone());
         state.loaded_at = Some(Instant::now());
+        state.stale_served = false;
         Ok(data)
     }
 
@@ -154,6 +165,7 @@ impl EntityCache {
         let mut state = lock(&self.state);
         state.data = None;
         state.loaded_at = None;
+        state.stale_served = false;
     }
 
     /// 在已缓存的整表数据上做过滤查找（未加载时返回空列表）。
@@ -537,9 +549,12 @@ mod tests {
             )
             .unwrap();
 
-        // 过期时间置 0：任何访问都视为过期 → 同步重载
+        // 过期时间置 0：任何访问都视为过期
         cache.set_expire_seconds(0);
         assert!(!cache.is_valid());
+        // 首次过期访问：返回旧值（不阻塞，对应 C# “旧值 + 异步刷新”）
+        assert_eq!(cache.entities(&dal, session.as_mut()).unwrap().len(), 1);
+        // 下次访问：同步重载
         assert_eq!(cache.entities(&dal, session.as_mut()).unwrap().len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
