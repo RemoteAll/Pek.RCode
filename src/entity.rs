@@ -95,6 +95,16 @@ pub trait Entity: Sized {
     /// 输出实体的全部 `(列名, 值)`（用于插入/更新/删除的主键提取）。
     fn to_fields(&self) -> Vec<(&'static str, DbValue)>;
 
+    /// 取指定列的当前值（用于按脏列/指定列取值；默认回退为 [`Entity::to_fields`] 全量取值）。
+    ///
+    /// 生成实体会覆盖为按列名直接取值，避免宽表更新时对未变化列做无谓的克隆分配。
+    fn column_value(&self, column: &str) -> Option<DbValue> {
+        self.to_fields()
+            .into_iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+            .map(|(_, value)| value)
+    }
+
     /// 从查询行装载实体。
     fn from_row(row: &DbRow) -> Result<Self>;
 
@@ -386,6 +396,37 @@ pub trait Entity: Sized {
             return Ok(0);
         }
 
+        // 启用脏追踪：只取脏列的值（避免宽表对全部列做克隆分配）
+        if let Some(state) = dirty {
+            let names = state.names();
+            let mut sets: Vec<(&'static str, DbValue)> = Vec::with_capacity(names.len());
+            for name in &names {
+                if pks.iter().any(|pk| pk.eq_ignore_ascii_case(name))
+                    || identity.is_some_and(|id| id.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
+                let Some(column) = Self::columns()
+                    .iter()
+                    .copied()
+                    .find(|c| c.eq_ignore_ascii_case(name))
+                else {
+                    continue;
+                };
+                if let Some(value) = self.column_value(column) {
+                    sets.push((column, value));
+                }
+            }
+            if sets.is_empty() {
+                self.clear_dirty();
+                return Ok(0);
+            }
+            let pk_values = pk_values(self, pks)?;
+            let affected = table.update_by_pk(session, &sets, &pk_values)?;
+            self.clear_dirty();
+            return Ok(affected);
+        }
+
         let fields = self.to_fields();
         let sets: Vec<(&'static str, DbValue)> = fields
             .iter()
@@ -395,20 +436,92 @@ pub trait Entity: Sized {
                 {
                     return false;
                 }
-                // 启用脏追踪时只写脏列
-                dirty.is_none_or(|state| state.contains(pair.0))
+                true
             })
             .map(|pair| (pair.0, pair.1.clone()))
             .collect();
 
         if sets.is_empty() {
-            self.clear_dirty();
-            return Ok(0);
+            return Err(Error::Model(format!(
+                "实体 {} 除主键/自增列外没有可更新字段",
+                Self::table()
+            )));
         }
 
         let pk_values = pk_values_of(&fields, pks)?;
         let affected = table.update_by_pk(session, &sets, &pk_values)?;
         self.clear_dirty();
+        Ok(affected)
+    }
+
+    /// 按指定的列集合更新（显式列集；对应 C# `Entity.Update(names, values)`）。
+    ///
+    /// - 用于“只想更新少数列”的窄更新场景（底层走 [`TableRef::update_by_pk`]）；
+    /// - 列名不存在、或只含主键/自增列时返回 0（不拼空 SET、不发 SQL）；
+    /// - 启用脏追踪时，成功后**只清除这些列的脏标记**（其它列的脏数据保留，后续 `save` 仍会写入）；
+    /// - 未启用脏追踪的实体同样可用（取值回退 [`Entity::column_value`]）。
+    fn update_columns(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        columns: &[&str],
+    ) -> Result<u64> {
+        let table = dal.table(Self::table())?;
+        self.update_columns_with(&table, session, columns)
+    }
+
+    /// 按指定的列集合更新到指定表句柄（分表场景使用）。
+    fn update_columns_with(
+        &self,
+        table: &TableRef<'_>,
+        session: &mut dyn SqlSession,
+        columns: &[&str],
+    ) -> Result<u64> {
+        let pks = Self::primary_keys();
+        if pks.is_empty() {
+            return Err(Error::Model(format!(
+                "实体 {} 没有主键，无法按主键更新",
+                Self::table()
+            )));
+        }
+        let identity = Self::identity_column();
+        let mut sets: Vec<(&'static str, DbValue)> = Vec::with_capacity(columns.len());
+        for name in columns {
+            if pks.iter().any(|pk| pk.eq_ignore_ascii_case(name))
+                || identity.is_some_and(|id| id.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            let Some(column) = Self::columns()
+                .iter()
+                .copied()
+                .find(|c| c.eq_ignore_ascii_case(name))
+            else {
+                return Err(Error::Model(format!(
+                    "实体 {} 不存在列 {}",
+                    Self::table(),
+                    name
+                )));
+            };
+            let Some(value) = self.column_value(column) else {
+                return Err(Error::Model(format!(
+                    "实体 {} 无法读取列 {} 的值",
+                    Self::table(),
+                    column
+                )));
+            };
+            sets.push((column, value));
+        }
+        if sets.is_empty() {
+            return Ok(0);
+        }
+        let pk_values = pk_values(self, pks)?;
+        let affected = table.update_by_pk(session, &sets, &pk_values)?;
+        if let Some(state) = self.dirty_state() {
+            for (column, _) in &sets {
+                state.remove(column);
+            }
+        }
         Ok(affected)
     }
 
@@ -441,10 +554,48 @@ pub trait Entity: Sized {
         if list.is_empty() {
             return Ok(0);
         }
+        // 无自增列 + 单一主键：一次批量查询判定存在性（避免逐条 SELECT，N 次往返降为 1 次）
+        let pks = Self::primary_keys();
+        let batch_exists = Self::identity_column().is_none() && pks.len() == 1;
+        let mut existing: HashSet<String> = HashSet::new();
+        if batch_exists {
+            let pk = pks[0];
+            let mut values: Vec<DbValue> = Vec::with_capacity(list.len());
+            for entity in list {
+                if let Some(value) = entity.column_value(pk)
+                    && !is_empty_pk_value(&value)
+                {
+                    values.push(value);
+                }
+            }
+            if !values.is_empty() {
+                let table = dal.table(Self::table())?;
+                for chunk in values.chunks(1000) {
+                    let filter = Where::new().in_(pk, chunk.to_vec());
+                    let set = table.query(session, &Query::new().filter(filter))?;
+                    for row in set.rows {
+                        if let Some(value) = row.get_by_name(pk) {
+                            existing.insert(value.to_text());
+                        }
+                    }
+                }
+            }
+        }
+
         let mut news: Vec<usize> = Vec::new();
         let mut total = 0u64;
         for (index, entity) in list.iter().enumerate() {
-            if is_new_entity(dal, session, entity)? {
+            let is_new = if batch_exists {
+                match entity.column_value(pks[0]) {
+                    Some(value) if !is_empty_pk_value(&value) => {
+                        !existing.contains(&value.to_text())
+                    }
+                    _ => true,
+                }
+            } else {
+                is_new_entity(dal, session, entity)?
+            };
+            if is_new {
                 news.push(index);
             } else {
                 total += entity.update(dal, session)?;
@@ -497,7 +648,14 @@ pub trait Entity: Sized {
                 return Ok(());
             }
             let pk = pk_values_of(&fields, Self::primary_keys())?;
-            queue.upsert(dal, session, &pk, &fields)
+            match self.dirty_state() {
+                // 行已存在时只写变化列（行不存在仍插入全列）
+                Some(state) => {
+                    let columns = state.names();
+                    queue.upsert_tracked(dal, session, &pk, &fields, Some(columns.as_slice()))
+                }
+                None => queue.upsert(dal, session, &pk, &fields),
+            }
         }
     }
 
@@ -510,7 +668,10 @@ pub trait Entity: Sized {
     /// 按主键删除指定表句柄中的行（分表场景使用）。
     fn delete_with(&self, table: &TableRef<'_>, session: &mut dyn SqlSession) -> Result<u64> {
         let pk = pk_values_of(&self.to_fields(), Self::primary_keys())?;
-        table.delete_by_pk(session, &pk)
+        let affected = table.delete_by_pk(session, &pk)?;
+        // 删除后实体不再对应数据库行，脏数据一并清空
+        self.clear_dirty();
+        Ok(affected)
     }
 
     /// 批量按主键删除（对应 C# `EntityExtension.Delete(list)` 的批量分支）：
@@ -847,6 +1008,10 @@ pub trait Entity: Sized {
             }
             let table = group_dal.table_as(Self::table(), &group.physical)?;
             affected += table.write_batch_prepared(group_session, &group.payload, mode, batch_size)?;
+        }
+        // 批量写入成功后清空各实体的脏数据（与单表批量写入一致）
+        for entity in list.iter() {
+            entity.clear_dirty();
         }
         Ok(affected)
     }
@@ -1351,6 +1516,21 @@ fn is_empty_pk_value(value: &DbValue) -> bool {
 }
 
 /// 从字段列表按主键顺序提取主键值。
+/// 按主键列逐个取值（走 [`Entity::column_value`]，避免全字段收集）。
+fn pk_values<E: Entity>(entity: &E, pks: &[&'static str]) -> Result<Vec<DbValue>> {
+    if pks.is_empty() {
+        return Err(Error::Model("实体没有主键，无法按主键操作".into()));
+    }
+    pks.iter()
+        .copied()
+        .map(|pk| {
+            entity
+                .column_value(pk)
+                .ok_or_else(|| Error::Model(format!("实体字段缺少主键 {pk}")))
+        })
+        .collect()
+}
+
 fn pk_values_of(fields: &[(&'static str, DbValue)], pks: &[&'static str]) -> Result<Vec<DbValue>> {
     if pks.is_empty() {
         return Err(Error::Model("实体没有主键，无法按主键操作".into()));
@@ -1376,10 +1556,7 @@ pub trait AuditExt: Entity {
     /// <param name="column">列名（忽略大小写）</param>
     /// <returns>列值；列不存在时为 None</returns>
     fn field_value(&self, column: &str) -> Option<DbValue> {
-        self.to_fields()
-            .into_iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(column))
-            .map(|(_, value)| value)
+        self.column_value(column)
     }
 
     /// 创建时间（`CreateTime`）。

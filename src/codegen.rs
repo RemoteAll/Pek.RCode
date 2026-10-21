@@ -206,6 +206,7 @@ pub fn generate(table: &TableMeta) -> String {
     }
 
     let mut field_lines = String::new();
+    let mut value_arms = String::new();
     for col in &table.columns {
         let field = safe_field_name(&to_snake_case(&col.name));
         let name = table.effective_column_name(col);
@@ -222,9 +223,15 @@ pub fn generate(table: &TableMeta) -> String {
             format!("self.{field}.into()")
         };
         field_lines.push_str(&format!("            (\"{name}\", {expr}),\n"));
+        value_arms.push_str(&format!(
+            "        if column.eq_ignore_ascii_case(\"{name}\") {{\n            return Some({expr});\n        }}\n"
+        ));
     }
     methods.push(format!(
         "fn to_fields(&self) -> Vec<(&'static str, DbValue)> {{\n        vec![\n{field_lines}        ]\n    }}"
+    ));
+    methods.push(format!(
+        "fn column_value(&self, column: &str) -> Option<DbValue> {{\n{value_arms}        None\n    }}"
     ));
 
     let mut row_lines = String::new();
@@ -1003,6 +1010,10 @@ mod tests {
         assert!(code.contains("pub fn id(&self) -> &i32"), "{code}");
         assert!(code.contains("pub fn set_id(&mut self, value: i32)"), "{code}");
         assert!(code.contains("self.dirty.mark(\"Id\");"), "{code}");
+        assert!(
+            code.contains("fn column_value(&self, column: &str) -> Option<DbValue>"),
+            "生成实体应按列直接取值（避免全字段克隆）：{code}"
+        );
         assert!(
             code.contains("fn dirty_state(&self) -> Option<&pek_rcode::dirty::DirtyState>"),
             "{code}"

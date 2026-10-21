@@ -398,3 +398,148 @@ fn dirty_setter_same_value_and_noop_update() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 显式列集更新：只写指定列，成功后只清除这些列的脏标记。
+#[test]
+fn update_columns_writes_only_requested_columns() {
+    let (dir, dal) = setup("update-columns");
+    let mut session = dal.open_session().unwrap();
+
+    let mut seed = TrackedOrder::new();
+    seed.set_code(Some("A".into()));
+    seed.set_amount("1".parse().unwrap());
+    let id = seed.insert(&dal, session.as_mut()).unwrap();
+
+    let mut loaded = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+    loaded.set_code(Some("B".into()));
+    loaded.set_amount("9".parse().unwrap());
+
+    // 只写 Amount：Code 的脏标记保留，数据库里的 Code 仍是 A
+    assert_eq!(
+        loaded
+            .update_columns(&dal, session.as_mut(), &["Amount"])
+            .unwrap(),
+        1
+    );
+    assert!(loaded.is_dirty("Code"), "未写入的列应保留脏标记");
+    assert!(!loaded.is_dirty("Amount"), "已写入的列应清除脏标记");
+
+    let after = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.code().as_deref(), Some("A"));
+    assert_eq!(after.amount().to_string(), "9");
+
+    // 随后 save 只写剩余的 Code
+    assert_eq!(loaded.save(&dal, session.as_mut()).unwrap(), 1);
+    let final_row = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_row.code().as_deref(), Some("B"));
+
+    // 未知列直接报错，不发 SQL
+    assert!(
+        loaded
+            .update_columns(&dal, session.as_mut(), &["Missing"])
+            .is_err()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 批量插入成功后清空各实体的脏数据。
+#[test]
+fn batch_insert_clears_dirty() {
+    let (dir, dal) = setup("batch-dirty");
+    let mut session = dal.open_session().unwrap();
+
+    let mut first = TrackedOrder::new();
+    first.set_code(Some("B1".into()));
+    let mut second = TrackedOrder::new();
+    second.set_code(Some("B2".into()));
+    assert!(first.has_dirty() && second.has_dirty());
+
+    let list = vec![first, second];
+    let affected = TrackedOrder::insert_batch(&dal, session.as_mut(), &list, None).unwrap();
+    assert_eq!(affected, 2);
+    assert!(
+        list.iter().all(|e| !e.has_dirty()),
+        "批量插入成功后应清空脏数据"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `DbRow::get_by_name`：大小写不敏感、缺失列返回 None、重复取值一致。
+#[test]
+fn db_row_name_lookup_is_case_insensitive_and_cached() {
+    use std::sync::Arc;
+
+    let columns: Arc<Vec<String>> = Arc::new(
+        ["Id", "Code", "Amount"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    let row = pek_rcode::session::DbRow::new(
+        columns,
+        vec![1i64.into(), "abc".into(), 2.5f64.into()],
+    );
+    assert_eq!(row.get_by_name("id").and_then(DbValue::as_i64), Some(1));
+    assert_eq!(row.get_by_name("CODE").map(DbValue::to_text), Some("abc".to_string()));
+    assert_eq!(row.get_by_name("amount").and_then(DbValue::as_f64), Some(2.5));
+    assert!(row.get_by_name("Missing").is_none());
+    // 重复取值走索引缓存
+    assert_eq!(row.get_by_name("Code").map(DbValue::to_text), Some("abc".to_string()));
+}
+
+/// `SaveAsync` 等价（`enqueue_save` + `EntityQueue`）：更新分支只写脏列，无脏不入队。
+#[test]
+fn enqueue_save_writes_only_dirty_columns() {
+    let (dir, dal) = setup("queue-dirty");
+    let mut session = dal.open_session().unwrap();
+    let mut queue = pek_rcode::entity_queue::EntityQueue::new(TrackedOrder::TABLE_NAME);
+
+    let mut seed = TrackedOrder::new();
+    seed.set_code(Some("Q1".into()));
+    seed.set_amount("1".parse().unwrap());
+    let id = seed.insert(&dal, session.as_mut()).unwrap();
+
+    // 两个会话各加载同一行（内存中都是旧值）
+    let mut a = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+    let mut b = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+
+    a.set_code(Some("Q2".into()));
+    a.enqueue_save(&mut queue, &dal, session.as_mut()).unwrap();
+    queue.flush(&dal, session.as_mut()).unwrap();
+
+    b.set_amount("5".parse().unwrap());
+    b.enqueue_save(&mut queue, &dal, session.as_mut()).unwrap();
+    queue.flush(&dal, session.as_mut()).unwrap();
+
+    let reloaded = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded.code().as_deref(),
+        Some("Q2"),
+        "队列更新只写脏列：B 的旧 Code 不应覆盖 A 的新值"
+    );
+    assert_eq!(reloaded.amount().to_string(), "5");
+
+    // 无脏数据：不应入队
+    let mut clean = TrackedOrder::find(&dal, session.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+    let before = queue.len();
+    clean.enqueue_save(&mut queue, &dal, session.as_mut()).unwrap();
+    assert_eq!(queue.len(), before, "无脏数据不应入队");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

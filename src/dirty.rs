@@ -70,6 +70,13 @@ impl DirtyCollection {
         self.items.iter().map(|(key, _)| key.as_str()).collect()
     }
 
+    /// 移除指定列（忽略大小写），返回是否移除。
+    pub fn remove(&mut self, name: &str) -> bool {
+        let before = self.items.len();
+        self.items.retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+        self.items.len() != before
+    }
+
     /// 清空。
     pub fn clear(&mut self) {
         self.items.clear();
@@ -198,6 +205,12 @@ impl DirtyState {
     pub fn names(&self) -> Vec<String> {
         let items = lock(&self.items);
         items.names().into_iter().map(str::to_string).collect()
+    }
+
+    /// 移除指定脏列（按指定列集更新成功后调用，仅清除已落库的列）。
+    pub fn remove(&self, name: &str) -> bool {
+        let mut items = lock(&self.items);
+        items.remove(name)
     }
 
     /// 清空（写入成功后由实体层调用）。

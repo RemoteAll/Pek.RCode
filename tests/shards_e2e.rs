@@ -21,6 +21,7 @@ struct TradeLog {
     id: i32,
     create_time: NaiveDateTime,
     note: String,
+    dirty: pek_rcode::dirty::DirtyState,
 }
 
 impl TradeLog {
@@ -31,7 +32,17 @@ impl TradeLog {
             id: 0,
             create_time,
             note: note.to_string(),
+            dirty: pek_rcode::dirty::DirtyState::new(),
         }
+    }
+
+    /// 写入 Note（值未变化时不登记脏数据）。
+    fn set_note(&mut self, value: &str) {
+        if self.note == value {
+            return;
+        }
+        self.note = value.to_string();
+        self.dirty.mark("Note");
     }
 }
 
@@ -74,7 +85,12 @@ impl Entity for TradeLog {
                 .get_by_name("Note")
                 .map(DbValue::to_text)
                 .unwrap_or_default(),
+            dirty: pek_rcode::dirty::DirtyState::new(),
         })
+    }
+
+    fn dirty_state(&self) -> Option<&pek_rcode::dirty::DirtyState> {
+        Some(&self.dirty)
     }
 
     fn set_identity(&mut self, value: i64) -> Result<()> {
@@ -286,7 +302,7 @@ fn time_sharded_crud_routes_to_physical_tables() {
 
     // 更新：写回原分表
     let mut to_update = found.clone();
-    to_update.note = "b1-updated".into();
+    to_update.set_note("b1-updated");
     assert_eq!(
         to_update.update_sharded(&dal, session.as_mut(), &policy).unwrap(),
         1
@@ -742,7 +758,7 @@ fn cross_connection_shards_route_by_conn_name() {
     .unwrap()
     .expect("应能跨库找到 2026 行");
     assert_eq!(found.note, "a");
-    found.note = "a2".into();
+    found.set_note("a2");
     assert_eq!(
         found.update_sharded(&dal, session.as_mut(), &policy).unwrap(),
         1
@@ -851,5 +867,54 @@ fn cross_connection_shards_route_by_conn_name() {
     dal.clear_pool();
     drop(session);
     drop(dal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 分表脏追踪：无脏更新不发 SQL、改 Note 返回 1、批量插入成功清空脏数据。
+#[test]
+fn sharded_dirty_tracking_and_batch_clear() {
+    let (dir, db) = temp_db("dirty");
+    let dal = open_dal(&db);
+    let mut session = dal.open_session().unwrap();
+    let policy = day_policy();
+    let when = day(2026, 9, 1);
+    let key: DbValue = when.into();
+
+    let mut seed = TradeLog::new(when, "A");
+    seed.insert_sharded(&dal, session.as_mut(), &policy).unwrap();
+    assert!(!seed.has_dirty(), "插入后应清空脏数据");
+
+    let loaded = TradeLog::find_sharded(&dal, session.as_mut(), &policy, &key, &[seed.id.into()])
+        .unwrap()
+        .unwrap();
+    assert!(!loaded.has_dirty());
+    assert_eq!(
+        loaded
+            .update_sharded(&dal, session.as_mut(), &policy)
+            .unwrap(),
+        0,
+        "无修改时分表更新应直接返回 0"
+    );
+
+    let mut edit = TradeLog::find_sharded(&dal, session.as_mut(), &policy, &key, &[seed.id.into()])
+        .unwrap()
+        .unwrap();
+    edit.set_note("B");
+    assert_eq!(
+        edit.update_sharded(&dal, session.as_mut(), &policy).unwrap(),
+        1
+    );
+    assert!(!edit.has_dirty(), "分表更新成功后应清空脏数据");
+
+    // 分表批量插入成功后清空各实体脏数据
+    let mut batch = vec![TradeLog::new(when, "X"), TradeLog::new(when, "Y")];
+    batch[0].set_note("X1");
+    assert!(batch[0].has_dirty());
+    TradeLog::insert_batch_sharded(&dal, session.as_mut(), &policy, &mut batch, None).unwrap();
+    assert!(
+        batch.iter().all(|entity| !entity.has_dirty()),
+        "分表批量写入后应清空脏数据"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

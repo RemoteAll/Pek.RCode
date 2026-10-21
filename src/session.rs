@@ -5,7 +5,8 @@
 //!   SQL Server（[`crate::mssql::MssqlSession`]）、PostgreSQL 系（[`crate::postgres::PostgresSession`]，
 //!   含 HighGo/KingBase/VastBase）、Oracle（[`crate::oracle::OracleSession`]）
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use crate::dialect::DatabaseKind;
 use crate::error::Result;
@@ -31,10 +32,7 @@ impl RowSet {
 
     /// 追加一行。
     pub fn push(&mut self, values: Vec<DbValue>) {
-        self.rows.push(DbRow {
-            columns: self.columns.clone(),
-            values,
-        });
+        self.rows.push(DbRow::new(self.columns.clone(), values));
     }
 
     /// 行数。
@@ -70,18 +68,46 @@ impl<'a> IntoIterator for &'a RowSet {
 }
 
 /// 单行数据。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DbRow {
     /// 列名（与结果集共享）
     columns: Arc<Vec<String>>,
     /// 值（与列一一对应）
     values: Vec<DbValue>,
+    /// 列名（ASCII 小写）→ 下标（首次按名取值时构建，宽表/多行装载避免 O(列数²) 比较）
+    index: OnceLock<HashMap<String, usize>>,
+}
+
+impl Clone for DbRow {
+    fn clone(&self) -> Self {
+        // 克隆时重置索引缓存（避免复制索引表；取值时按需重建）
+        Self {
+            columns: self.columns.clone(),
+            values: self.values.clone(),
+            index: OnceLock::new(),
+        }
+    }
 }
 
 impl DbRow {
     /// 创建一行。
     pub fn new(columns: Arc<Vec<String>>, values: Vec<DbValue>) -> Self {
-        Self { columns, values }
+        Self {
+            columns,
+            values,
+            index: OnceLock::new(),
+        }
+    }
+
+    /// 列名索引（惰性构建）。
+    fn name_index(&self) -> &HashMap<String, usize> {
+        self.index.get_or_init(|| {
+            let mut map = HashMap::with_capacity(self.columns.len());
+            for (position, name) in self.columns.iter().enumerate() {
+                map.entry(name.to_ascii_lowercase()).or_insert(position);
+            }
+            map
+        })
     }
 
     /// 全部值。
@@ -99,13 +125,11 @@ impl DbRow {
         self.values.get(index)
     }
 
-    /// 按列名取值（忽略大小写）。
+    /// 按列名取值（忽略大小写；列名索引缓存，重复取值 O(1)）。
     pub fn get_by_name(&self, name: &str) -> Option<&DbValue> {
-        let index = self
-            .columns
-            .iter()
-            .position(|c| c.eq_ignore_ascii_case(name))?;
-        self.values.get(index)
+        let key = name.to_ascii_lowercase();
+        let position = *self.name_index().get(&key)?;
+        self.values.get(position)
     }
 
     /// 组装为 `(列名, 值)` 列表，便于转换为业务结构。

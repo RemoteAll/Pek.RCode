@@ -38,6 +38,8 @@ struct QueueItem {
     pk: Vec<DbValue>,
     /// 列与值
     fields: Vec<(String, DbValue)>,
+    /// Upsert 的“存在即更新”分支只写这些列（`None` = 全列，向后兼容）
+    update_columns: Option<Vec<String>>,
 }
 
 /// 队列执行统计。
@@ -108,7 +110,7 @@ impl EntityQueue {
         session: &mut dyn SqlSession,
         fields: &[(&str, DbValue)],
     ) -> Result<()> {
-        self.push(QueueMethod::Insert, Vec::new(), fields);
+        self.push(QueueMethod::Insert, Vec::new(), fields, None);
         self.auto_flush(dal, session)
     }
 
@@ -120,7 +122,7 @@ impl EntityQueue {
         pk: &[DbValue],
         fields: &[(&str, DbValue)],
     ) -> Result<()> {
-        self.push(QueueMethod::Update, pk.to_vec(), fields);
+        self.push(QueueMethod::Update, pk.to_vec(), fields, None);
         self.auto_flush(dal, session)
     }
 
@@ -131,7 +133,7 @@ impl EntityQueue {
         session: &mut dyn SqlSession,
         pk: &[DbValue],
     ) -> Result<()> {
-        self.push(QueueMethod::Delete, pk.to_vec(), &[]);
+        self.push(QueueMethod::Delete, pk.to_vec(), &[], None);
         self.auto_flush(dal, session)
     }
 
@@ -143,12 +145,38 @@ impl EntityQueue {
         pk: &[DbValue],
         fields: &[(&str, DbValue)],
     ) -> Result<()> {
-        self.push(QueueMethod::Upsert, pk.to_vec(), fields);
+        self.push(QueueMethod::Upsert, pk.to_vec(), fields, None);
+        self.auto_flush(dal, session)
+    }
+
+    /// 入队 Upsert，并指定“存在即更新”时需要写入的列（脏列；`None` = 全列）。
+    ///
+    /// 对应实体 `SaveAsync` 的脏追踪语义：行已存在时只写变化列，行不存在时仍插入全列。
+    pub fn upsert_tracked(
+        &mut self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        pk: &[DbValue],
+        fields: &[(&str, DbValue)],
+        update_columns: Option<&[String]>,
+    ) -> Result<()> {
+        self.push(
+            QueueMethod::Upsert,
+            pk.to_vec(),
+            fields,
+            update_columns.map(<[String]>::to_vec),
+        );
         self.auto_flush(dal, session)
     }
 
     /// 入队一项。
-    fn push(&mut self, method: QueueMethod, pk: Vec<DbValue>, fields: &[(&str, DbValue)]) {
+    fn push(
+        &mut self,
+        method: QueueMethod,
+        pk: Vec<DbValue>,
+        fields: &[(&str, DbValue)],
+        update_columns: Option<Vec<String>>,
+    ) {
         self.items.push(QueueItem {
             method,
             pk,
@@ -156,6 +184,7 @@ impl EntityQueue {
                 .iter()
                 .map(|(name, value)| (name.to_string(), value.clone()))
                 .collect(),
+            update_columns,
         });
     }
 
@@ -239,8 +268,27 @@ impl EntityQueue {
                         .map(|(name, value)| (name.as_str(), value.clone()))
                         .collect();
                     if table.find_by_pk(session, &item.pk)?.is_some() {
-                        let affected = table.update_by_pk(session, &fields, &item.pk)?;
-                        stats.updated += affected;
+                        // 启用脏追踪的实体：存在即更新时只写变化列（排除主键/自增列）
+                        let sets: Vec<(&str, DbValue)> = match &item.update_columns {
+                            Some(columns) => {
+                                let pks = table.meta().primary_keys();
+                                fields
+                                    .iter()
+                                    .filter(|(name, _)| {
+                                        columns.iter().any(|c| c.eq_ignore_ascii_case(name))
+                                            && !pks
+                                                .iter()
+                                                .any(|pk| pk.name.eq_ignore_ascii_case(name))
+                                    })
+                                    .map(|(name, value)| (*name, value.clone()))
+                                    .collect()
+                            }
+                            None => fields,
+                        };
+                        if !sets.is_empty() {
+                            let affected = table.update_by_pk(session, &sets, &item.pk)?;
+                            stats.updated += affected;
+                        }
                     } else {
                         // 主键不在 fields 时补入
                         let mut with_pk = fields.clone();

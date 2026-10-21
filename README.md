@@ -344,6 +344,27 @@ order.delete(&dal, session.as_mut())?;
 > 手写实体与 `#[derive(Entity)]` 实体保持原有 `pub` 字段与"写全部非主键列"的行为（向后兼容），
 > 需要同样的优化时实现 `Entity::dirty_state()` 返回自己的 `DirtyState` 即可。
 
+#### 写入最小化的覆盖范围（哪些 API 只写变化列）
+
+| 方法 | 写入列 |
+|---|---|
+| `insert` / `insert_batch*` / `insert_ignore_batch` / `replace_batch` | 全列（插入语义） |
+| `save` / `save_batch` / `save_batch_sharded` | 已存在 → **只写脏列**（无脏 0 SQL）；新增 → 批量插入 |
+| `update` / `update_batch` / `update_sharded` / `update_batch_sharded` | **只写脏列**；无脏返回 0 |
+| `update_columns(dal, session, &["Amount"])` | **只写指定列**（显式列集；成功后只清这些列的脏） |
+| `enqueue_save` + `EntityQueue::flush`（`SaveAsync` 等价） | 行已存在 → **只写脏列**；行不存在 → 插入全列；无脏不入队 |
+| `upsert_batch` / `upsert_batch_sharded` | SQL 级整行覆盖（`ON CONFLICT DO UPDATE` 全列）；需要最小写入请用 `save_batch*` |
+
+> **防呆约定**：启用脏追踪的实体（生成实体，或手写实现 `dirty_state()`）必须通过会登记脏数据的 setter 修改字段；
+> 直接改 `pub` 字段不会标脏，`update` 会认为"没有变化"而返回 0。生成实体字段私有，编译期即可杜绝该误用。
+
+#### 写入/装载性能要点
+
+- 更新按脏列取值（`Entity::column_value`，生成实体按列名直接取）——宽表只克隆变化列，不再全字段收集；
+- `save_batch` 对"无自增列 + 单一主键"一次 `IN` 查询判定存在性（N 次点查 → 1 次）；
+- `DbRow::get_by_name` 首次按名取值后使用列名索引缓存，多列/多行装载不再 O(列数²)；
+- 无脏数据时 `update` / `save` / `update_columns` 不发 SQL、`enqueue_save` 不入队。
+
 > 生成产物已用真实模型（`JiLiYu`、`VerifyCode`）做过编译与运行验证。
 
 ### 分表（与 DH.NCode 共用同一批分表）
