@@ -492,6 +492,25 @@ pub trait Entity: Sized {
         Ok(affected)
     }
 
+    /// 按条件批量更新同值（`UPDATE ... SET ... WHERE ...`，一条语句改多行）。
+    ///
+    /// 对应 C# `EntityPersistence.Update` 的"按条件改同值"用法（批量改状态/打标）：
+    /// 比逐行 [`Entity::update`] 少 N-1 次往返。**不同行不同值请用
+    /// [`Entity::update_batch`]（逐条）**。
+    ///
+    /// - 「仅插入」表与视图表拒绝；
+    /// - 空条件会更新全表，请先用 `Where::is_empty` 防护；
+    /// - 写入成功后该表的实体缓存/单对象缓存/字段缓存/行数缓存全部失效。
+    fn update_where(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        sets: &[(&str, DbValue)],
+        filter: &Where,
+    ) -> Result<u64> {
+        Self::ensure_writable()?;
+        dal.table(Self::table())?.update_where(session, sets, filter)
+    }
+
     /// 按指定的列集合更新（显式列集；对应 C# `Entity.Update(names, values)`）。
     ///
     /// - 用于“只想更新少数列”的窄更新场景（底层走 [`TableRef::update_by_pk`]）；
@@ -763,7 +782,17 @@ pub trait Entity: Sized {
     }
 
     /// 按主键查询单条记录（对应 XCode 的 `FindByID` 等）。
+    ///
+    /// 单主键且表启用实体缓存（`MaxCacheCount > 0`）时走 **单对象缓存**（对应 C# 生成的
+    /// `return Meta.SingleCache[id]`）；否则直查数据库。
     fn find(dal: &Dal, session: &mut dyn SqlSession, pk: &[DbValue]) -> Result<Option<Self>> {
+        if Self::primary_keys().len() == 1 && Self::max_cache_count(dal) > 0 {
+            let cache = dal.single_cache(Self::table())?;
+            return match cache.get(dal, session, pk)? {
+                Some(row) => Ok(Some(Self::from_row(&row)?)),
+                None => Ok(None),
+            };
+        }
         let table = dal.table(Self::table())?;
         table
             .find_by_pk(session, pk)?

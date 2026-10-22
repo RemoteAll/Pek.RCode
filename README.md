@@ -726,18 +726,21 @@ Pek.RCode/
 
 | 能力 | C# 位置 | 本库 | 业务价值 / 性能影响 |
 |------|---------|------|-------------------|
-| **`FieldCache<T>`**（按列分组缓存 + 10 分钟过期 + 下拉选项 `GetXxxList`） | `Cache/FieldCache.cs`、`EntityBuilder` 生成 | ❌ 未实现 | 业务：分类/字典下拉高频读；性能：免 `GROUP BY` 查询 |
-| **`SingleCache` 自动用于按主键查询**（生成 `return Meta.SingleCache[id]`） | `EntityBuilder` 生成 | ⚠️ 有 `SingleCache`，但 `find`/`find_by_xxx` 未自动接入 | 性能：主键热点读可再省一次查询 |
-| **`DbCache`**（SQL 结果缓存，60s） | `Cache/DbCache.cs` | ❌ 未实现 | 性能：重复查询免执行 |
-| **条件批量更新** `UPDATE ... SET ... WHERE ...`（单条语句改多行） | `EntityPersistence.Update(where, ...)` | ⚠️ 仅 `update_by_pk` / `update_columns`（按主键） | 业务：批量改状态；性能：一次语句替代 N 次 |
-| **`LongCount` 异步刷新**（60s 缓存 + 后台更新） | `EntitySession.LongCount` | ⚠️ `Dal::cached_count` 为**同步** 60s 缓存（首次查库） | 性能：并发首次会有一次查询（已单飞于调用线程） |
-| `InsertOnly` 表的 codegen 跳过更新/查询方法 | `EntityBuilder` | ⚠️ 生成 `insert_only()`，运行时拦截 | DX 为主 |
-| `Fields` 静态列元数据（`Order._.Name` 强类型查询） | `EntityBuilder` 生成 | ❌ 未实现 | DX 为主 |
-| `Valid` / `OnValid` 业务校验钩子 | `Entity.Valid` | ⚠️ 有 `interceptor`，无逐实体 `Valid` 链 | 业务：统一校验 |
-| `Transform` 抽取器（树/递归实体显式化） | `Entity/Transform.cs` | **有意不做**（用普通查询组装） | — |
-| 读写分离 `IgnoreTimes` | `ReadWriteStrategy` | **有意不做**（用 `set_primary_only` 替代） | — |
-| Oracle/MySQL 参数数组式批量 Update | `IDbSession` | **有意不做**（逐条回退语义等价） | — |
-| `HtmlBuilder`（Razor 页面生成） | `Code/HtmlBuilder.cs` | **有意不做**（由 C# XCodeTool 继续使用） | — |
+| ~~`FieldCache<T>`~~ | `Cache/FieldCache.cs` | ✅ **已实现**（`Dal::field_cache` + 生成 `xxx_list`） | 分类/字典下拉：每 10 分钟 1 次 `GROUP BY` |
+| ~~`SingleCache` 接入按主键查询~~ | 生成 `return Meta.SingleCache[id]` | ✅ **已接入** `Entity::find`（`MaxCacheCount>0`） | 主键热点读 0 次查询 |
+| ~~条件批量更新~~ | `EntityPersistence.Update(where,...)` | ✅ `TableRef::update_where` / `Entity::update_where` | 批量改同值：1 条语句改 N 行 |
+| **`DbCache`**（SQL 结果缓存 60s） | `Cache/DbCache.cs` | ❌ 未实现 | 重复查询免执行（与 FieldCache/EntityCache 有重叠） |
+| **`LongCount` 异步刷新** | `EntitySession.LongCount` | ⚠️ `Dal::cached_count` 为**同步** 60s 缓存 | 并发首次各有一次采样 |
+| `InsertOnly` 表跳过更新/查询方法生成 | `EntityBuilder` | ⚠️ 运行时拦截 | DX 为主 |
+| `Fields` 静态列元数据（`Order._.Name`） | `EntityBuilder` 生成 | ❌ 未实现 | DX 为主 |
+| `Valid` / `OnValid` 校验钩子 | `Entity.Valid` | ⚠️ 有 `interceptor`，无逐实体 `Valid` 链 | 业务：统一校验 |
+| `Transform` 抽取器 | `Entity/Transform.cs` | **有意不做** | 用普通查询组装 |
+| 读写分离 `IgnoreTimes` | `ReadWriteStrategy` | **有意不做** | 用 `set_primary_only` 替代 |
+| Oracle/MySQL 参数数组式批量 Update | `IDbSession` | **有意不做** | 逐条回退语义等价 |
+| `HtmlBuilder`（Razor 页面生成） | `Code/HtmlBuilder.cs` | **有意不做** | 由 C# XCodeTool 继续使用 |
+
+> 性能与资源审计：见 [docs/审计报告-性能与资源-2026-10-22.md](docs/审计报告-性能与资源-2026-10-22.md)
+> （含热路径微基准、内存/锁清单、数据库压力对比；本轮修复了模型表查找 9.8× 回退）。
 
 > 本轮已补齐：**`InsertOnly`（仅插入表）**、**`IsView`（视图禁写 + 跳过迁移）**、
 > **`MaxCacheCount`（小表自动走实体缓存 + 唯一索引 `find_by_xxx` 生成 + 60s 行数缓存）**、

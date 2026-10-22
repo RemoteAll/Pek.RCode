@@ -754,3 +754,72 @@ fn max_cache_count_zero_uses_sql_path() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+#[test]
+fn update_where_changes_many_rows_in_one_statement() {
+    let (dir, dal) = setup("update-where");
+    let mut s = dal.open_session().unwrap();
+
+    for code in ["A", "B", "C"] {
+        let mut row = TrackedOrder::new();
+        row.set_code(Some(code.into()));
+        row.set_amount("1".parse().unwrap());
+        row.insert(&dal, s.as_mut()).unwrap();
+    }
+
+    // 一条 UPDATE 改多行（对应 C# 的按条件批量更新）
+    let affected = TrackedOrder::update_where(
+        &dal,
+        s.as_mut(),
+        &[("Amount", DbValue::from("9".parse::<rust_decimal::Decimal>().unwrap()))],
+        &Where::new().eq("Code", "A"),
+    )
+    .unwrap();
+    assert_eq!(affected, 1, "只命中 Code=A 的行");
+
+    // 全部改成同一值的场景（批量打标）
+    let affected = TrackedOrder::update_where(
+        &dal,
+        s.as_mut(),
+        &[("Ok", DbValue::Bool(true))],
+        &Where::new(),
+    )
+    .unwrap();
+    assert_eq!(affected, 3, "空条件更新全部行（与 delete_where 同规矩）");
+
+    let all = TrackedOrder::all(&dal, s.as_mut()).unwrap();
+    assert!(all.iter().all(|row| *row.amount() == "9".parse().unwrap() || *row.amount() == "1".parse().unwrap()));
+    assert!(all.len() == 3);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn find_uses_single_cache_and_sees_new_value_after_update() {
+    let (dir, dal) = setup("single-cache");
+    let mut s = dal.open_session().unwrap();
+
+    let mut row = TrackedOrder::new();
+    row.set_code(Some("S1".into()));
+    row.insert(&dal, s.as_mut()).unwrap();
+    let id = *row.id() as i64;
+
+    // 第一次：查库并回填单对象缓存
+    let first = TrackedOrder::find(&dal, s.as_mut(), &[id.into()])
+        .unwrap()
+        .expect("应能查到");
+    assert_eq!(first.code().as_deref(), Some("S1"));
+
+    // 修改后再查：写入使缓存失效，拿到新值（不能读到旧快照）
+    let mut edit = TrackedOrder::find(&dal, s.as_mut(), &[id.into()])
+        .unwrap()
+        .unwrap();
+    edit.set_code(Some("S2".into()));
+    edit.update(&dal, s.as_mut()).unwrap();
+
+    let again = TrackedOrder::find(&dal, s.as_mut(), &[id.into()])
+        .unwrap()
+        .expect("应能查到");
+    assert_eq!(again.code().as_deref(), Some("S2"), "写入后应读到新值");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

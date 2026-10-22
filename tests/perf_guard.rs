@@ -234,3 +234,69 @@ fn report_sizes() {
         std::mem::size_of::<EntityCache>()
     );
 }
+
+/// 模型表查找：线性扫描（旧路径）vs 表名索引（新路径）。
+///
+/// 热路径（实体 find/insert/update、缓存注册、行数缓存）每次操作都要查表定义；
+/// 线性扫描在 176 表模型上是 O(表数×2) 次字符串比较，索引后 O(1)。
+#[test]
+#[ignore]
+fn bench_model_table_lookup() {
+    use pek_rcode::model::EntityModel;
+
+    const TABLES: usize = 176;
+    const N: usize = 200_000;
+
+    let mut xml = String::from("<EntityModel><Tables>");
+    for i in 0..TABLES {
+        xml.push_str(&format!(
+            r#"<Table Name="T{i}" TableName="DH_T{i}"><Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns></Table>"#
+        ));
+    }
+    xml.push_str("</Tables></EntityModel>");
+    let model = EntityModel::parse(&xml).unwrap();
+    assert_eq!(model.tables.len(), TABLES);
+
+    let conn = format!(
+        "Data Source={};Provider=SQLite",
+        std::env::temp_dir()
+            .join(format!("pek-rcode-lookup-{}.db", std::process::id()))
+            .display()
+    );
+    let dal = pek_rcode::Dal::open_with_model(&conn, EntityModel::parse(&xml).unwrap()).unwrap();
+
+    // 预构造表名（排除 format 分配噪声，只测查找本身）
+    let names: Vec<String> = (0..TABLES).map(|i| format!("T{i}")).collect();
+
+    // 旧路径：EntityModel::table 线性扫描
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    let mut sink = 0usize;
+    for i in 0..N {
+        sink += usize::from(model.table(&names[i % TABLES]).is_some());
+    }
+    report(
+        &format!("模型表查找（线性扫描，{TABLES} 表）"),
+        N,
+        t.elapsed(),
+        alloc_since(mark),
+    );
+
+    // 新路径：Dal 表名索引
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for i in 0..N {
+        sink += usize::from(dal.table(&names[i % TABLES]).is_ok());
+    }
+    report(
+        &format!("模型表查找（表名索引，{TABLES} 表）"),
+        N,
+        t.elapsed(),
+        alloc_since(mark),
+    );
+    assert!(sink > 0);
+
+    let _ = std::fs::remove_file(
+        std::env::temp_dir().join(format!("pek-rcode-lookup-{}.db", std::process::id())),
+    );
+}

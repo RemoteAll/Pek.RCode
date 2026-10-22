@@ -226,6 +226,12 @@ fn unique_index_generates_cached_find_method() {
     assert!(code.contains("Self::find_cached_by(dal, session, &["), "{code}");
     // 可空列的唯一索引不生成（参数无法表达 NULL 语义）
     assert!(!code.contains("find_by_memo"), "{code}");
+
+    // 唯一索引首个字符串列 → 生成字段缓存下拉方法（对应 C# `FieldCache<T>`）
+    assert!(code.contains("pub fn code_list("), "{code}");
+    assert!(code.contains("field_cache(\"DhUser\", \"Code\")"), "{code}");
+    // 可空列同样生成下拉（分组时空值会被过滤，与 C# 一致）
+    assert!(code.contains("pub fn memo_list("), "{code}");
 }
 
 #[test]

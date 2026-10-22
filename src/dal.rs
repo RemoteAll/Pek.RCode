@@ -187,8 +187,13 @@ pub struct Dal {
     pub(crate) entity_caches: Mutex<HashMap<String, Arc<EntityCache>>>,
     /// 单对象缓存注册表（按表共享，对应 DH.NCode 的 `Meta.SingleCache`）
     pub(crate) single_caches: Mutex<HashMap<String, Arc<SingleCache>>>,
-    /// 表行数缓存（表名→（行数, 时刻）；对应 C# `EntitySession.Count` 的 60 秒缓存）
-    pub(crate) count_cache: Mutex<HashMap<String, (i64, std::time::Instant)>>,
+    /// 字段缓存注册表（表（小写）→ 列（小写）→ 共享实例；对应 DH.NCode 的 `FieldCache<T>`）
+    pub(crate) field_caches:
+        Mutex<HashMap<String, HashMap<String, Arc<crate::cache::FieldCache>>>>,
+    /// 表行数缓存（表名→（行数, 时刻）；对应 C# `EntitySession.Count` 的 60 秒缓存；读多写少用 RwLock）
+    pub(crate) count_cache: RwLock<HashMap<String, (i64, std::time::Instant)>>,
+    /// 模型表名索引（小写实体名/物理表名 → 表下标；避免每次操作线性扫 176 表）
+    table_index: OnceLock<HashMap<String, usize>>,
     /// 会话连接池（懒创建；`Pooling=false` 时不使用）
     pool: OnceLock<Arc<SessionPool>>,
     /// 是否启用连接池
@@ -465,7 +470,9 @@ impl Dal {
             conn_migration,
             entity_caches: Mutex::new(HashMap::new()),
             single_caches: Mutex::new(HashMap::new()),
-            count_cache: Mutex::new(HashMap::new()),
+            field_caches: Mutex::new(HashMap::new()),
+            count_cache: RwLock::new(HashMap::new()),
+            table_index: OnceLock::new(),
             pool: OnceLock::new(),
             pool_enabled,
             readonly: AtomicBool::new(readonly),
@@ -506,6 +513,29 @@ impl Dal {
     /// 替换数据模型。
     pub fn set_model(&mut self, model: EntityModel) {
         self.model = Some(Arc::new(model));
+        // 模型变了 → 表名索引重建（OnceLock 可整体替换）
+        self.table_index = OnceLock::new();
+    }
+
+    /// 模型表名索引（小写实体名与物理表名都指向同一个表下标）。
+    fn table_index(&self) -> Result<&HashMap<String, usize>> {
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| Error::Model("尚未加载数据模型".into()))?;
+        Ok(self.table_index.get_or_init(|| {
+            let mut map = HashMap::with_capacity(model.tables.len() * 4);
+            for (i, table) in model.tables.iter().enumerate() {
+                // 原名（生成代码传入字面量 = 零分配精确匹配）
+                map.entry(table.name.clone()).or_insert(i);
+                map.entry(table.effective_table_name().to_string()).or_insert(i);
+                // 小写（兼容大小写不一致的调用）
+                map.entry(table.name.to_ascii_lowercase()).or_insert(i);
+                map.entry(table.effective_table_name().to_ascii_lowercase())
+                    .or_insert(i);
+            }
+            map
+        }))
     }
 
     /// 设置 SQL 输出开关（覆盖连接串中的 `ShowSql`）。
@@ -737,18 +767,29 @@ impl Dal {
 
     /// 获取表操作句柄。
     pub fn table(&self, name: &str) -> Result<TableRef<'_>> {
-        let model = self
-            .model
-            .as_ref()
-            .ok_or_else(|| Error::Model("尚未加载数据模型，请使用 open_with_model 或 set_model".into()))?;
-        let table = model
-            .table(name)
+        let table = self
+            .dal_table_meta(name)
             .ok_or_else(|| Error::Model(format!("模型中不存在表/实体 {name}")))?;
         Ok(TableRef {
             dal: self,
             table,
             table_name: None,
         })
+    }
+
+    /// 按实体名/物理表名取表定义（**走表名索引**，O(1)）。
+    ///
+    /// 快路径用**原名精确匹配**（生成代码传入的都是模型里的字面量，零分配）；
+    /// 未命中时才做小写化再查（兼容大小写不一致/外部调用）。
+    pub(crate) fn dal_table_meta(&self, name: &str) -> Option<&TableMeta> {
+        let model = self.model.as_ref()?;
+        let index = self.table_index().ok()?;
+        if let Some(i) = index.get(name) {
+            return model.tables.get(*i);
+        }
+        index
+            .get(&name.to_ascii_lowercase())
+            .and_then(|i| model.tables.get(*i))
     }
 
     /// 获取表操作句柄（**指定物理表名**）：列元数据仍取模型定义，SQL 操作落到指定表。
@@ -2002,6 +2043,44 @@ impl<'a> TableRef<'a> {
         let affected = session.execute(&sql, &params)?;
         if affected > 0 {
             // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
+            self.dal.invalidate_cache(self.physical_name());
+        }
+        Ok(affected)
+    }
+
+    /// 按条件更新（`UPDATE ... SET ... WHERE ...`，一条语句改多行），返回受影响行数。
+    ///
+    /// 对应 C# `EntityPersistence.Update` 的"按条件改同值"用法（批量改状态、批量打标等）：
+    /// 比逐行 `update_by_pk` 少 N-1 次往返。**不同行不同值仍请用 `update_batch`（逐条）**。
+    ///
+    /// - 视图表拒绝（与其它写操作一致）；
+    /// - 拦截器按 `Update` 刷新审计字段；
+    /// - 空条件会更新全表，请先用 [`Where::is_empty`] 防护（与 `delete_where` 同规矩）。
+    pub fn update_where(
+        &self,
+        session: &mut dyn SqlSession,
+        sets: &[(&str, DbValue)],
+        filter: &Where,
+    ) -> Result<u64> {
+        self.ensure_writable()?;
+        if sets.is_empty() {
+            return Err(Error::Argument("按条件更新至少需要一个待更新字段".into()));
+        }
+        let values = crate::interceptor::prepare(
+            self.table,
+            crate::interceptor::DataMethod::Update,
+            sets,
+        );
+        let (sql, params) = sqlbuild::update_sql_owned_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            values,
+            filter,
+        )?;
+        self.dal.log_sql(&sql);
+        let affected = session.execute(&sql, &params)?;
+        if affected > 0 {
             self.dal.invalidate_cache(self.physical_name());
         }
         Ok(affected)

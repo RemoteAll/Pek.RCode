@@ -37,11 +37,12 @@ pub mod invalidator;
 pub mod lazy;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use crate::dal::{Dal, TableRef};
+use crate::dialect::DatabaseKind;
 use crate::error::Result;
 use crate::model::TableMeta;
 use crate::session::{DbRow, SqlSession};
@@ -406,7 +407,207 @@ impl SingleCache {
     }
 }
 
+/// 字段缓存的默认过期时间（秒；对齐 C# `FieldCache` 的 10 分钟）。
+pub const DEFAULT_FIELD_CACHE_EXPIRE_SECONDS: u64 = 600;
+/// 字段缓存默认保留的分组数（对齐 C# 生成代码的 `limit 20`）。
+pub const DEFAULT_FIELD_CACHE_TOP: usize = 20;
+
+/// 字段缓存状态：分组统计（值, 计数）+ 采样时刻。
+type FieldState = Option<(Arc<Vec<(String, i64)>>, Instant)>;
+
+/// 字段缓存（对应 DH.NCode 的 `FieldCache<T>`）：按某列分组统计，取出现次数最多的前 N 种。
+///
+/// 典型用途：分类/字典的**下拉选项**——避免每次请求都做 `GROUP BY`。
+/// 默认缓存 10 分钟；该表任何添删改都会使其失效。
+pub struct FieldCache {
+    /// 物理表名
+    table: String,
+    /// 物理列名
+    column: String,
+    /// 过期时间（纳秒）
+    expire_nanos: AtomicU64,
+    /// 保留的分组数
+    top: AtomicUsize,
+    /// 缓存项（值 + 计数，按计数降序）
+    state: RwLock<FieldState>,
+}
+
+impl FieldCache {
+    /// 创建（表名/列名均为**物理名**；一般经 [`Dal::field_cache`] 获取共享实例）。
+    pub fn new(table: &str, column: &str) -> Self {
+        Self {
+            table: table.to_string(),
+            column: column.to_string(),
+            expire_nanos: AtomicU64::new(
+                DEFAULT_FIELD_CACHE_EXPIRE_SECONDS * NANOS_PER_SECOND,
+            ),
+            top: AtomicUsize::new(DEFAULT_FIELD_CACHE_TOP),
+            state: RwLock::new(None),
+        }
+    }
+
+    /// 列名（物理）。
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// 当前过期时间。
+    pub fn expire(&self) -> Duration {
+        Duration::from_nanos(self.expire_nanos.load(Ordering::Relaxed))
+    }
+
+    /// 设置过期时间（秒；0 = 每次重新统计）。
+    pub fn set_expire_seconds(&self, seconds: u64) {
+        self.expire_nanos
+            .store(seconds.saturating_mul(NANOS_PER_SECOND), Ordering::Relaxed);
+    }
+
+    /// 保留的分组数。
+    pub fn top(&self) -> usize {
+        self.top.load(Ordering::Relaxed)
+    }
+
+    /// 设置保留的分组数（默认 20）。
+    pub fn set_top(&self, top: usize) {
+        self.top.store(top.max(1), Ordering::Relaxed);
+    }
+
+    /// 使缓存失效（写入路径自动调用）。
+    pub fn invalidate(&self) {
+        *self.write_state() = None;
+    }
+
+    fn read_state(&self) -> RwLockReadGuard<'_, FieldState> {
+        self.state.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_state(&self) -> RwLockWriteGuard<'_, FieldState> {
+        self.state.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 分组统计结果（值 + 计数，按计数降序），命中缓存时不查库。
+    pub fn items(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<Arc<Vec<(String, i64)>>> {
+        let expire = self.expire();
+        {
+            let state = self.read_state();
+            if let Some((items, at)) = state.as_ref()
+                && at.elapsed() < expire
+            {
+                return Ok(items.clone());
+            }
+        }
+        let mut guard = self.write_state();
+        // 双重检查：并发过期时只有一个线程查库
+        if let Some((items, at)) = guard.as_ref()
+            && at.elapsed() < expire
+        {
+            return Ok(items.clone());
+        }
+
+        let kind = dal.kind();
+        let top = self.top();
+        let mut sql = format!(
+            "SELECT COUNT(*) AS c, {} AS v FROM {} GROUP BY {} ORDER BY c DESC",
+            kind.quote(&self.column),
+            kind.quote(&self.table),
+            kind.quote(&self.column),
+        );
+        // 方言不支持 LIMIT 时取全量、内存截断（时序/文档库的兼容退让）
+        if let Some(suffix) = limit_suffix(kind, top) {
+            sql.push_str(&suffix);
+        }
+        dal.log_sql(&sql);
+        let rows = session.query(&sql, &[])?;
+        let mut items: Vec<(String, i64)> = rows
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let value = row.get_by_name("v")?;
+                if value.is_null() {
+                    return None;
+                }
+                let count = row
+                    .get_by_name("c")
+                    .and_then(DbValue::as_i64)
+                    .unwrap_or_default();
+                Some((value.to_text(), count))
+            })
+            .collect();
+        if items.len() > top {
+            items.truncate(top);
+        }
+        let items = Arc::new(items);
+        *guard = Some((items.clone(), Instant::now()));
+        Ok(items)
+    }
+
+    /// 下拉选项（按计数降序的值列表）。
+    pub fn names(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<Vec<String>> {
+        Ok(self
+            .items(dal, session)?
+            .iter()
+            .map(|(value, _)| value.clone())
+            .collect())
+    }
+
+    /// 值 → 值映射（对应 C# `FieldCache.FindAllName()` 的 `IDictionary<String,String>`）。
+    pub fn name_map(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        Ok(self
+            .items(dal, session)?
+            .iter()
+            .map(|(value, _)| (value.clone(), value.clone()))
+            .collect())
+    }
+}
+
+/// `GROUP BY` 统计的 LIMIT 子句（方言差异；不支持时返回 `None`）。
+fn limit_suffix(kind: DatabaseKind, top: usize) -> Option<String> {
+    let suffix = match kind {
+        DatabaseKind::Sqlite
+        | DatabaseKind::MySql
+        | DatabaseKind::PostgreSql
+        | DatabaseKind::DuckDb
+        | DatabaseKind::ClickHouse
+        | DatabaseKind::Hana
+        | DatabaseKind::DaMeng
+        | DatabaseKind::Iris => format!(" LIMIT {top}"),
+        DatabaseKind::SqlServer => format!(" OFFSET 0 ROWS FETCH NEXT {top} ROWS ONLY"),
+        DatabaseKind::Oracle | DatabaseKind::Db2 => format!(" FETCH FIRST {top} ROWS ONLY"),
+        DatabaseKind::Firebird => format!(" ROWS {top}"),
+        // 时序/文档库的 SQL 子集不支持该句式：不限制，由调用方内存截断
+        DatabaseKind::TDengine | DatabaseKind::InfluxDb | DatabaseKind::MongoDb | DatabaseKind::Access => {
+            return None;
+        }
+    };
+    Some(suffix)
+}
+
 impl Dal {
+    /// 获取字段缓存（按「表 + 列」共享，惰性创建；对应 DH.NCode 的 `FieldCache<T>`）。
+    ///
+    /// `table` 可传实体名或物理表名，`column` 可传属性名或列名。
+    pub fn field_cache(&self, table: &str, column: &str) -> Result<Arc<FieldCache>> {
+        let meta = self.table_meta(table)?;
+        let physical_table = meta.effective_table_name().to_string();
+        let col = meta
+            .column(column)
+            .ok_or_else(|| crate::error::Error::Model(format!("表 {} 不存在列 {column}", meta.name)))?;
+        let physical_column = meta.effective_column_name(col).to_string();
+        let table_key = physical_table.to_ascii_lowercase();
+        let column_key = physical_column.to_ascii_lowercase();
+
+        let mut field_maps = lock(&self.field_caches);
+        let columns = field_maps.entry(table_key).or_default();
+        Ok(columns
+            .entry(column_key)
+            .or_insert_with(|| Arc::new(FieldCache::new(&physical_table, &physical_column)))
+            .clone())
+    }
+
     /// 获取实体缓存（按表共享，惰性创建；对应 DH.NCode 的 `Meta.Cache`）。
     pub fn entity_cache(&self, table: &str) -> Result<Arc<EntityCache>> {
         let name = self.table_meta(table)?.effective_table_name().to_string();
@@ -444,8 +645,22 @@ impl Dal {
         if let Some(cache) = lock(&self.single_caches).get(&key) {
             cache.clear();
         }
+        // 字段缓存（先按表取一次，避免全注册表扫描）
+        {
+            let mut field_maps = lock(&self.field_caches);
+            if let Some(columns) = field_maps.remove(&key) {
+                for cache in columns.into_values() {
+                    cache.invalidate();
+                }
+                // 保留注册项：清空数据但避免下次重新分配（重新插回空表）
+                field_maps.insert(key.clone(), HashMap::new());
+            }
+        }
         // 行数缓存同步失效（下次按 MAX(id)/COUNT(*) 重新采样）
-        lock(&self.count_cache).remove(&key);
+        self.count_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
     }
 
     /// 表行数（带 60 秒缓存；对应 C# `EntitySession.Count` 的阀值判定用途）。
@@ -460,10 +675,13 @@ impl Dal {
         let key = meta.effective_table_name().to_ascii_lowercase();
 
         const TTL: Duration = Duration::from_secs(60);
-        if let Some((count, at)) = lock(&self.count_cache).get(&key)
-            && at.elapsed() < TTL
         {
-            return Ok(*count);
+            let cache = self.count_cache.read().unwrap_or_else(|e| e.into_inner());
+            if let Some((count, at)) = cache.get(&key)
+                && at.elapsed() < TTL
+            {
+                return Ok(*count);
+            }
         }
 
         let sql = match (self.kind(), meta.identity()) {
@@ -485,7 +703,10 @@ impl Dal {
             .and_then(|r| r.get_by_name("c"))
             .and_then(DbValue::as_i64)
             .unwrap_or(0);
-        lock(&self.count_cache).insert(key, (count, std::time::Instant::now()));
+        self.count_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (count, std::time::Instant::now()));
         Ok(count)
     }
 
@@ -504,8 +725,7 @@ impl Dal {
 
     /// 按名取表定义（表名或实体名，忽略大小写）。
     pub(crate) fn table_meta(&self, table: &str) -> Result<&TableMeta> {
-        self.model()
-            .and_then(|model| model.table(table))
+        self.dal_table_meta(table)
             .ok_or_else(|| crate::error::Error::Model(format!("模型中不存在表/实体：{table}")))
     }
 }

@@ -328,6 +328,35 @@ pub fn generate(table: &TableMeta) -> String {
         ));
     }
 
+    // 字段缓存下拉选项（对应 C# `EntityBuilder` 为"唯一索引首个字符串列"生成的 `FieldCache<T>`）：
+    // 按该列分组统计，取出现次数最多的前 20 种，缓存 10 分钟。
+    {
+        let mut seen: Vec<String> = Vec::new();
+        for index in &table.indexes {
+            let Some(first) = index.columns.first() else {
+                continue;
+            };
+            let Some(col) = table.column(first) else {
+                continue;
+            };
+            if !matches!(col.data_type, DataType::String) || col.master {
+                continue;
+            }
+            let field = safe_field_name(&to_snake_case(&col.name));
+            if seen.contains(&field) {
+                continue;
+            }
+            seen.push(field.clone());
+            methods.push(format!(
+                "/// 按 {doc} 分组的选项列表（字段缓存 10 分钟，按出现次数降序）。\n    ///\n    /// 对应 DH.NCode 生成代码里的 `FieldCache<...>` 下拉选项（`GetXxxList`）。\n    pub fn {field}_list(\n        dal: &pek_rcode::Dal,\n        session: &mut dyn pek_rcode::SqlSession,\n    ) -> pek_rcode::Result<Vec<String>> {{\n        dal.field_cache(\"{table}\", \"{name}\")?.names(dal, session)\n    }}",
+                doc = col.description.replace('\n', " "),
+                field = field,
+                table = table.name,
+                name = col.name,
+            ));
+        }
+    }
+
     // 分表实体：生成按列回写（雪花主键自动生成后回写实体，对齐 C# AutoFillSnowIdPrimaryKey 的对象同步）
     if time_shard_spec(table).is_some() {
         let mut arms = String::new();
