@@ -108,6 +108,21 @@ pub trait Entity: Sized {
     /// 从查询行装载实体。
     fn from_row(row: &DbRow) -> Result<Self>;
 
+    /// 本表是否「仅插入」（对应 DH.NCode 的 `InsertOnly`：日志表/记录表/事件表）。
+    ///
+    /// `rcodegen` 会为 `Model.xml` 中 `InsertOnly="true"` 的表生成 `true`；手写实体可自行覆盖。
+    /// 为 `true` 时：
+    /// - [`Entity::update`] / [`Entity::delete`] 等修改/删除操作**直接报错**（对齐 C#
+    ///   「只写的日志型数据禁止修改/禁止删除」）；
+    /// - [`Entity::save`] / [`Entity::enqueue_save`] **不查主键是否存在**，直接插入
+    ///   （对齐 C# `if (InsertOnly) batch.Insert(...) else batch.Save(...)`——省掉每行的存在性查询）。
+    fn insert_only() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
     /// 脏数据状态（由 `rcodegen` 生成的实体返回 `Some`；手写/`derive` 实体默认 `None`）。
     ///
     /// 返回 `Some` 表示启用脏追踪：`set_xxx` 写入时登记脏列，[`Entity::update`] 只写脏列，
@@ -372,7 +387,25 @@ pub trait Entity: Sized {
     }
 
     /// 按主键更新（主键值与自增列不参与 SET），返回受影响行数。
+    /// 是否允许修改/删除（「仅插入」表拒绝）。
+    ///
+    /// 对应 C# `DoAction` 的 `if (InsertOnly) throw "只写的日志型数据禁止修改/禁止删除！"`。
+    fn ensure_writable() -> Result<()>
+    where
+        Self: Sized,
+    {
+        if Self::insert_only() {
+            return Err(Error::Unsupported(format!(
+                "只写的日志型数据[{}]禁止修改或删除",
+                Self::table()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 按主键更新一行（自动跳过主键与自增列），返回受影响行数。
     fn update(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
+        Self::ensure_writable()?;
         let table = dal.table(Self::table())?;
         self.update_with(&table, session)
     }
@@ -534,7 +567,8 @@ pub trait Entity: Sized {
     /// - 有自增列：主键值为 0/NULL 视为新增，否则更新
     /// - 无自增列：按主键行是否存在决定新增或更新
     fn save(&mut self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
-        if is_new_entity(dal, session, self)? {
+        // 仅插入表：不查存在性，直接插入（对齐 C# `if (InsertOnly) batch.Insert(...)`）
+        if Self::insert_only() || is_new_entity(dal, session, self)? {
             self.insert(dal, session)?;
             Ok(1)
         } else {
@@ -558,6 +592,10 @@ pub trait Entity: Sized {
     ) -> Result<u64> {
         if list.is_empty() {
             return Ok(0);
+        }
+        // 仅插入表：整批直接插入，**不查存在性**（对齐 C# `if (InsertOnly) batch.Insert(...)`）
+        if Self::insert_only() {
+            return Self::insert_batch(dal, session, list, batch_size);
         }
         // 无自增列 + 单一主键：一次批量查询判定存在性（避免逐条 SELECT，N 次往返降为 1 次）
         let pks = Self::primary_keys();
@@ -629,17 +667,22 @@ pub trait Entity: Sized {
         session: &mut dyn SqlSession,
     ) -> Result<()> {
         let fields = self.to_fields();
-        let is_new = match Self::identity_column() {
-            Some(id) => {
-                let value = fields
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(id))
-                    .map(|(_, value)| value);
-                !matches!(value.and_then(|v| v.as_i64()), Some(v) if v != 0)
-            }
-            None => {
-                let pk = pk_values_of(&fields, Self::primary_keys())?;
-                pk.iter().all(is_empty_pk_value)
+        // 仅插入表：一律走插入入队（不查存在性、不生成 Upsert）
+        let is_new = if Self::insert_only() {
+            true
+        } else {
+            match Self::identity_column() {
+                Some(id) => {
+                    let value = fields
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(id))
+                        .map(|(_, value)| value);
+                    !matches!(value.and_then(|v| v.as_i64()), Some(v) if v != 0)
+                }
+                None => {
+                    let pk = pk_values_of(&fields, Self::primary_keys())?;
+                    pk.iter().all(is_empty_pk_value)
+                }
             }
         };
         if is_new {
@@ -666,12 +709,14 @@ pub trait Entity: Sized {
 
     /// 按主键删除本对象对应的行，返回受影响行数。
     fn delete(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
+        Self::ensure_writable()?;
         let table = dal.table(Self::table())?;
         self.delete_with(&table, session)
     }
 
     /// 按主键删除指定表句柄中的行（分表场景使用）。
     fn delete_with(&self, table: &TableRef<'_>, session: &mut dyn SqlSession) -> Result<u64> {
+        Self::ensure_writable()?;
         let pk = pk_values_of(&self.to_fields(), Self::primary_keys())?;
         let affected = table.delete_by_pk(session, &pk)?;
         // 删除后实体不再对应数据库行，脏数据一并清空
@@ -691,6 +736,7 @@ pub trait Entity: Sized {
         if list.is_empty() {
             return Ok(0);
         }
+        Self::ensure_writable()?;
         let pks = Self::primary_keys();
         if pks.len() == 1 && list.len() > 1 {
             let pk = pks[0];

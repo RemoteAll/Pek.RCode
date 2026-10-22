@@ -543,3 +543,130 @@ fn enqueue_save_writes_only_dirty_columns() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 「仅插入」实体（对应 `Model.xml` 的 `InsertOnly="true"`）：日志/记录/事件表。
+///
+/// 与生成代码同构：字段私有 + 声明 `insert_only()`；`update`/`delete` 应被拒绝，
+/// `save` 不查存在性直接插入。
+#[derive(Debug, Clone, PartialEq)]
+struct LogRow {
+    id: i32,
+    code: Option<String>,
+    amount: rust_decimal::Decimal,
+    ok: bool,
+    create_time: chrono::NaiveDateTime,
+    data: Option<Vec<u8>>,
+}
+
+impl LogRow {
+    fn new() -> Self {
+        Self {
+            id: 0,
+            code: None,
+            amount: Default::default(),
+            ok: false,
+            create_time: chrono::DateTime::UNIX_EPOCH.naive_utc(),
+            data: None,
+        }
+    }
+
+    fn set_code(&mut self, value: Option<String>) {
+        self.code = value;
+    }
+}
+
+impl Entity for LogRow {
+    fn table() -> &'static str {
+        "DH_Order"
+    }
+
+    fn columns() -> &'static [&'static str] {
+        &["Id", "Code", "Amount", "Ok", "CreateTime", "Data"]
+    }
+
+    fn primary_keys() -> &'static [&'static str] {
+        &["Id"]
+    }
+
+    fn identity_column() -> Option<&'static str> {
+        Some("Id")
+    }
+
+    fn to_fields(&self) -> Vec<(&'static str, DbValue)> {
+        vec![
+            ("Id", self.id.into()),
+            ("Code", self.code.clone().into()),
+            ("Amount", self.amount.into()),
+            ("Ok", self.ok.into()),
+            ("CreateTime", self.create_time.into()),
+            ("Data", self.data.clone().into()),
+        ]
+    }
+
+    fn from_row(row: &DbRow) -> Result<Self> {
+        Ok(Self {
+            id: row.get_by_name("Id").and_then(DbValue::as_i32).unwrap_or_default(),
+            code: row.get_by_name("Code").and_then(|v| (!v.is_null()).then(|| v.to_text())),
+            amount: row.get_by_name("Amount").and_then(DbValue::as_decimal).unwrap_or_default(),
+            ok: row.get_by_name("Ok").and_then(DbValue::as_bool).unwrap_or_default(),
+            create_time: row
+                .get_by_name("CreateTime")
+                .and_then(DbValue::as_datetime)
+                .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc()),
+            data: row.get_by_name("Data").and_then(|v| v.as_blob().map(<[u8]>::to_vec)),
+        })
+    }
+
+    fn insert_only() -> bool {
+        true
+    }
+
+    fn set_identity(&mut self, value: i64) -> Result<()> {
+        self.id = value as i32;
+        Ok(())
+    }
+}
+
+#[test]
+fn insert_only_entity_rejects_update_and_delete_but_saves_directly() {
+    let (dir, dal) = setup("insert-only");
+    let mut session = dal.open_session().unwrap();
+
+    let mut row = LogRow::new();
+    row.set_code(Some("L1".into()));
+    let id = row.insert(&dal, session.as_mut()).unwrap();
+    assert!(id > 0, "插入应回写自增主键");
+
+    // 修改被拒（对齐 C#「只写的日志型数据禁止修改」）
+    row.set_code(Some("L2".into()));
+    let err = row.update(&dal, session.as_mut()).unwrap_err().to_string();
+    assert!(err.contains("禁止修改"), "{err}");
+
+    // 删除被拒
+    let err = row.delete(&dal, session.as_mut()).unwrap_err().to_string();
+    assert!(err.contains("禁止修改或删除"), "{err}");
+
+    // save 不查存在性、直接插入（即使主键已有值）
+    let mut second = LogRow::new();
+    second.set_code(Some("L3".into()));
+    assert_eq!(second.save(&dal, session.as_mut()).unwrap(), 1);
+    let mut third = LogRow::new();
+    third.set_code(Some("L4".into()));
+    assert_eq!(third.save(&dal, session.as_mut()).unwrap(), 1, "只插入表 save 一律插入");
+
+    let total = LogRow::count(&dal, session.as_mut(), None).unwrap();
+    assert_eq!(total, 3, "三行都应存在（没有更新覆盖）");
+
+    // 批量保存同样直插
+    let mut batch = vec![LogRow::new(), LogRow::new()];
+    for (i, row) in batch.iter_mut().enumerate() {
+        row.set_code(Some(format!("B{i}")));
+    }
+    assert_eq!(
+        LogRow::save_batch(&dal, session.as_mut(), &batch, None).unwrap(),
+        2
+    );
+    assert_eq!(LogRow::count(&dal, session.as_mut(), None).unwrap(), 5);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

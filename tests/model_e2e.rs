@@ -168,6 +168,34 @@ fn model_codegen_output() {
 }
 
 #[test]
+fn insert_only_table_parses_roundtrips_and_generates_guard() {
+    // `<Table InsertOnly="true">`（对应 C# 的"仅插入表"：日志/记录/事件表）
+    let xml = r#"<EntityModel xmlns="http://schemas.newlifex.com/Model202509">
+  <Tables>
+    <Table Name="DhLog" TableName="DH_Log" Description="日志" InsertOnly="True">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        <Column Name="Message" DataType="String" Length="200" />
+      </Columns>
+    </Table>
+  </Tables>
+</EntityModel>"#;
+    let model = EntityModel::parse(xml).unwrap();
+    let table = model.table("DhLog").unwrap();
+    assert!(table.insert_only, "InsertOnly=True 应解析为 true");
+
+    // 解析 → 写出 → 再解析：属性不丢失
+    let out = model.to_xml();
+    assert!(out.contains("InsertOnly=\"true\""), "{out}");
+    let back = EntityModel::parse(&out).unwrap();
+    assert!(back.table("DhLog").unwrap().insert_only);
+
+    // 生成的实体声明 insert_only()（更新/删除会在运行时被拒绝）
+    let code = codegen::generate(table);
+    assert!(code.contains("fn insert_only() -> bool {"), "{code}");
+}
+
+#[test]
 fn connection_string_accepts_wms_configs() {
     // 与生产同构的两种连接串（示例值，不含真实凭据）
     let sqlite = ConnectionString::parse("Data Source=..\\..\\Data\\DG.db;ShowSql=false;Provider=SQLite");

@@ -113,6 +113,14 @@ pub struct TableMeta {
     /// 表级迁移档位（对应 DH.NCode 的 `TableItem.Migration`；只能收紧、不能放大，
     /// 空值表示继承全局配置）
     pub migration: Option<Migration>,
+    /// 仅插入表（对应 DH.NCode 的 `InsertOnly`：日志表/记录表/事件表）。
+    ///
+    /// 语义与 C# 一致：
+    /// - **禁止修改/删除**（`Entity::update` / `delete` 直接报错）；
+    /// - **保存时不查存在性**，直接插入（队列 flush 直接批量 `INSERT`，
+    ///   省掉每行的存在性查询——这是该配置带来的真实性能收益）；
+    /// - 代码生成不产出更新/删除相关用例（由实体自己声明 [`crate::entity::Entity::insert_only`]）。
+    pub insert_only: bool,
     /// 列定义
     pub columns: Vec<ColumnMeta>,
     /// 索引定义
@@ -382,6 +390,9 @@ fn parse_table(node: &Node) -> Result<TableMeta> {
         description: attr_string(node, "Description").unwrap_or_default(),
         conn_name: attr_string(node, "ConnName"),
         migration: attr_string(node, "Migration").and_then(|v| Migration::parse(&v)),
+        insert_only: attr_string(node, "InsertOnly")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false),
         columns: Vec::new(),
         indexes: Vec::new(),
     };
@@ -507,6 +518,10 @@ fn write_name_and_table_name(table: &TableMeta) -> String {
     // 表级迁移档位（收紧）：仅显式配置时写出，保证解析→写出→解析往返一致
     if let Some(migration) = table.migration {
         s.push_str(&format!(" Migration=\"{}\"", migration.name()));
+    }
+    // 仅插入表（日志/记录/事件表）：与 C# `InsertOnly` 同名字段
+    if table.insert_only {
+        s.push_str(" InsertOnly=\"true\"");
     }
     s
 }

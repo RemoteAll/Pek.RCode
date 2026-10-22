@@ -1458,6 +1458,7 @@ mod tests {
             description: String::new(),
             conn_name: None,
             migration: None,
+            insert_only: false,
             columns: Vec::new(),
             indexes: Vec::new(),
         };

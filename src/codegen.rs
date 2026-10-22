@@ -248,6 +248,14 @@ pub fn generate(table: &TableMeta) -> String {
             .to_string(),
     );
 
+    // 仅插入表（Model.xml `InsertOnly="true"`）：禁改/禁删，保存时直达插入不查存在性
+    if table.insert_only {
+        methods.push(
+            "/// 仅插入表（日志/记录/事件表）：禁止修改与删除。\n    ///\n    /// 对应 DH.NCode 的 `InsertOnly`：`update`/`delete` 直接报错，`save` 不查存在性。\n    fn insert_only() -> bool {\n        true\n    }"
+                .to_string(),
+        );
+    }
+
     if let Some(identity) = table.identity()
         && identity.data_type.is_integer()
     {

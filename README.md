@@ -1,5 +1,8 @@
 # pek-rcode — DH.NCode（XCode ORM）的 Rust 实现
 
+> **⚠️ 使用本库的项目，开工前先读 [`docs/使用规范.md`](docs/使用规范.md)**
+> （实体写法、读写分离、批量写、缓存边界、性能红线、常见错误对照与接入检查清单）。
+
 Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.NCode 技术栈）能够**渐进迁移**到 Rust——
 两边**共用同一份 `Model.xml`**、**共用同一个数据库**，业务可以一个用例一个用例地从 C# 搬到 Rust，而不是推倒重来。
 
@@ -510,6 +513,51 @@ let removed = WmsLog::delete_batch(&dal, session.as_mut(), &batch, None)?;      
 6. **会话按线程使用**：从池里 `checkout` 的 `session` 不要跨线程传递；池默认 `Max=1000`、空闲 30s 回收，
    并发写线程数远小于此值时可按实际并发调小，避免数据库侧连接数压力。
 7. **避免长事务**：事务会阻塞读写分离切换、延长行锁持有时间；一次消息处理一个短事务或直接自动提交。
+
+### 读写分离与只读连接（对应 DH.NCode `DAL.Reads` / `DbBase.Readonly`）
+
+**连接名约定与 C# 完全一致**（`DAL.cs`）：主连接 `X` 对应 `X.readonly`（单副本）
+或 `X.readonly.rd0` / `.rd1` / …（多副本，轮询）。
+
+```rust
+// 1) 启动时从 Config/Database.toml 自动发现并挂载副本
+let file = pek_rcode::database::DatabaseFile::load(&base)?;
+let replicas = Dal::read_replicas_from_file(&file, &base, "main")?;
+dal.attach_read_replicas(replicas);
+
+// 2) 只读查询（轮询副本；未配置副本时自动回退主库）
+let mut s = dal.read_session()?;
+let list = Order::query(&dal, s.as_mut(), &query)?;
+
+// 3) 按表策略：写入后要求立刻读到最新值的表强制走主库
+dal.set_ignore_tables(&["DH_Order"]);
+let mut s = dal.read_session_for("DH_Order")?;
+
+// 4) 主从延迟告警/对账期间：一键全切主库
+dal.set_primary_only(true);
+```
+
+- **只读连接**：连接串 `Readonly=true`（对齐 `DbBase.Readonly`）——写语句与事务
+  在**调用点直接报错**、不发 SQL；`Dal::set_readonly(bool)` 运行期切换（对齐 `SuspendReadOnly`）；
+- 副本会话创建失败 → **自动回退主库**（可用性优先）；
+- 与 C# 的差异：不提供 `IgnoreTimes`（时段判定依赖本地时区），用 `set_primary_only` 代替；
+- **事务内一致性**：本库会话是显式取出的，`read_session` 返回独立会话；
+  需要"同一事务内读写一致"时全部用 `open_session` 的同一会话。
+
+### 仅插入表（`InsertOnly`，日志/记录/事件表）
+
+`Model.xml` 里 `<Table Name="DhLog" InsertOnly="True">`，`rcodegen` 会为实体生成
+`fn insert_only() -> bool { true }`：
+
+- `update` / `delete`（含批量删除）**直接报错**——对齐 C#「只写的日志型数据禁止修改/禁止删除」；
+- `save` / `save_batch` / `enqueue_save` **不查主键是否存在，直接插入**——
+  对齐 C# `if (InsertOnly) batch.Insert(...) else batch.Save(...)`，**每行省一次存在性查询**；
+- 解析→写出→再解析往返保留该属性（`InsertOnly="true"`）。
+
+> 顺带澄清一个常见误解：DH.NCode 里"针对单表的只读"只有两种——
+> `InsertOnly`（只插不改不删）与 `Migration="ReadOnly"`（结构迁移只生成 DDL 不执行）；
+> 没有"表级只读数据"的开关，`FieldItem.ReadOnly` 只影响代码生成/界面，不影响 SQL 列数。
+> 需要"整张表禁止写"请用**只读连接**。
 
 ### 结构迁移档位（对应 DH.NCode 的 `Migration` 枚举）
 

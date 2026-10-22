@@ -1,5 +1,8 @@
 //! # pek-rcode —— DH.NCode（XCode ORM）的 Rust 实现
 //!
+//! > **使用本库的项目：开工前先读 [`docs/使用规范.md`](../docs/使用规范.md)**
+//! > （实体写法、读写分离、批量写、缓存边界、性能红线与检查清单）。
+//!
 //! 目标：让现有 C#/.NET 项目（DH.NCode 技术栈）能够**渐进迁移**到 Rust——
 //! 两边共用同一份 `Model.xml` 数据模型，逐步把业务从 C# 搬到 Rust。
 //!
@@ -137,6 +140,7 @@ pub mod pool;
 #[cfg(feature = "driver-postgresql")]
 pub mod postgres;
 pub mod query;
+pub mod readwrite;
 pub mod reverse;
 pub mod session;
 pub mod shards;

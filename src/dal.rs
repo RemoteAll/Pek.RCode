@@ -8,7 +8,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -19,6 +22,7 @@ use crate::migration::Migration;
 use crate::model::{EntityModel, TableMeta};
 use crate::pool::{PoolOptions, PoolStats, SessionPool};
 use crate::query::{Query, Where};
+use crate::readwrite::ReadWriteStrategy;
 use crate::session::{DbRow, RowSet, SqlSession};
 use crate::sqlbuild;
 use crate::sqlbuild::BatchWriteMode;
@@ -187,6 +191,79 @@ pub struct Dal {
     pool: OnceLock<Arc<SessionPool>>,
     /// 是否启用连接池
     pool_enabled: bool,
+    /// 连接是否只读（连接串 `Readonly=true`；对应 C# `DbBase.Readonly`）
+    readonly: AtomicBool,
+    /// 只读副本（对应 C# `DAL.Reads`；读操作轮询分流）
+    read_replicas: RwLock<Vec<Arc<Dal>>>,
+    /// 读写分离策略（运行期可调）
+    rw_strategy: RwLock<ReadWriteStrategy>,
+    /// 副本轮询计数器
+    read_cursor: AtomicUsize,
+}
+
+/// 只读连接上的会话包装：写操作直接报错、不发 SQL。
+///
+/// 对应 C# `DAL_DbOperate` 的 `if (Db.Readonly) throw new InvalidOperationException(..)`。
+/// 只在**只读连接**上包装（主库连接零额外开销）。
+struct ReadOnlySession {
+    inner: Box<dyn SqlSession>,
+    kind: DatabaseKind,
+}
+
+impl ReadOnlySession {
+    fn deny(&self, action: &str) -> Error {
+        Error::Unsupported(format!(
+            "数据连接[{:?}]只读（Readonly=true），禁止执行{action}",
+            self.kind
+        ))
+    }
+}
+
+impl SqlSession for ReadOnlySession {
+    fn kind(&self) -> DatabaseKind {
+        self.kind
+    }
+
+    fn execute(&mut self, _sql: &str, _params: &[DbValue]) -> Result<u64> {
+        Err(self.deny("写入语句"))
+    }
+
+    fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
+        self.inner.query(sql, params)
+    }
+
+    fn begin(&mut self) -> Result<()> {
+        // 事务必然意味着写入意图，只读连接直接拒绝（对齐"只读连接禁止写"语义）
+        Err(self.deny("事务"))
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        self.inner.commit()
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        self.inner.rollback()
+    }
+
+    fn last_identity(&mut self) -> Result<i64> {
+        self.inner.last_identity()
+    }
+
+    fn last_identity_of(&mut self, table: &str) -> Result<i64> {
+        self.inner.last_identity_of(table)
+    }
+
+    fn table_exists(&mut self, table: &str) -> Result<bool> {
+        self.inner.table_exists(table)
+    }
+
+    fn table_columns(&mut self, table: &str) -> Result<Vec<String>> {
+        self.inner.table_columns(table)
+    }
+
+    fn catalog_tables(&mut self) -> Result<Option<Vec<crate::catalog::TableInfo>>> {
+        self.inner.catalog_tables()
+    }
 }
 
 /// 直接创建会话（不走连接池；供 `Pooling=false` 与池工厂使用）。
@@ -367,6 +444,16 @@ impl Dal {
         //（与 XCodeSetting.Migration 默认值一致；模型级配置在 open_with_model 中补充）
         let conn_migration = conn_str.get("migration").and_then(Migration::parse);
         let migration = conn_migration.unwrap_or_default();
+        // 连接只读：`Readonly=true` / `ReadOnly=1`（对齐 C# `DbBase` 从连接串解析）
+        let readonly = conn_str
+            .get("readonly")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
         Ok(Self {
             conn_str,
             kind,
@@ -378,6 +465,10 @@ impl Dal {
             single_caches: Mutex::new(HashMap::new()),
             pool: OnceLock::new(),
             pool_enabled,
+            readonly: AtomicBool::new(readonly),
+            read_replicas: RwLock::new(Vec::new()),
+            rw_strategy: RwLock::new(ReadWriteStrategy::new()),
+            read_cursor: AtomicUsize::new(0),
         })
     }
 
@@ -446,10 +537,167 @@ impl Dal {
     /// 连接池按连接串（当前 `Dal`）共享，对应 C# 的 `ConnectionPool`：
     /// 优先复用空闲会话；空闲超时（默认 30 秒）或调用出错的会话在归还时关闭。
     pub fn open_session(&self) -> Result<Box<dyn SqlSession>> {
-        if !self.pool_enabled {
-            return create_session(self.kind, &self.conn_str);
+        let session = if !self.pool_enabled {
+            create_session(self.kind, &self.conn_str)?
+        } else {
+            self.session_pool().checkout()?
+        };
+        // 只读连接：写操作直接报错（对齐 C# `if (Db.Readonly) throw`），不发 SQL
+        if self.is_readonly() {
+            return Ok(Box::new(ReadOnlySession {
+                inner: session,
+                kind: self.kind,
+            }));
         }
-        self.session_pool().checkout()
+        Ok(session)
+    }
+
+    /// 连接是否只读（连接串 `Readonly=true`；对应 C# `DbBase.Readonly`）。
+    pub fn is_readonly(&self) -> bool {
+        self.readonly.load(Ordering::Relaxed)
+    }
+
+    /// 运行期切换只读（对应 C# `SuspendReadOnly` / `ResumeReadOnly`）。
+    ///
+    /// 只影响**后续** `open_session()`；已取出的会话保持创建时的保护状态。
+    pub fn set_readonly(&self, value: bool) {
+        self.readonly.store(value, Ordering::Relaxed);
+    }
+
+    /// 挂载只读副本（对应 C# `DAL.Reads`；读操作轮询分流）。
+    ///
+    /// 典型来源是连接名约定 `X.readonly` / `X.readonly.rd0..`（见
+    /// [`open_replicas_from_file`](Self::open_replicas_from_file)）。
+    pub fn attach_read_replicas(&self, replicas: Vec<Arc<Dal>>) {
+        *self
+            .read_replicas
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = replicas;
+    }
+
+    /// 当前只读副本。
+    pub fn read_replicas(&self) -> Vec<Arc<Dal>> {
+        self.read_replicas
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 是否有可用副本。
+    pub fn has_read_replicas(&self) -> bool {
+        !self
+            .read_replicas
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// 读写分离策略快照（忽略表 + 当前开关）。
+    pub fn read_write_strategy(&self) -> ReadWriteStrategy {
+        self.rw_strategy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot()
+    }
+
+    /// 设置忽略表（这些表的读操作强制走主库）。
+    pub fn set_ignore_tables(&self, tables: &[&str]) {
+        let mut guard = self.rw_strategy.write().unwrap_or_else(|e| e.into_inner());
+        *guard = guard.snapshot().ignore_tables(tables);
+    }
+
+    /// 当前忽略表（小写）。
+    pub fn ignored_tables(&self) -> Vec<String> {
+        self.rw_strategy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ignored_tables()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// 全局切主库（`true`）或恢复读写分离（`false`）。
+    pub fn set_primary_only(&self, value: bool) {
+        self.rw_strategy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_primary_only(value);
+    }
+
+    /// 是否已全局切主库。
+    pub fn is_primary_only(&self) -> bool {
+        self.rw_strategy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_primary_only()
+    }
+
+    /// 取只读会话（对应 C# `ReadWriteStrategy.TryGet`）。
+    ///
+    /// - 有副本：按轮询分配（与 C# 的 `Interlocked.Increment % count` 一致）；
+    /// - 无副本：回退主库（业务无需关心是否配置了从库）。
+    ///
+    /// 只读查询应该用本方法；写入必须用 [`open_session`](Self::open_session)。
+    pub fn read_session(&self) -> Result<Box<dyn SqlSession>> {
+        let replicas = self.read_replicas();
+        if replicas.is_empty() {
+            return self.open_session();
+        }
+        let index = self.read_cursor.fetch_add(1, Ordering::Relaxed) % replicas.len();
+        match replicas[index].open_session() {
+            Ok(session) => Ok(session),
+            // 副本不可用不阻断业务：退回主库（可用性优先，与只读场景语义兼容）
+            Err(_) => self.open_session(),
+        }
+    }
+
+    /// 按表名策略取只读会话：命中忽略表或全局切主库时走主库。
+    pub fn read_session_for(&self, table: &str) -> Result<Box<dyn SqlSession>> {
+        let allow = self
+            .rw_strategy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .allows_replica(table);
+        if allow {
+            self.read_session()
+        } else {
+            self.open_session()
+        }
+    }
+
+    /// 从 `Config/Database.toml` 按 C# 连接名约定创建副本集合。
+    ///
+    /// 约定（与 DH.NCode `DAL.cs` 一致）：主连接名 `X` 对应
+    /// `X.readonly`（单副本）或 `X.readonly.rd0` / `.rd1`（多副本）。
+    /// 未配置任何副本时返回空集合（不影响主库使用）。
+    #[cfg(feature = "database")]
+    pub fn read_replicas_from_file(
+        file: &crate::database::DatabaseFile,
+        base: &std::path::Path,
+        conn_name: &str,
+    ) -> Result<Vec<Arc<Dal>>> {
+        let mut names = Vec::new();
+        let single = format!("{conn_name}.readonly");
+        if file.connections.contains_key(&single) {
+            names.push(single);
+        } else {
+            for i in 0..32 {
+                let name = format!("{conn_name}.readonly.rd{i}");
+                if file.connections.contains_key(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        let mut replicas = Vec::with_capacity(names.len());
+        for name in names {
+            // 副本连接串不完整时忽略该副本（主库仍可用），不阻断启动
+            let Ok(conn) = file.resolve_connection(base, &name) else {
+                continue;
+            };
+            replicas.push(Arc::new(Dal::open(&conn)?));
+        }
+        Ok(replicas)
     }
 
     /// 取（或懒创建）会话池。

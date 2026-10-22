@@ -87,6 +87,7 @@ fn to_table_meta(info: catalog::TableInfo) -> TableMeta {
         description: info.description,
         conn_name: None,
         migration: None,
+        insert_only: false,
         columns: info
             .columns
             .into_iter()
