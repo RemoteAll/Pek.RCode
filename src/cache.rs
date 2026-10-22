@@ -37,7 +37,7 @@ pub mod invalidator;
 pub mod lazy;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,13 @@ use crate::value::DbValue;
 
 /// 默认过期时间（秒，与 DH.NCode 一致）。
 pub const DEFAULT_EXPIRE_SECONDS: u64 = 60;
+
+/// 1 秒的纳秒数（避免浮点与常数魔法值分散）。
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// 一致性模式：过期后同步重载（默认）。
+const CONSISTENCY_BLOCKING: u8 = 0;
+/// 一致性模式：过期先返旧值再刷新。
+const CONSISTENCY_SWR: u8 = 1;
 
 /// 实体缓存一致性模式（按业务场景选择）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -91,10 +98,12 @@ fn pk_key(pk: &[DbValue]) -> String {
 pub struct EntityCache {
     /// 表名（注册键，小写）
     table: String,
-    /// 过期时间
-    expire: Mutex<Duration>,
-    /// 一致性模式
-    consistency: Mutex<CacheConsistency>,
+    /// 过期时间（纳秒；原子读写，避免高并发命中时抢锁）
+    expire_nanos: AtomicU64,
+    /// 一致性模式（0=Blocking，1=StaleWhileRevalidate）
+    consistency_mode: AtomicU8,
+    /// SWR 模式下允许的陈旧窗口（纳秒）
+    stale_max_nanos: AtomicU64,
     /// 缓存状态（写锁用于刷新，保证并发过期时只有一个线程查库）
     state: RwLock<EntityCacheState>,
     /// 已向调用方返回过“过期旧值”（SWR 模式）
@@ -115,8 +124,9 @@ impl EntityCache {
     pub fn new(table: &str) -> Self {
         Self {
             table: table.to_string(),
-            expire: Mutex::new(Duration::from_secs(DEFAULT_EXPIRE_SECONDS)),
-            consistency: Mutex::new(CacheConsistency::default()),
+            expire_nanos: AtomicU64::new(DEFAULT_EXPIRE_SECONDS * NANOS_PER_SECOND),
+            consistency_mode: AtomicU8::new(CONSISTENCY_BLOCKING),
+            stale_max_nanos: AtomicU64::new(0),
             state: RwLock::new(EntityCacheState::default()),
             stale_served: AtomicBool::new(false),
         }
@@ -139,28 +149,48 @@ impl EntityCache {
 
     /// 当前过期时间。
     pub fn expire(&self) -> Duration {
-        *lock(&self.expire)
+        Duration::from_nanos(self.expire_nanos.load(Ordering::Relaxed))
     }
 
     /// 设置过期时间（秒）。
     pub fn set_expire_seconds(&self, seconds: u64) {
-        *lock(&self.expire) = Duration::from_secs(seconds);
+        self.expire_nanos
+            .store(seconds.saturating_mul(NANOS_PER_SECOND), Ordering::Relaxed);
     }
 
     /// 当前一致性模式。
     pub fn consistency(&self) -> CacheConsistency {
-        *lock(&self.consistency)
+        if self.consistency_mode.load(Ordering::Relaxed) == CONSISTENCY_SWR {
+            CacheConsistency::StaleWhileRevalidate {
+                max_stale: Duration::from_nanos(self.stale_max_nanos.load(Ordering::Relaxed)),
+            }
+        } else {
+            CacheConsistency::Blocking
+        }
     }
 
     /// 设置一致性模式（强一致用 [`CacheConsistency::Blocking`]；读多写少、可容忍短暂旧值的表
     /// 可开 [`CacheConsistency::StaleWhileRevalidate`]）。
     pub fn set_consistency(&self, mode: CacheConsistency) {
-        *lock(&self.consistency) = mode;
+        match mode {
+            CacheConsistency::Blocking => {
+                self.consistency_mode
+                    .store(CONSISTENCY_BLOCKING, Ordering::Relaxed);
+                self.stale_max_nanos.store(0, Ordering::Relaxed);
+            }
+            CacheConsistency::StaleWhileRevalidate { max_stale } => {
+                self.stale_max_nanos.store(
+                    u64::try_from(max_stale.as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                self.consistency_mode.store(CONSISTENCY_SWR, Ordering::Relaxed);
+            }
+        }
     }
 
     /// 缓存是否可用（已加载且未过期）。
     pub fn is_valid(&self) -> bool {
-        let expire = *lock(&self.expire);
+        let expire = self.expire();
         let state = self.read_state();
         state
             .loaded_at
@@ -178,8 +208,8 @@ impl EntityCache {
     /// 重载在**写锁内**执行：并发过期时只有一个线程查库，其余线程等它完成后直接拿新数据，
     /// 避免缓存击穿（N 个线程同时整表查询）。
     pub fn entities(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<Arc<Vec<DbRow>>> {
-        let expire = *lock(&self.expire);
-        let mode = *lock(&self.consistency);
+        let expire = self.expire();
+        let mode = self.consistency();
 
         // 快路径：读锁
         {
@@ -267,8 +297,8 @@ impl EntityCache {
 pub struct SingleCache {
     /// 表名（注册键，小写）
     table: String,
-    /// 过期时间
-    expire: Mutex<Duration>,
+    /// 过期时间（纳秒；原子读写）
+    expire_nanos: AtomicU64,
     /// 最大实体数（0 表示不限制）
     max_entity: Mutex<usize>,
     /// 缓存项（键为归一化主键文本）
@@ -287,7 +317,7 @@ impl SingleCache {
     pub fn new(table: &str) -> Self {
         Self {
             table: table.to_string(),
-            expire: Mutex::new(Duration::from_secs(DEFAULT_EXPIRE_SECONDS)),
+            expire_nanos: AtomicU64::new(DEFAULT_EXPIRE_SECONDS * NANOS_PER_SECOND),
             max_entity: Mutex::new(DEFAULT_MAX_ENTITY),
             state: Mutex::new(SingleCacheState::default()),
         }
@@ -300,12 +330,13 @@ impl SingleCache {
 
     /// 当前过期时间。
     pub fn expire(&self) -> Duration {
-        *lock(&self.expire)
+        Duration::from_nanos(self.expire_nanos.load(Ordering::Relaxed))
     }
 
     /// 设置过期时间（秒）。
     pub fn set_expire_seconds(&self, seconds: u64) {
-        *lock(&self.expire) = Duration::from_secs(seconds);
+        self.expire_nanos
+            .store(seconds.saturating_mul(NANOS_PER_SECOND), Ordering::Relaxed);
     }
 
     /// 最大实体数。
@@ -337,7 +368,7 @@ impl SingleCache {
     ) -> Result<Option<Arc<DbRow>>> {
         let key = pk_key(pk);
         {
-            let expire = *lock(&self.expire);
+            let expire = self.expire();
             let state = lock(&self.state);
             if let Some((row, at)) = state.items.get(&key)
                 && at.elapsed() < expire

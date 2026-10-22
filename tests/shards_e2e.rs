@@ -42,7 +42,7 @@ impl TradeLog {
             return;
         }
         self.note = value.to_string();
-        self.dirty.mark("Note");
+        self.dirty.mark_static("Note");
     }
 }
 

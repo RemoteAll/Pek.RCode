@@ -400,25 +400,28 @@ pub trait Entity: Sized {
 
         // 启用脏追踪：只取脏列的值（避免宽表对全部列做克隆分配）
         if let Some(state) = dirty {
-            let names = state.names();
-            let mut sets: Vec<(&'static str, DbValue)> = Vec::with_capacity(names.len());
-            for name in &names {
-                if pks.iter().any(|pk| pk.eq_ignore_ascii_case(name))
-                    || identity.is_some_and(|id| id.eq_ignore_ascii_case(name))
-                {
-                    continue;
+            // 在脏状态锁内直接遍历列名，避免为取列名而逐条分配字符串
+            let mut sets: Vec<(&'static str, DbValue)> = Vec::new();
+            state.with_columns(|items| {
+                sets.reserve(items.len());
+                for (name, _) in items.iter() {
+                    if pks.iter().any(|pk| pk.eq_ignore_ascii_case(name))
+                        || identity.is_some_and(|id| id.eq_ignore_ascii_case(name))
+                    {
+                        continue;
+                    }
+                    let Some(column) = Self::columns()
+                        .iter()
+                        .copied()
+                        .find(|c| c.eq_ignore_ascii_case(name))
+                    else {
+                        continue;
+                    };
+                    if let Some(value) = self.column_value(column) {
+                        sets.push((column, value));
+                    }
                 }
-                let Some(column) = Self::columns()
-                    .iter()
-                    .copied()
-                    .find(|c| c.eq_ignore_ascii_case(name))
-                else {
-                    continue;
-                };
-                if let Some(value) = self.column_value(column) {
-                    sets.push((column, value));
-                }
-            }
+            });
             if sets.is_empty() {
                 self.clear_dirty();
                 return Ok(0);

@@ -1,5 +1,6 @@
 //! 实体脏数据与扩展属性（对应 DH.NCode 的 `Entity/DirtyCollection.cs` 与 `Entity/EntityExtend.cs`）。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -14,10 +15,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// 脏数据集合：记录被修改的列及其**旧值**（对应 `DirtyCollection`）。
 ///
 /// 实体在保存前把自己的修改登记进来，保存时只写脏列；`Save` 成功后清空。
+///
+/// 列名用 [`Cow`] 保存：代码生成的实体传入字面量（`'static`）时不发生堆分配，
+/// 高频写场景（如设备状态更新）不会为每条更新产生额外的内存分配。
 #[derive(Debug, Default, Clone)]
 pub struct DirtyCollection {
     /// 列名 → 旧值（保留最早一次的旧值）
-    items: Vec<(String, DbValue)>,
+    items: Vec<(Cow<'static, str>, DbValue)>,
 }
 
 impl DirtyCollection {
@@ -36,6 +40,11 @@ impl DirtyCollection {
         self.items.is_empty()
     }
 
+    /// 遍历脏列（列名 + 旧值，按登记顺序）。
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &DbValue)> {
+        self.items.iter().map(|(key, value)| (key.as_ref(), value))
+    }
+
     /// 是否包含脏列（忽略大小写）。
     pub fn contains(&self, name: &str) -> bool {
         self.items
@@ -43,18 +52,32 @@ impl DirtyCollection {
             .any(|(key, _)| key.eq_ignore_ascii_case(name))
     }
 
-    /// 登记脏列并记录旧值；重复登记**保留最早旧值**。新登记返回 `true`。
+    /// 登记脏列（列名为动态字符串）。
     pub fn set(&mut self, name: &str, old_value: DbValue) -> bool {
         if self.contains(name) {
             return false;
         }
-        self.items.push((name.to_string(), old_value));
+        self.items.push((Cow::Owned(name.to_string()), old_value));
+        true
+    }
+
+    /// 登记脏列（列名为 `'static` 字面量，**不发生堆分配**）。
+    pub fn set_static(&mut self, name: &'static str, old_value: DbValue) -> bool {
+        if self.contains(name) {
+            return false;
+        }
+        self.items.push((Cow::Borrowed(name), old_value));
         true
     }
 
     /// 登记脏列（无旧值，记录为 NULL）。
     pub fn add(&mut self, name: &str) -> bool {
         self.set(name, DbValue::Null)
+    }
+
+    /// 登记脏列（无旧值，列名为 `'static` 字面量，**不发生堆分配**）。
+    pub fn add_static(&mut self, name: &'static str) -> bool {
+        self.set_static(name, DbValue::Null)
     }
 
     /// 取旧值（未登记返回 `None`）。
@@ -67,7 +90,7 @@ impl DirtyCollection {
 
     /// 脏列名列表（按登记顺序）。
     pub fn names(&self) -> Vec<&str> {
-        self.items.iter().map(|(key, _)| key.as_str()).collect()
+        self.items.iter().map(|(key, _)| key.as_ref()).collect()
     }
 
     /// 移除指定列（忽略大小写），返回是否移除。
@@ -181,9 +204,21 @@ impl DirtyState {
         lock(&self.items).add(name)
     }
 
+    /// 登记脏列（列名为 `'static` 字面量，**不发生堆分配**；代码生成的实体走这条）。
+    pub fn mark_static(&self, name: &'static str) -> bool {
+        lock(&self.items).add_static(name)
+    }
+
     /// 登记脏列并记录旧值（重复登记保留最早旧值）。
     pub fn mark_with_old(&self, name: &str, old_value: DbValue) -> bool {
         lock(&self.items).set(name, old_value)
+    }
+
+    /// 在持锁状态下遍历脏列（避免为取列名而逐条分配字符串）。
+    ///
+    /// 闭包内不要再次访问同一实体的脏状态（会自死锁）。
+    pub fn with_columns<R>(&self, f: impl FnOnce(&DirtyCollection) -> R) -> R {
+        f(&lock(&self.items))
     }
 
     /// 是否包含脏列（忽略大小写）。
@@ -267,6 +302,23 @@ mod tests {
 
         dirty.clear();
         assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn static_mark_behaves_like_dynamic_mark() {
+        let state = DirtyState::new();
+        assert!(state.mark_static("Status"));
+        assert!(!state.mark_static("status"), "大小写不敏感：重复登记不新增");
+        assert!(!state.mark("STATUS"), "静态与动态登记共享同一集合");
+        assert!(state.mark("Code"));
+        assert_eq!(state.len(), 2);
+
+        // 持锁遍历：顺序与登记一致，无需为取列名分配字符串
+        let seen = state.with_columns(|items| items.iter().map(|(name, _)| name.to_string()).collect::<Vec<_>>());
+        assert_eq!(seen, vec!["Status", "Code"]);
+
+        state.clear();
+        assert!(state.is_empty());
     }
 
     #[test]

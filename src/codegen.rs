@@ -106,7 +106,7 @@ pub fn generate(table: &TableMeta) -> String {
             clean_doc(&col.description)
         };
         accessors.push(format!(
-            "    /// 获取 {doc}。\n    pub fn {field}(&self) -> &{ty} {{\n        &self.{field}\n    }}\n\n    /// 设置 {doc}（值未变化时不产生数据库写入）。\n    pub fn {setter}(&mut self, value: {ty}) {{\n        if self.{field} == value {{\n            return;\n        }}\n        self.{field} = value;\n        self.dirty.mark(\"{name}\");\n    }}"
+            "    /// 获取 {doc}。\n    pub fn {field}(&self) -> &{ty} {{\n        &self.{field}\n    }}\n\n    /// 设置 {doc}（值未变化时不产生数据库写入）。\n    pub fn {setter}(&mut self, value: {ty}) {{\n        if self.{field} == value {{\n            return;\n        }}\n        self.{field} = value;\n        self.dirty.mark_static(\"{name}\");\n    }}"
         ));
     }
     out.push_str(&accessors.join("\n\n"));
@@ -1009,7 +1009,7 @@ mod tests {
         // 访问器与脏追踪：写入自动登记脏列，更新只写脏列
         assert!(code.contains("pub fn id(&self) -> &i32"), "{code}");
         assert!(code.contains("pub fn set_id(&mut self, value: i32)"), "{code}");
-        assert!(code.contains("self.dirty.mark(\"Id\");"), "{code}");
+        assert!(code.contains("self.dirty.mark_static(\"Id\");"), "{code}");
         assert!(
             code.contains("fn column_value(&self, column: &str) -> Option<DbValue>"),
             "生成实体应按列直接取值（避免全字段克隆）：{code}"

@@ -134,7 +134,7 @@ impl TrackedOrder {
             return;
         }
         self.code = value;
-        self.dirty.mark("Code");
+        self.dirty.mark_static("Code");
     }
 
     fn set_amount(&mut self, value: rust_decimal::Decimal) {
@@ -142,7 +142,7 @@ impl TrackedOrder {
             return;
         }
         self.amount = value;
-        self.dirty.mark("Amount");
+        self.dirty.mark_static("Amount");
     }
 }
 
