@@ -35,7 +35,11 @@ impl RowSet {
 
     /// 追加一行。
     pub fn push(&mut self, values: Vec<DbValue>) {
-        // 同一结果集只构建一次列名索引，各行共享
+        // 宽表：同一结果集只构建一次列名索引，各行共享；小表直接线性比较无需索引
+        if self.columns.len() <= SMALL_COLUMN_COUNT {
+            self.rows.push(DbRow::new(self.columns.clone(), values));
+            return;
+        }
         let index = self
             .index
             .get_or_init(|| Arc::new(build_column_index(&self.columns)))
@@ -61,6 +65,12 @@ impl RowSet {
 
     /// 按列名取列序号（忽略大小写）。
     pub fn column_index(&self, name: &str) -> Option<usize> {
+        if self.columns.len() <= SMALL_COLUMN_COUNT {
+            return self
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name));
+        }
         let index = self
             .index
             .get_or_init(|| Arc::new(build_column_index(&self.columns)));
@@ -76,6 +86,9 @@ impl<'a> IntoIterator for &'a RowSet {
         self.rows.iter()
     }
 }
+
+/// 小列表阀值：列数不超过该值时按名取值走线性比较（避免为少列构建 HashMap）。
+pub(crate) const SMALL_COLUMN_COUNT: usize = 8;
 
 /// 单行数据。
 #[derive(Debug)]
@@ -152,8 +165,15 @@ impl DbRow {
         self.values.get(index)
     }
 
-    /// 按列名取值（忽略大小写；列名索引缓存，重复取值 O(1)）。
+    /// 按列名取值（忽略大小写；宽表列名索引缓存，小表直接线性比较）。
     pub fn get_by_name(&self, name: &str) -> Option<&DbValue> {
+        if self.columns.len() <= SMALL_COLUMN_COUNT {
+            let position = self
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name))?;
+            return self.values.get(position);
+        }
         let key = name.to_ascii_lowercase();
         let position = *self.name_index().get(&key)?;
         self.values.get(position)
