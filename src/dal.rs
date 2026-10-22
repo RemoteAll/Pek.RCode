@@ -1796,6 +1796,9 @@ impl<'a> TableRef<'a> {
     /// - 模式支持：`Insert`（不支持多行的方言回退逐行）、`InsertIgnore`/`Replace`（方言不支持时报错，
     ///   无安全回退）、`Upsert`（SQLite/MySQL/PostgreSQL/DuckDB 多行 `On Conflict`；其余方言回退逐行
     ///   ——查主键后更新/插入）；
+    /// - **`Upsert`/`Replace` 是整行语义**（冲突时覆盖全部非主键列；`Replace` 为先删后插），
+    ///   多个应用共享同一张表时禁用，改用 [`TableRef::update_by_pk`] / [`TableRef::update_where`]
+    ///   只写变化的列（详见 `docs/使用规范.md` §4.5）；
     /// - `batch_size` 默认 [`crate::batch::DEFAULT_INSERT_BATCH_SIZE`] = 5000，再按数据库单语句参数上限收紧；
     /// - **不保证回写自增主键**（与 C# `BatchInsert` 一致）；无自增的雪花主键请先填值
     ///   （分表批量 [`crate::entity::Entity::insert_batch_sharded`] / [`crate::entity::Entity::upsert_batch_sharded`] 会自动生成）；
@@ -2381,6 +2384,9 @@ impl<'a> TableRef<'a> {
     /// - [`crate::data_access::SaveModes::Upsert`]：主键已存在则按主键更新，否则插入；
     /// - [`crate::data_access::SaveModes::InsertIgnore`]：主键已存在则忽略（返回 0）；
     /// - [`crate::data_access::SaveModes::Replace`]：主键已存在则先删除再插入。
+    ///
+    /// **`fields` 直接作为 `SET` 的列集**：只想改少数列就只传这些列；传全字段即整行覆盖
+    /// （多个应用共享同一张表时，传全字段会把旧值写回——见 `docs/使用规范.md` §4.5）。
     ///
     /// 非插入模式下 `fields` 必须包含全部主键列；写入路径中的拦截器刷新与缓存失效由
     /// [`TableRef::insert`]/[`TableRef::update_by_pk`]/[`TableRef::delete_by_pk`] 各自处理。

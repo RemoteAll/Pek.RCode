@@ -309,6 +309,7 @@ pub trait Entity: Sized {
     /// 批量替换插入（对应 C# `EntityExtension.BatchReplace`）：按主键/唯一键替换整行。
     ///
     /// 仅 SQLite/DuckDB（`Insert Or Replace`）、MySQL（`Replace Into`）支持；其余方言报错（与 C# 一致）。
+    /// **先删后插的整行语义**，多个应用共享同一张表时禁用（见 `docs/使用规范.md` §4.5）。
     fn replace_batch(
         dal: &Dal,
         session: &mut dyn SqlSession,
@@ -324,6 +325,9 @@ pub trait Entity: Sized {
 
     /// 批量插入或更新（对应 C# `EntityExtension.Save(list)` 的 Upsert 语义）：按主键冲突更新非主键列。
     ///
+    /// - **整行覆盖**：冲突时 `SET` 包含全部非主键列，实体里的旧值会写回库中。
+    ///   **多个应用/系统共享同一张表时禁用**，改用 [`Entity::save_batch`]（逐行只写脏列）、
+    ///   [`Entity::update_columns`] 或 [`Entity::update_where`]（详见 `docs/使用规范.md` §4.5）；
     /// - SQLite/DuckDB/PostgreSQL 生成 `On Conflict(pk) Do Update`、MySQL 生成 `On Duplicate Key Update`，
     ///   多行一条语句；其余方言回退逐行（查主键后更新/插入，同队列 Upsert）；
     /// - 存在自增列时**不允许部分指定主键、部分不指定**（对齐 C# `Save(list)` 的 `NotSupportedException`）；
