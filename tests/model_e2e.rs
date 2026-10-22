@@ -196,8 +196,79 @@ fn insert_only_table_parses_roundtrips_and_generates_guard() {
 }
 
 #[test]
+fn unique_index_generates_cached_find_method() {
+    // 唯一索引 → 生成 find_by_xxx（内部走 find_cached_by：小表自动使用实体缓存）
+    let xml = r#"<EntityModel xmlns="http://schemas.newlifex.com/Model202509">
+  <Tables>
+    <Table Name="DhUser" TableName="DH_User" Description="用户">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        <Column Name="Code" DataType="String" Length="50" />
+        <Column Name="TenantId" DataType="Int32" />
+        <Column Name="Memo" DataType="String" Length="200" Nullable="True" />
+      </Columns>
+      <Indexes>
+        <Index Name="IX_Code" Columns="Code" Unique="True" />
+        <Index Name="IX_Tenant_Code" Columns="TenantId,Code" Unique="True" />
+        <Index Name="IX_Memo" Columns="Memo" Unique="True" />
+      </Indexes>
+    </Table>
+  </Tables>
+</EntityModel>"#;
+    let model = EntityModel::parse(xml).unwrap();
+    let code = codegen::generate(model.table("DhUser").unwrap());
+
+    // 单列唯一索引
+    assert!(code.contains("pub fn find_by_code("), "{code}");
+    // 多列唯一索引 → find_by_a_and_b
+    assert!(code.contains("pub fn find_by_tenant_id_and_code("), "{code}");
+    // 统一走 find_cached_by（MaxCacheCount 自动判定）
+    assert!(code.contains("Self::find_cached_by(dal, session, &["), "{code}");
+    // 可空列的唯一索引不生成（参数无法表达 NULL 语义）
+    assert!(!code.contains("find_by_memo"), "{code}");
+}
+
+#[test]
+fn max_cache_count_defaults_and_time_scale_disables_cache() {
+    // 缺省 1000；含 DataScale=time / timeShard 的表强制 0（对齐 C# EntityBuilder.Prepare）
+    let xml = r#"<EntityModel xmlns="http://schemas.newlifex.com/Model202509">
+  <Tables>
+    <Table Name="A" TableName="T_A">
+      <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+    </Table>
+    <Table Name="B" TableName="T_B" MaxCacheCount="5000">
+      <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+    </Table>
+    <Table Name="C" TableName="T_C" MaxCacheCount="5000">
+      <Columns>
+        <Column Name="Id" DataType="Int32" PrimaryKey="True" />
+        <Column Name="LogTime" DataType="DateTime" DataScale="timeShard:LogTime" />
+      </Columns>
+    </Table>
+    <Table Name="D" TableName="T_D" MaxCacheCount="0">
+      <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+    </Table>
+  </Tables>
+</EntityModel>"#;
+    let model = EntityModel::parse(xml).unwrap();
+    assert_eq!(model.table("A").unwrap().max_cache_count, 1000, "缺省 1000");
+    assert_eq!(model.table("B").unwrap().max_cache_count, 5000, "显式值生效");
+    assert_eq!(
+        model.table("C").unwrap().max_cache_count,
+        0,
+        "时序/分表列 → 强制禁用缓存"
+    );
+    assert_eq!(model.table("D").unwrap().max_cache_count, 0, "0 = 禁用");
+
+    // 往返：非缺省值写出后仍能解析回来
+    let out = model.to_xml();
+    assert!(out.contains("MaxCacheCount=\"5000\""), "{out}");
+    let back = EntityModel::parse(&out).unwrap();
+    assert_eq!(back.table("B").unwrap().max_cache_count, 5000);
+}
+
+#[test]
 fn connection_string_accepts_wms_configs() {
-    // 与生产同构的两种连接串（示例值，不含真实凭据）
     let sqlite = ConnectionString::parse("Data Source=..\\..\\Data\\DG.db;ShowSql=false;Provider=SQLite");
     assert_eq!(sqlite.kind().unwrap(), DatabaseKind::Sqlite);
     assert!(!sqlite.show_sql());

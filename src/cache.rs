@@ -444,6 +444,49 @@ impl Dal {
         if let Some(cache) = lock(&self.single_caches).get(&key) {
             cache.clear();
         }
+        // 行数缓存同步失效（下次按 MAX(id)/COUNT(*) 重新采样）
+        lock(&self.count_cache).remove(&key);
+    }
+
+    /// 表行数（带 60 秒缓存；对应 C# `EntitySession.Count` 的阀值判定用途）。
+    ///
+    /// 用于"小表走整表缓存"的判定（`Model.xml` 的 `MaxCacheCount`），
+    /// **不应作为业务精确计数**——需要精确值直接 `SELECT COUNT(*)`。
+    ///
+    /// 采样策略（对齐 C# `GetCount`）：SQLite 且有自增列时用 `MAX(自增列)`（`COUNT(*)` 在 SQLite 上很慢），
+    /// 其余数据库用 `COUNT(*)`；任何添删改都使缓存失效。
+    pub fn cached_count(&self, table: &str, session: &mut dyn SqlSession) -> Result<i64> {
+        let meta = self.table_meta(table)?;
+        let key = meta.effective_table_name().to_ascii_lowercase();
+
+        const TTL: Duration = Duration::from_secs(60);
+        if let Some((count, at)) = lock(&self.count_cache).get(&key)
+            && at.elapsed() < TTL
+        {
+            return Ok(*count);
+        }
+
+        let sql = match (self.kind(), meta.identity()) {
+            // SQLite：自增列最大值即近似行数（空表为 NULL → 0）
+            (crate::dialect::DatabaseKind::Sqlite, Some(column)) => format!(
+                "SELECT MAX({}) AS c FROM {}",
+                self.kind().quote(meta.effective_column_name(column)),
+                self.kind().quote(meta.effective_table_name()),
+            ),
+            _ => format!(
+                "SELECT COUNT(*) AS c FROM {}",
+                self.kind().quote(meta.effective_table_name())
+            ),
+        };
+        self.log_sql(&sql);
+        let rows = session.query(&sql, &[])?;
+        let count = rows
+            .first()
+            .and_then(|r| r.get_by_name("c"))
+            .and_then(DbValue::as_i64)
+            .unwrap_or(0);
+        lock(&self.count_cache).insert(key, (count, std::time::Instant::now()));
+        Ok(count)
     }
 
     /// 读取整表（实体缓存加载用；列引用按方言转义）。

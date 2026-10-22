@@ -121,6 +121,20 @@ pub struct TableMeta {
     ///   省掉每行的存在性查询——这是该配置带来的真实性能收益）；
     /// - 代码生成不产出更新/删除相关用例（由实体自己声明 [`crate::entity::Entity::insert_only`]）。
     pub insert_only: bool,
+    /// 是否为视图（对应 DH.NCode 的 `TableItem.IsView`：`[BindTable(IsView=true)]`
+    /// 或表名以 `#` 开头）。
+    ///
+    /// 视图在 C# 侧的表现（`EntitySession`）：
+    /// - 所有增/删/改（含批量）**直接招异常**「视图无法添删改！」；
+    /// - 结构迁移（InitData / CheckModel / 建表）**全部跳过**。
+    pub is_view: bool,
+    /// 实体缓存阀值（`MaxCacheCount`，默认 1000）：表行数小于该值时，生成的
+    /// `find_by_xxx` 与 [`crate::entity::Entity::find_cached_by`] **直接走整表实体缓存**。
+    ///
+    /// 对齐 C# `EntityBuilder`：
+    /// - 缺省 1000；`MaxCacheCount="0"` 完全禁用缓存分支；
+    /// - **含 `DataScale` 为 `time` / `timeShard` 的列（时序/大表分表）→ 强制 0**（对齐 `Prepare` 里的大表不缓存）。
+    pub max_cache_count: i32,
     /// 列定义
     pub columns: Vec<ColumnMeta>,
     /// 索引定义
@@ -383,6 +397,11 @@ fn parse_table(node: &Node) -> Result<TableMeta> {
     let name = attr_string(node, "Name")
         .ok_or_else(|| Error::Model("存在缺少 Name 属性的 Table".to_string()))?;
     let table_name = attr_string(node, "TableName").unwrap_or_else(|| name.clone());
+    // 视图：显式 IsView，或实体名以 `#` 开头（与 C# `bt.IsView || bt.Name[0] == '#'` 一致）
+    let is_view = attr_string(node, "IsView")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+        || name.starts_with('#');
 
     let mut table = TableMeta {
         name,
@@ -393,6 +412,11 @@ fn parse_table(node: &Node) -> Result<TableMeta> {
         insert_only: attr_string(node, "InsertOnly")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false),
+        is_view,
+        // 实体缓存阀值：缺省 1000；含时序分表列的表强制不缓存（对齐 C# `EntityBuilder.Prepare`）
+        max_cache_count: attr_string(node, "MaxCacheCount")
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(1000),
         columns: Vec::new(),
         indexes: Vec::new(),
     };
@@ -419,6 +443,18 @@ fn parse_table(node: &Node) -> Result<TableMeta> {
 
     if table.columns.is_empty() {
         return Err(Error::Model(format!("表 {} 没有任何列定义", table.name)));
+    }
+
+    // 大表（时序/时序分表）不参与实体缓存（对齐 C# `EntityBuilder.Prepare`：MaxCacheCount = 0）
+    if table.max_cache_count > 0
+        && table.columns.iter().any(|c| {
+            c.data_scale.as_deref().is_some_and(|s| {
+                let s = s.trim().to_ascii_lowercase();
+                s == "time" || s.starts_with("time:") || s.starts_with("timeshard:")
+            })
+        })
+    {
+        table.max_cache_count = 0;
     }
 
     Ok(table)
@@ -522,6 +558,14 @@ fn write_name_and_table_name(table: &TableMeta) -> String {
     // 仅插入表（日志/记录/事件表）：与 C# `InsertOnly` 同名字段
     if table.insert_only {
         s.push_str(" InsertOnly=\"true\"");
+    }
+    // 视图表（禁增删改 + 跳过结构迁移）
+    if table.is_view {
+        s.push_str(" IsView=\"true\"");
+    }
+    // 实体缓存阀值：仅非缺省（1000）时写出，保证往返一致
+    if table.max_cache_count != 1000 {
+        s.push_str(&format!(" MaxCacheCount=\"{}\"", table.max_cache_count));
     }
     s
 }

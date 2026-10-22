@@ -559,6 +559,35 @@ dal.set_primary_only(true);
 > 没有"表级只读数据"的开关，`FieldItem.ReadOnly` 只影响代码生成/界面，不影响 SQL 列数。
 > 需要"整张表禁止写"请用**只读连接**。
 
+### 小表自动走缓存（`MaxCacheCount`，对齐 C# 生成的 `FindByXxx`）
+
+`Model.xml` 里 `<Table MaxCacheCount="1000">`（**默认 1000**；`0` = 禁用）：
+
+- `rcodegen` 为每个**唯一索引**（列全部非空）生成 `find_by_xxx`，内部统一调用
+  `Entity::find_cached_by`：
+  - 表行数 < `MaxCacheCount` → **整表实体缓存内存匹配，零 SQL**；
+  - 否则 → `WHERE ... LIMIT 1` 走库；
+  - 字符串匹配忽略大小写（与 `COLLATE NOCASE` / C# `EqualIgnoreCase` 一致）。
+- 行数取自 `Dal::cached_count`（**60 秒缓存**；SQLite 用 `MAX(自增列)`，其余 `COUNT(*)`；
+  任何添删改立即失效）——对应 C# `EntitySession.Count`。
+- **含 `DataScale="time"` / `timeShard` 列的表自动 `MaxCacheCount = 0`**（时序/大表不缓存），
+  对齐 C# `EntityBuilder.Prepare`。
+
+```rust
+// 生成代码（唯一索引 Code）：
+// pub fn find_by_code(dal: &Dal, session: &mut dyn SqlSession, code: String) -> Result<Option<Self>>
+let user = DhUser::find_by_code(&dal, s.as_mut(), "U001".into())?;
+```
+
+### 视图表（`IsView`，禁增删改）
+
+`<Table IsView="True">`（或实体名以 `#` 开头，对齐 C# `bt.IsView || bt.Name[0] == '#'`）：
+
+- **所有写入（单行/批量/按主键/条件删除/分批删除）直接报错**「视图无法添删改！」，
+  对齐 C# `EntitySession` 的 6 处 `if (DataTable.IsView) throw`；
+- **结构迁移全部跳过**（不建表、不补列、不建分表），对齐 `CheckModel`/`InitData` 的视图分支；
+- 查询照常（视图只读场景走 `read_session` 更合适）。
+
 ### 结构迁移档位（对应 DH.NCode 的 `Migration` 枚举）
 
 `Dal::sync_schema()` 按档位执行结构迁移，语义与 DH.NCode 逐档对齐（默认 `On`）：
@@ -692,6 +721,27 @@ Pek.RCode/
 ---
 
 ## 六、补迁移进度（按“完整功能迁移、可直接切换 C# 项目”标准）
+
+### 与 DH.NCode 的已知差距（2026-10-22 全量盘点）
+
+| 能力 | C# 位置 | 本库 | 业务价值 / 性能影响 |
+|------|---------|------|-------------------|
+| **`FieldCache<T>`**（按列分组缓存 + 10 分钟过期 + 下拉选项 `GetXxxList`） | `Cache/FieldCache.cs`、`EntityBuilder` 生成 | ❌ 未实现 | 业务：分类/字典下拉高频读；性能：免 `GROUP BY` 查询 |
+| **`SingleCache` 自动用于按主键查询**（生成 `return Meta.SingleCache[id]`） | `EntityBuilder` 生成 | ⚠️ 有 `SingleCache`，但 `find`/`find_by_xxx` 未自动接入 | 性能：主键热点读可再省一次查询 |
+| **`DbCache`**（SQL 结果缓存，60s） | `Cache/DbCache.cs` | ❌ 未实现 | 性能：重复查询免执行 |
+| **条件批量更新** `UPDATE ... SET ... WHERE ...`（单条语句改多行） | `EntityPersistence.Update(where, ...)` | ⚠️ 仅 `update_by_pk` / `update_columns`（按主键） | 业务：批量改状态；性能：一次语句替代 N 次 |
+| **`LongCount` 异步刷新**（60s 缓存 + 后台更新） | `EntitySession.LongCount` | ⚠️ `Dal::cached_count` 为**同步** 60s 缓存（首次查库） | 性能：并发首次会有一次查询（已单飞于调用线程） |
+| `InsertOnly` 表的 codegen 跳过更新/查询方法 | `EntityBuilder` | ⚠️ 生成 `insert_only()`，运行时拦截 | DX 为主 |
+| `Fields` 静态列元数据（`Order._.Name` 强类型查询） | `EntityBuilder` 生成 | ❌ 未实现 | DX 为主 |
+| `Valid` / `OnValid` 业务校验钩子 | `Entity.Valid` | ⚠️ 有 `interceptor`，无逐实体 `Valid` 链 | 业务：统一校验 |
+| `Transform` 抽取器（树/递归实体显式化） | `Entity/Transform.cs` | **有意不做**（用普通查询组装） | — |
+| 读写分离 `IgnoreTimes` | `ReadWriteStrategy` | **有意不做**（用 `set_primary_only` 替代） | — |
+| Oracle/MySQL 参数数组式批量 Update | `IDbSession` | **有意不做**（逐条回退语义等价） | — |
+| `HtmlBuilder`（Razor 页面生成） | `Code/HtmlBuilder.cs` | **有意不做**（由 C# XCodeTool 继续使用） | — |
+
+> 本轮已补齐：**`InsertOnly`（仅插入表）**、**`IsView`（视图禁写 + 跳过迁移）**、
+> **`MaxCacheCount`（小表自动走实体缓存 + 唯一索引 `find_by_xxx` 生成 + 60s 行数缓存）**、
+> **读写分离与只读连接**、**实体脏字段更新**、**批量写入族**、**缓存一致性（Blocking/SWR）+ 单飞刷新**。
 
 **已完成（2026-09-27 补迁移批次）**：
 

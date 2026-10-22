@@ -256,6 +256,62 @@ pub fn generate(table: &TableMeta) -> String {
         );
     }
 
+    // 唯一索引查询方法（对应 C# `EntityBuilder` 为每个唯一索引生成的 `FindByXxx`）：
+    // 表行数 < `MaxCacheCount` 时走整表实体缓存（零 SQL），否则走 SQL。
+    for index in &table.indexes {
+        if !index.unique || index.columns.is_empty() {
+            continue;
+        }
+        // 主键索引已有 `find`，不重复生成
+        if index.columns.len() == 1
+            && table
+                .primary_keys()
+                .iter()
+                .any(|pk| pk.name.eq_ignore_ascii_case(index.columns[0].as_str()))
+        {
+            continue;
+        }
+        let mut params = Vec::new();
+        let mut key_rows = Vec::new();
+        let mut valid = true;
+        for col_name in &index.columns {
+            let Some(col) = table.column(col_name) else {
+                valid = false;
+                break;
+            };
+            // 可空列不适合作为"按值必中"的查询参数（对应 C# 生成时的跳过规则）
+            if col.nullable {
+                valid = false;
+                break;
+            }
+            let ty = entity_field_type(col);
+            let param = safe_field_name(&to_snake_case(&col.name));
+            let expr = if matches!(col.data_type, DataType::String) {
+                format!("pek_rcode::DbValue::Text({param})")
+            } else {
+                format!("pek_rcode::DbValue::from({param})")
+            };
+            params.push(format!("{param}: {ty}"));
+            key_rows.push(format!("(\"{name}\", {expr})", name = col.name));
+        }
+        if !valid || params.is_empty() {
+            continue;
+        }
+        let method = format!(
+            "/// 按唯一索引（{cols}）查询单条；表行数小于 `MaxCacheCount` 时**自动走实体缓存**。\n    ///\n    /// 对应 C# 为唯一索引生成的 `FindByXxx`（`if (Meta.Session.Count < MaxCacheCount) return Meta.Cache.Find(..)`）。\n    pub fn find_by_{suffix}(\n        dal: &pek_rcode::Dal,\n        session: &mut dyn pek_rcode::SqlSession,\n        {params},\n    ) -> pek_rcode::Result<Option<Self>> {{\n        Self::find_cached_by(dal, session, &[{keys}])\n    }}",
+            cols = index.columns.join(", "),
+            suffix = index
+                .columns
+                .iter()
+                .map(|c| safe_field_name(&to_snake_case(c)))
+                .collect::<Vec<_>>()
+                .join("_and_"),
+            params = params.join(", "),
+            keys = key_rows.join(", "),
+        );
+        methods.push(method);
+    }
+
     if let Some(identity) = table.identity()
         && identity.data_type.is_integer()
     {

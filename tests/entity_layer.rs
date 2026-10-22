@@ -670,3 +670,87 @@ fn insert_only_entity_rejects_update_and_delete_but_saves_directly() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+#[test]
+fn find_cached_by_uses_entity_cache_for_small_tables() {
+    let (dir, dal) = setup("cached-find");
+    let mut s = dal.open_session().unwrap();
+
+    let mut a = TrackedOrder::new();
+    a.set_code(Some("A".into()));
+    a.insert(&dal, s.as_mut()).unwrap();
+
+    // 小表（1 行 < MaxCacheCount 默认 1000）→ 走整表实体缓存
+    let found = TrackedOrder::find_cached_by(
+        &dal,
+        s.as_mut(),
+        &[("Code", DbValue::Text("A".into()))],
+    )
+    .unwrap();
+    assert!(found.is_some(), "小表应命中实体缓存");
+
+    // 缓存内匹配忽略大小写（与 SQLite COLLATE NOCASE / C# EqualIgnoreCase 一致）
+    let found = TrackedOrder::find_cached_by(
+        &dal,
+        s.as_mut(),
+        &[("Code", DbValue::Text("a".into()))],
+    )
+    .unwrap();
+    assert!(found.is_some(), "字符串匹配应忽略大小写");
+
+    // 写入使实体缓存失效后，新行仍能查到（不能读到旧快照）
+    let mut b = TrackedOrder::new();
+    b.set_code(Some("B".into()));
+    b.insert(&dal, s.as_mut()).unwrap();
+    let found = TrackedOrder::find_cached_by(
+        &dal,
+        s.as_mut(),
+        &[("Code", DbValue::Text("B".into()))],
+    )
+    .unwrap();
+    assert!(found.is_some(), "写入后缓存失效，应能查到新行");
+
+    // 不存在的键返回 None
+    let missing = TrackedOrder::find_cached_by(
+        &dal,
+        s.as_mut(),
+        &[("Code", DbValue::Text("Z".into()))],
+    )
+    .unwrap();
+    assert!(missing.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn max_cache_count_zero_uses_sql_path() {
+    // MaxCacheCount=0：禁用缓存分支，走 SQL（结果必须一致）
+    let xml = MODEL.replace(
+        r#"<Table Name="Order" TableName="DH_Order" Description="订单">"#,
+        r#"<Table Name="Order" TableName="DH_Order" Description="订单" MaxCacheCount="0">"#,
+    );
+    let dir = temp_dir("no-cache");
+    let db = dir.join("test.db");
+    let conn = format!("Data Source={};Provider=SQLite", db.display());
+    let dal = Dal::open_with_model(&conn, EntityModel::parse(&xml).unwrap()).unwrap();
+    dal.sync_schema().unwrap();
+    assert_eq!(
+        dal.model().unwrap().table("Order").unwrap().max_cache_count,
+        0,
+        "MaxCacheCount=0 应被解析"
+    );
+
+    let mut s = dal.open_session().unwrap();
+    let mut a = TrackedOrder::new();
+    a.set_code(Some("A".into()));
+    a.insert(&dal, s.as_mut()).unwrap();
+
+    let found = TrackedOrder::find_cached_by(
+        &dal,
+        s.as_mut(),
+        &[("Code", DbValue::Text("A".into()))],
+    )
+    .unwrap();
+    assert!(found.is_some(), "禁用缓存时仍应查到（走 SQL）");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

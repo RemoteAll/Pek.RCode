@@ -1459,6 +1459,8 @@ mod tests {
             conn_name: None,
             migration: None,
             insert_only: false,
+            is_view: false,
+            max_cache_count: 1000,
             columns: Vec::new(),
             indexes: Vec::new(),
         };

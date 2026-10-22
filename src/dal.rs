@@ -187,6 +187,8 @@ pub struct Dal {
     pub(crate) entity_caches: Mutex<HashMap<String, Arc<EntityCache>>>,
     /// 单对象缓存注册表（按表共享，对应 DH.NCode 的 `Meta.SingleCache`）
     pub(crate) single_caches: Mutex<HashMap<String, Arc<SingleCache>>>,
+    /// 表行数缓存（表名→（行数, 时刻）；对应 C# `EntitySession.Count` 的 60 秒缓存）
+    pub(crate) count_cache: Mutex<HashMap<String, (i64, std::time::Instant)>>,
     /// 会话连接池（懒创建；`Pooling=false` 时不使用）
     pool: OnceLock<Arc<SessionPool>>,
     /// 是否启用连接池
@@ -463,6 +465,7 @@ impl Dal {
             conn_migration,
             entity_caches: Mutex::new(HashMap::new()),
             single_caches: Mutex::new(HashMap::new()),
+            count_cache: Mutex::new(HashMap::new()),
             pool: OnceLock::new(),
             pool_enabled,
             readonly: AtomicBool::new(readonly),
@@ -768,6 +771,10 @@ impl Dal {
             .model
             .as_ref()
             .ok_or_else(|| Error::Model("尚未加载数据模型，无法创建分表".into()))?;
+        // 视图不存在"分表建表"语义（对齐 C#：视图跳过结构迁移）
+        if model.table(name).is_some_and(|t| t.is_view) {
+            return Ok(false);
+        }
         let table = model
             .table(name)
             .ok_or_else(|| Error::Model(format!("模型中不存在表/实体 {name}")))?;
@@ -876,6 +883,10 @@ impl Dal {
         let mut session = self.open_session()?;
 
         for table in &model.tables {
+            // 视图不参与结构迁移（对齐 C# `EntitySession` 的 `if (DataTable.IsView) return`）
+            if table.is_view {
+                continue;
+            }
             // 表级收紧：只能比全局更保守（对应 XCode ResolveMigration）
             let mode = self.migration.tighten(table.migration);
             if mode == Migration::Off {
@@ -1535,6 +1546,22 @@ impl<'a> TableRef<'a> {
         self.dal
     }
 
+    /// 是否为视图表（对应 DH.NCode `TableItem.IsView`）。
+    pub fn is_view(&self) -> bool {
+        self.table.is_view
+    }
+
+    /// 视图表拒绝写入（对齐 C# `if (DataTable.IsView) throw new NotSupportedException("视图无法添删改！")`）。
+    fn ensure_writable(&self) -> Result<()> {
+        if self.table.is_view {
+            return Err(Error::Unsupported(format!(
+                "视图无法添删改！（{}）",
+                self.table.name
+            )));
+        }
+        Ok(())
+    }
+
     /// 插入一行，返回自增主键（无自增列时返回 0）。
     ///
     /// 自增回写策略按数据库区分：
@@ -1542,6 +1569,7 @@ impl<'a> TableRef<'a> {
     /// - Oracle：插入语句携带 `SEQ_{表名}.NEXTVAL`（由 [`sqlbuild::insert_sql`] 注入），随后读取序列 CURRVAL
     /// - 其余：插入后通过会话读取自增函数（`last_insert_rowid()` / `LAST_INSERT_ID()` / `SCOPE_IDENTITY()`）
     pub fn insert(&self, session: &mut dyn SqlSession, fields: &[(&str, DbValue)]) -> Result<i64> {
+        self.ensure_writable()?;
         // 拦截器补全审计字段（对应实体拦截器 OnValid）
         let values = crate::interceptor::prepare(
             self.table,
@@ -1557,6 +1585,7 @@ impl<'a> TableRef<'a> {
         session: &mut dyn SqlSession,
         fields: Vec<(String, DbValue)>,
     ) -> Result<i64> {
+        self.ensure_writable()?;
         let values = crate::interceptor::prepare_owned(
             self.table,
             crate::interceptor::DataMethod::Insert,
@@ -1666,6 +1695,7 @@ impl<'a> TableRef<'a> {
         mode: BatchWriteMode,
         batch_size: Option<usize>,
     ) -> Result<u64> {
+        self.ensure_writable()?;
         let prepared: Vec<Vec<(String, DbValue)>> = rows
             .iter()
             .map(|fields| {
@@ -1687,6 +1717,7 @@ impl<'a> TableRef<'a> {
         mode: BatchWriteMode,
         batch_size: Option<usize>,
     ) -> Result<u64> {
+        self.ensure_writable()?;
         let rows: Vec<&Vec<(String, DbValue)>> = rows.iter().filter(|r| !r.is_empty()).collect();
         let Some(first) = rows.first() else {
             return Ok(0);
@@ -1861,6 +1892,7 @@ impl<'a> TableRef<'a> {
         values: &[DbValue],
         batch_size: Option<usize>,
     ) -> Result<u64> {
+        self.ensure_writable()?;
         if values.is_empty() {
             return Ok(0);
         }
@@ -1892,6 +1924,7 @@ impl<'a> TableRef<'a> {
         max_rows: Option<u64>,
         interval: Option<Duration>,
     ) -> Result<u64> {
+        self.ensure_writable()?;
         let batch = batch_size
             .unwrap_or(crate::batch::DEFAULT_DELETE_WHERE_BATCH_SIZE)
             .max(1);
@@ -1950,6 +1983,7 @@ impl<'a> TableRef<'a> {
         sets: &[(&str, DbValue)],
         pk: &[DbValue],
     ) -> Result<u64> {
+        self.ensure_writable()?;
         let filter = self.pk_filter(pk)?;
         // 拦截器刷新审计字段（对应实体拦截器 OnValid）
         let values = crate::interceptor::prepare(
@@ -2024,6 +2058,7 @@ impl<'a> TableRef<'a> {
     ///
     /// 对应 C# `Entity.Delete(Expression)` 的单表部分；分表删除见 [`TableRef::delete_sharded`](crate::dal::TableRef::delete_sharded)。
     pub fn delete_where(&self, session: &mut dyn SqlSession, filter: &Where) -> Result<u64> {
+        self.ensure_writable()?;
         // 拦截器通知（对应 OnValid/Delete；默认拦截器不处理删除，保留扩展点）
         let mut notify: Vec<(String, DbValue)> = Vec::new();
         crate::interceptor::apply_registered(

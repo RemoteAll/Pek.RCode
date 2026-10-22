@@ -771,6 +771,50 @@ pub trait Entity: Sized {
             .transpose()
     }
 
+    /// 本表的实体缓存阀值（`Model.xml` 的 `MaxCacheCount`，未加载模型时为 0 = 不缓存）。
+    fn max_cache_count(dal: &Dal) -> i32 {
+        dal.model()
+            .and_then(|m| m.table(Self::table()))
+            .map(|t| t.max_cache_count)
+            .unwrap_or(0)
+    }
+
+    /// 按「唯一索引列值」查询单条，**小表自动走整表实体缓存**
+    /// （对应 C# 生成的 `FindByXxx`：`if (Meta.Session.Count < MaxCacheCount) return Meta.Cache.Find(..)`）。
+    ///
+    /// - 表行数 < `MaxCacheCount`（`cached_count`，60 秒缓存）→ 整表缓存内存匹配（零 SQL）；
+    /// - 否则走 SQL（`WHERE 列=值 LIMIT 1`）；
+    /// - 字符串列匹配忽略大小写（与 `COLLATE NOCASE` / C# `EqualIgnoreCase` 一致）。
+    ///
+    /// 一般无需手写：`rcodegen` 会为 `Model.xml` 中每个唯一索引生成 `find_by_xxx` 方法。
+    fn find_cached_by(
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        key: &[(&str, DbValue)],
+    ) -> Result<Option<Self>> {
+        let max = Self::max_cache_count(dal);
+        if max > 0 && dal.cached_count(Self::table(), session)? < i64::from(max) {
+            let cache = dal.entity_cache(Self::table())?;
+            let rows = cache.entities(dal, session)?;
+            for row in rows.iter() {
+                if key
+                    .iter()
+                    .all(|(column, value)| row_value_matches(row.get_by_name(column), value))
+                {
+                    return Ok(Some(Self::from_row(row)?));
+                }
+            }
+            return Ok(None);
+        }
+
+        let mut filter = Where::new();
+        for (column, value) in key {
+            filter = filter.eq(*column, value.clone());
+        }
+        let query = Query::new().filter(filter).take(1);
+        Ok(Self::query(dal, session, &query)?.into_iter().next())
+    }
+
     /// 条件查询（对应 XCode 的 `FindAll` + 分页参数）。
     fn query(dal: &Dal, session: &mut dyn SqlSession, query: &Query) -> Result<Vec<Self>> {
         let table = dal.table(Self::table())?;
@@ -1649,6 +1693,18 @@ fn is_empty_pk_value(value: &DbValue) -> bool {
         DbValue::Null => true,
         DbValue::Text(text) => text.is_empty(),
         other => other.as_i64() == Some(0),
+    }
+}
+
+/// 结果集列的取值与键值是否匹配（实体缓存内存匹配用）。
+///
+/// 字符串忽略大小写（与 SQLite `COLLATE NOCASE`、C# `EqualIgnoreCase` 一致），其余按值相等。
+fn row_value_matches(row_value: Option<&DbValue>, key: &DbValue) -> bool {
+    match (row_value, key) {
+        (Some(DbValue::Text(left)), DbValue::Text(right)) => left.eq_ignore_ascii_case(right),
+        (Some(left), right) => left == right,
+        (None, DbValue::Null) => true,
+        (None, _) => false,
     }
 }
 
