@@ -794,6 +794,34 @@ fn open_auto_sqlite(name: &str, base_dal: &Dal) -> Result<Arc<Dal>> {
     Ok(Arc::new(Dal::open_with_model(&conn, (*model).clone())?))
 }
 
+/// 解析**表级 `ConnName`** 对应的数据访问层（对应 C# `Meta.ConnName` / `TableItem.ConnName`）。
+///
+/// 与 [`resolve_shard_dal`] 的区别：这里比较的是**模型级连接名**（当前 `Dal` 代表的连接），
+/// 而不是表自身的连接名（表级 ConnName 正是要覆盖它）。
+///
+/// - 未配置 / 空串 / 与当前连接同名（大小写不敏感）→ `Ok(None)`（沿用当前 `Dal`）；
+/// - 已注册连接（[`register_connection`]）→ 返回注册的 `Dal`；
+/// - 未注册 → 按 C# `DAL.Init` 规则自动创建并缓存 `Data/{连接名}.db`（见 [`set_auto_db_dir`]）。
+pub fn resolve_table_dal(
+    table_conn: Option<&str>,
+    base_conn: Option<&str>,
+    base_dal: &Dal,
+) -> Result<Option<Arc<Dal>>> {
+    let Some(conn) = table_conn.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if base_conn.is_some_and(|c| c.eq_ignore_ascii_case(conn)) {
+        return Ok(None);
+    }
+    if let Some(dal) = registered_connection(conn) {
+        return Ok(Some(dal));
+    }
+    // 并发首用同一连接名：锁外先建（可能重复创建、代价可控），锁内以先到者为准
+    let auto = open_auto_sqlite(conn, base_dal)?;
+    let mut map = connections().lock().unwrap_or_else(|e| e.into_inner());
+    Ok(Some(map.entry(conn.to_lowercase()).or_insert(auto).clone()))
+}
+
 /// 解析分片对应的数据访问层（对应 C# `DAL.Create(shard.ConnName)` 的连接解析）：
 ///
 /// - 分片未指定 / 连接名为空 / 与基础连接相同（大小写不敏感）→ `Ok(None)`（沿用当前 `Dal` 与会话）；

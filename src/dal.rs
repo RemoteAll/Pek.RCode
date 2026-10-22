@@ -835,6 +835,44 @@ impl Dal {
         Ok(handle)
     }
 
+    /// 表级 `ConnName` 解析出的目标连接（对应 C# `Meta.ConnName`；`None` = 与当前连接相同）。
+    ///
+    /// 规则见 [`crate::shards::resolve_table_dal`]：已注册连接直接复用，未注册则按 C#
+    /// `DAL.Init` 规则自动创建 `{自动目录}/{连接名}.db`（SQLite）并缓存。
+    pub fn table_conn_dal(&self, name: &str) -> Result<Option<Arc<Dal>>> {
+        let table = self
+            .dal_table_meta(name)
+            .ok_or_else(|| Error::Model(format!("模型中不存在表/实体 {name}")))?;
+        let base_conn = self.model.as_ref().and_then(|m| m.options.conn_name());
+        crate::shards::resolve_table_dal(table.conn_name.as_deref(), base_conn, self)
+    }
+
+    /// 在「表级 `ConnName` 解析出的连接」上打开会话并执行闭包（自动分库路由）。
+    ///
+    /// 这是 C# `Entity`（`Meta.ConnName` 隐式选连接）在本库（会话显式）下的等价入口：
+    ///
+    /// ```no_run
+    /// # use pek_rcode::{Dal, DbValue, Query};
+    /// # fn demo(dal: &Dal) -> pek_rcode::Result<()> {
+    /// // 表在模型里配了 ConnName="IoTData"：自动落到 IoTData 连接（未注册则 Data/IoTData.db）
+    /// dal.with_table_session("StandardData", |_dal, table, session| {
+    ///     table.insert(session, &[("Name", DbValue::from("x"))])?;
+    ///     let _rows = table.query(session, &Query::new().column("Id"))?;
+    ///     Ok(())
+    /// })?;
+    /// # Ok(()) }
+    /// ```
+    pub fn with_table_session<R, F>(&self, name: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&Dal, TableRef<'_>, &mut dyn SqlSession) -> Result<R>,
+    {
+        let target = self.table_conn_dal(name)?;
+        let dal: &Dal = target.as_deref().unwrap_or(self);
+        let table = dal.table(name)?;
+        let mut session = dal.open_session()?;
+        f(dal, table, session.as_mut())
+    }
+
     /// 创建分表物理表（不存在时），结构照抄模型表（含索引，单表 DDL 与 `sync_schema` 一致）。
     ///
     /// 对齐 C# `EntitySession.CheckTable` → `dal.SetTables` 的"新表名自动建表"行为：
