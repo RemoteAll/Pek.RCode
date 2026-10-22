@@ -729,11 +729,11 @@ Pek.RCode/
 | ~~`FieldCache<T>`~~ | `Cache/FieldCache.cs` | ✅ **已实现**（`Dal::field_cache` + 生成 `xxx_list`） | 分类/字典下拉：每 10 分钟 1 次 `GROUP BY` |
 | ~~`SingleCache` 接入按主键查询~~ | 生成 `return Meta.SingleCache[id]` | ✅ **已接入** `Entity::find`（`MaxCacheCount>0`） | 主键热点读 0 次查询 |
 | ~~条件批量更新~~ | `EntityPersistence.Update(where,...)` | ✅ `TableRef::update_where` / `Entity::update_where` | 批量改同值：1 条语句改 N 行 |
-| **`DbCache`**（SQL 结果缓存 60s） | `Cache/DbCache.cs` | ❌ 未实现 | 重复查询免执行（与 FieldCache/EntityCache 有重叠） |
-| **`LongCount` 异步刷新** | `EntitySession.LongCount` | ⚠️ `Dal::cached_count` 为**同步** 60s 缓存 | 并发首次各有一次采样 |
-| `InsertOnly` 表跳过更新/查询方法生成 | `EntityBuilder` | ⚠️ 运行时拦截 | DX 为主 |
-| `Fields` 静态列元数据（`Order._.Name`） | `EntityBuilder` 生成 | ❌ 未实现 | DX 为主 |
-| `Valid` / `OnValid` 校验钩子 | `Entity.Valid` | ⚠️ 有 `interceptor`，无逐实体 `Valid` 链 | 业务：统一校验 |
+| ~~`Valid` / `OnValid` 校验钩子~~ | `Entity.Valid` | ✅ **已实现**（`Entity::validate` + `insert`/`update`/`insert_sharded` 写前拦截 + 生成必填校验 + `save_without_valid`） | 业务：统一校验，失败不发 SQL |
+| **`DbCache`**（业务键单实体缓存） | `Cache/DbCache.cs` | **有意不做**（需实体实现 `IDbCache`，本质是业务键缓存） | 用 `SingleCache` / `find_cached_by` / 业务表缓存替代 |
+| **`LongCount` 异步刷新** | `EntitySession.LongCount` | ⚠️ `Dal::cached_count` 为**同步** 60s 缓存 | 并发首次各有一次采样（已足够） |
+| `InsertOnly` 表跳过更新/查询方法生成 | `EntityBuilder` | ⚠️ 运行时拦截（`insert_only()` 已生成） | DX 为主 |
+| `Fields` 静态列元数据（`Order._.Name`） | `EntityBuilder` 生成 | **有意不做** | 运行时用 `TableMeta.columns` / `Entity::columns()` 即可 |
 | `Transform` 抽取器 | `Entity/Transform.cs` | **有意不做** | 用普通查询组装 |
 | 读写分离 `IgnoreTimes` | `ReadWriteStrategy` | **有意不做** | 用 `set_primary_only` 替代 |
 | Oracle/MySQL 参数数组式批量 Update | `IDbSession` | **有意不做** | 逐条回退语义等价 |
@@ -744,7 +744,8 @@ Pek.RCode/
 
 > 本轮已补齐：**`InsertOnly`（仅插入表）**、**`IsView`（视图禁写 + 跳过迁移）**、
 > **`MaxCacheCount`（小表自动走实体缓存 + 唯一索引 `find_by_xxx` 生成 + 60s 行数缓存）**、
-> **读写分离与只读连接**、**实体脏字段更新**、**批量写入族**、**缓存一致性（Blocking/SWR）+ 单飞刷新**。
+> **读写分离与只读连接**、**实体脏字段更新**、**批量写入族**、**缓存一致性（Blocking/SWR）+ 单飞刷新**、
+> **`Valid` 校验链（`validate` + 生成必填校验 + `save_without_valid`）**。
 
 **已完成（2026-09-27 补迁移批次）**：
 

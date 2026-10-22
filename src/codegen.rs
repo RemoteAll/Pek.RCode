@@ -174,6 +174,8 @@ pub fn generate(table: &TableMeta) -> String {
 
     // —— 对象实体实现（增删改查由 Entity 默认方法提供）——
     let mut methods = Vec::new();
+    // —— 固有方法（查询辅助，不能放进 `impl Entity`）——
+    let mut inherent_methods: Vec<String> = Vec::new();
 
     methods.push("fn table() -> &'static str {\n        Self::TABLE_NAME\n    }".to_string());
 
@@ -309,7 +311,7 @@ pub fn generate(table: &TableMeta) -> String {
             params = params.join(", "),
             keys = key_rows.join(", "),
         );
-        methods.push(method);
+        inherent_methods.push(method);
     }
 
     if let Some(identity) = table.identity()
@@ -326,6 +328,54 @@ pub fn generate(table: &TableMeta) -> String {
         methods.push(format!(
             "fn set_identity(&mut self, value: i64) -> Result<()> {{\n        self.{field} = {cast};\n        Ok(())\n    }}"
         ));
+    }
+
+    // 数据校验（对应 C# `EntityBuilder.BuildValid`）：
+    // 非空字符串列（无默认值、非审计列）→ 必填校验；有索引列/主字段判空串，其余判 NULL。
+    {
+        /// C# `_validExcludes`：审计/备注/追踪列不参与必填校验。
+        const VALID_EXCLUDES: [&str; 10] = [
+            "CreateUser",
+            "CreateUserID",
+            "CreateTime",
+            "CreateIP",
+            "UpdateUser",
+            "UpdateUserID",
+            "UpdateTime",
+            "UpdateIP",
+            "Remark",
+            "TraceId",
+        ];
+        let mut checks = Vec::new();
+        for col in &table.columns {
+            if col.nullable || !matches!(col.data_type, DataType::String) {
+                continue;
+            }
+            if col.default_value.as_ref().is_some_and(|v| !v.trim().is_empty()) {
+                continue;
+            }
+            if VALID_EXCLUDES
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&col.name))
+            {
+                continue;
+            }
+            let field = safe_field_name(&to_snake_case(&col.name));
+            checks.push(format!(
+                "        if self.{field}.trim().is_empty() {{\n            return Err(pek_rcode::Error::Validation(\"{display} 不能为空\".to_string()));\n        }}",
+                display = if col.description.is_empty() {
+                    col.name.clone()
+                } else {
+                    col.description.replace('\n', " ")
+                },
+            ));
+        }
+        if !checks.is_empty() {
+            methods.push(format!(
+                "/// 写入前校验（必填列不能为空；对齐 DH.NCode 生成的 `Valid`）。\n    ///\n    /// 由 `insert` / `update` 自动调用：失败时返回 `Error::Validation` 且不产生 SQL。\n    fn validate(&self) -> pek_rcode::Result<()> {{\n{}\n        Ok(())\n    }}",
+                checks.join("\n")
+            ));
+        }
     }
 
     // 字段缓存下拉选项（对应 C# `EntityBuilder` 为"唯一索引首个字符串列"生成的 `FieldCache<T>`）：
@@ -347,7 +397,7 @@ pub fn generate(table: &TableMeta) -> String {
                 continue;
             }
             seen.push(field.clone());
-            methods.push(format!(
+            inherent_methods.push(format!(
                 "/// 按 {doc} 分组的选项列表（字段缓存 10 分钟，按出现次数降序）。\n    ///\n    /// 对应 DH.NCode 生成代码里的 `FieldCache<...>` 下拉选项（`GetXxxList`）。\n    pub fn {field}_list(\n        dal: &pek_rcode::Dal,\n        session: &mut dyn pek_rcode::SqlSession,\n    ) -> pek_rcode::Result<Vec<String>> {{\n        dal.field_cache(\"{table}\", \"{name}\")?.names(dal, session)\n    }}",
                 doc = col.description.replace('\n', " "),
                 field = field,
@@ -378,6 +428,16 @@ pub fn generate(table: &TableMeta) -> String {
         name = table.name,
         body = methods.join("\n\n    ")
     ));
+
+    // 固有查询辅助（`find_by_xxx` / `xxx_list`）：必须放在 `impl` 而非 `impl Entity`
+    if !inherent_methods.is_empty() {
+        out.push('\n');
+        out.push_str(&format!(
+            "impl {name} {{\n    {body}\n}}\n",
+            name = table.name,
+            body = inherent_methods.join("\n\n    ")
+        ));
+    }
 
     out
 }

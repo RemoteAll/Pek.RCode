@@ -232,6 +232,55 @@ fn unique_index_generates_cached_find_method() {
     assert!(code.contains("field_cache(\"DhUser\", \"Code\")"), "{code}");
     // 可空列同样生成下拉（分组时空值会被过滤，与 C# 一致）
     assert!(code.contains("pub fn memo_list("), "{code}");
+
+    // 结构护栏：`find_by_xxx` / `xxx_list` 是**固有方法**，绝不能落进 `impl Entity for ...`
+    // （落进去会变成 trait 方法 → 生成代码无法编译；曾因此漏过一次）
+    let entity_start = code.find("impl Entity for DhUser").expect("应生成 trait impl");
+    let tail = &code[entity_start..];
+    let body_end = tail.find("\n}\n").map(|i| entity_start + i).unwrap_or(code.len());
+    let entity_block = &code[entity_start..body_end];
+    for needle in ["pub fn find_by_code(", "pub fn code_list(", "pub fn memo_list("] {
+        assert!(code.contains(needle), "缺少 {needle}");
+        assert!(
+            !entity_block.contains(needle),
+            "{needle} 不能出现在 `impl Entity` 块内（必须是固有 impl）：{code}"
+        );
+    }
+}
+
+#[test]
+fn codegen_generates_validate_for_required_columns() {
+    // 对齐 C# `EntityBuilder.BuildValid`：非空字符串列（无默认值、非审计列）→ 必填校验
+    let xml = r#"<EntityModel xmlns="http://schemas.newlifex.com/Model202509">
+  <Tables>
+    <Table Name="DhOrder" TableName="DH_Order" Description="订单">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        <Column Name="Code" DataType="String" Length="50" Description="单号" />
+        <Column Name="Memo" DataType="String" Length="200" Nullable="True" Description="备注" />
+        <Column Name="Kind" DataType="String" Length="20" DefaultValue="NORMAL" Description="类型" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+        <Column Name="CreateUser" DataType="String" Length="50" Description="创建者" />
+        <Column Name="Amount" DataType="Decimal" Precision="18" Scale="4" Description="金额" />
+      </Columns>
+    </Table>
+  </Tables>
+</EntityModel>"#;
+    let model = EntityModel::parse(xml).unwrap();
+    let code = codegen::generate(model.table("DhOrder").unwrap());
+
+    assert!(code.contains("fn validate(&self) -> pek_rcode::Result<()> {"), "{code}");
+    // 必填列 Code → 校验（提示用 Description）
+    assert!(
+        code.contains("if self.code.trim().is_empty()"),
+        "必填列 Code 应生成校验：{code}"
+    );
+    assert!(code.contains("单号 不能为空"), "{code}");
+    // 可空列 Memo / 有默认值 Kind / 审计列 CreateUser / 非字符串 Amount 都不校验
+    assert!(!code.contains("self.memo.trim()"), "{code}");
+    assert!(!code.contains("self.kind.trim()"), "{code}");
+    assert!(!code.contains("self.create_user.trim()"), "{code}");
+    assert!(!code.contains("self.amount.trim()"), "{code}");
 }
 
 #[test]

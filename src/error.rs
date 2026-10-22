@@ -19,6 +19,10 @@ pub enum Error {
     #[error("数据模型错误：{0}")]
     Model(String),
 
+    /// 数据校验失败（实体 `validate` 未通过；写入前拦截，不产生 SQL）
+    #[error("数据校验失败：{0}")]
+    Validation(String),
+
     /// 数据库访问错误
     #[error("数据库错误：{0}")]
     Db(String),

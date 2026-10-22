@@ -180,8 +180,27 @@ pub trait Entity: Sized {
 
     /// 插入一行（自动跳过自增列并回写主键），返回自增主键（无自增时 0）。
     fn insert(&mut self, dal: &Dal, session: &mut dyn SqlSession) -> Result<i64> {
+        if self.should_validate() {
+            self.validate()?;
+        }
         let table = dal.table(Self::table())?;
         self.insert_with(&table, session)
+    }
+
+    /// 数据校验（对应 DH.NCode 生成代码里的 `Valid(DataMethod)`）。
+    ///
+    /// 默认通过；`rcodegen` 会为「非空字符串列（无默认值、非审计列）」生成必填校验
+    /// （对齐 `EntityBuilder.BuildValid`）。[`Entity::insert`] / [`Entity::update`] 在写库**前**调用；
+    /// 校验失败返回 [`Error::Validation`]，不产生任何 SQL。
+    /// 批量写入（`insert_batch` / `save_batch`）为保持批量语义**不逐条校验**。
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// 写入前是否需要校验（有脏追踪的实体在无脏数据时跳过，对齐 C# `if (!HasDirty) return true`）。
+    fn should_validate(&self) -> bool {
+        // 手写/derive 实体无脏追踪 → 始终校验
+        self.dirty_state().is_none() || self.has_dirty()
     }
 
     /// 插入一行到指定表句柄（分表场景由 [`Entity::insert_sharded`] 传入分表句柄）。
@@ -406,6 +425,9 @@ pub trait Entity: Sized {
     /// 按主键更新一行（自动跳过主键与自增列），返回受影响行数。
     fn update(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
         Self::ensure_writable()?;
+        if self.should_validate() {
+            self.validate()?;
+        }
         let table = dal.table(Self::table())?;
         self.update_with(&table, session)
     }
@@ -592,6 +614,21 @@ pub trait Entity: Sized {
             Ok(1)
         } else {
             self.update(dal, session)
+        }
+    }
+
+    /// 保存但**跳过数据校验**（对齐 C# `SaveWithoutValid()`）。
+    ///
+    /// 适用于导入/迁移历史数据、批量搬运等「数据已知合法」的场景；
+    /// 其余规则与 [`Entity::save`] 相同（含「仅插入」表保护）。
+    fn save_without_valid(&mut self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
+        Self::ensure_writable()?;
+        let table = dal.table(Self::table())?;
+        if Self::insert_only() || is_new_entity(dal, session, self)? {
+            self.insert_with(&table, session)?;
+            Ok(1)
+        } else {
+            self.update_with(&table, session)
         }
     }
 
@@ -885,6 +922,9 @@ pub trait Entity: Sized {
         session: &mut dyn SqlSession,
         policy: &TimeShardPolicy,
     ) -> Result<i64> {
+        if self.should_validate() {
+            self.validate()?;
+        }
         // 1) 拦截器先行：拿到"实际入库"的字段值（含 CreateTime 自动补全）
         let handle = dal.table(Self::table())?;
         let fields = self.to_fields();
