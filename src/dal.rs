@@ -2277,11 +2277,33 @@ impl<'a> TableRef<'a> {
             self.update_by_pk(session, values, &[id.into()])?;
             Ok(false)
         } else {
+            // 合并插入字段：keys + values + insert_extra，**同名列只保留先出现者**
+            // （优先级 keys > values > insert_extra）。
+            //
+            // 必须去重：调用方常在 `values` 里已提供某列（如代理注册时上报的
+            // `DefaultPassword`），同时又在 `insert_extra` 里给了该列的仅插入初值，
+            // 不去重会生成 `INSERT INTO t (.., X, .., X) VALUES (..)`，
+            // MySQL 报 1110 `Column 'X' specified twice`、SQLite 报 duplicate column name。
+            fn push_unique<'a>(
+                fields: &mut Vec<(&'a str, DbValue)>,
+                name: &'a str,
+                value: &DbValue,
+            ) {
+                if !fields.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                    fields.push((name, value.clone()));
+                }
+            }
             let mut fields: Vec<(&str, DbValue)> =
                 Vec::with_capacity(keys.len() + values.len() + insert_extra.len());
-            fields.extend(keys.iter().map(|(k, v)| (*k, v.clone())));
-            fields.extend(values.iter().map(|(k, v)| (*k, v.clone())));
-            fields.extend(insert_extra.iter().map(|(k, v)| (*k, v.clone())));
+            for (name, value) in keys {
+                push_unique(&mut fields, name, value);
+            }
+            for (name, value) in values {
+                push_unique(&mut fields, name, value);
+            }
+            for (name, value) in insert_extra {
+                push_unique(&mut fields, name, value);
+            }
             self.insert(session, &fields)?;
             Ok(true)
         }
@@ -2611,6 +2633,47 @@ mod tests {
         assert!(table
             .upsert_by_key(session.as_mut(), &[], &[], &[])
             .is_err());
+
+        drop(session);
+        dal.clear_pool();
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_by_key_dedupes_columns_between_values_and_insert_extra() {
+        // 回归：values 与 insert_extra 出现同名列（代理注册上报 DefaultPassword 的场景）
+        // 曾生成重复列名，MySQL 报 `1110 Column 'X' specified twice`。
+        let dir = temp_dir("upsert-dup");
+        let db = dir.join("test.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
+        dal.sync_schema().unwrap();
+
+        let mut session = dal.open_session().unwrap();
+        let table = dal.table("Order").unwrap();
+        let keys: [(&str, DbValue); 1] = [("Code", "B001".into())];
+        // Status 同时出现在 values 与 insert_extra：应只插入一次，且保留 values 的值
+        assert!(table
+            .upsert_by_key(
+                session.as_mut(),
+                &keys,
+                &[("Status", 7i32.into())],
+                &[("Status", 0i32.into()), ("CreateTime", chrono::Local::now().naive_local().into())],
+            )
+            .unwrap());
+        let rows = table
+            .query(
+                session.as_mut(),
+                &Query::new().filter(Where::new().eq("Code", "B001")),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.rows[0].get_by_name("Status").and_then(|v| v.as_i32()),
+            Some(7),
+            "values 应优先于 insert_extra 的仅插入初值"
+        );
 
         drop(session);
         dal.clear_pool();
