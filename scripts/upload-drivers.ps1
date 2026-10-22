@@ -19,6 +19,7 @@ param(
     [string]$User = '',
     [string]$Password = '',
     [string]$Token = '',
+    [string]$TokenFile = '',
     [string]$Dir = 'dist\drivers',
     [string]$Zip = ''
 )
@@ -26,6 +27,13 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $server = $Server.TrimEnd('/')
+
+# A session token may also be handed over via a file (keeps it out of the
+# command line / shell history when reusing a browser session).
+if (-not $Token -and $TokenFile) {
+    if (-not (Test-Path $TokenFile)) { throw ("token file not found: " + $TokenFile) }
+    $Token = ([IO.File]::ReadAllText($TokenFile, [Text.Encoding]::UTF8)).Trim()
+}
 
 # Auth precedence: -Token (existing session, e.g. handed over from the web UI)
 # > -User/-Password > interactive hidden prompt (keeps passwords out of
