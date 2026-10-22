@@ -451,37 +451,10 @@ pub trait Entity: Sized {
         }
 
         let identity = Self::identity_column();
-        let dirty = self.dirty_state();
-        if dirty.is_some_and(crate::dirty::DirtyState::is_empty) {
-            // 没有任何修改：不产生数据库写入
-            return Ok(0);
-        }
-
         // 启用脏追踪：只取脏列的值（避免宽表对全部列做克隆分配）
-        if let Some(state) = dirty {
-            // 在脏状态锁内直接遍历列名，避免为取列名而逐条分配字符串
-            let mut sets: Vec<(&'static str, DbValue)> = Vec::new();
-            state.with_columns(|items| {
-                sets.reserve(items.len());
-                for (name, _) in items.iter() {
-                    if pks.iter().any(|pk| pk.eq_ignore_ascii_case(name))
-                        || identity.is_some_and(|id| id.eq_ignore_ascii_case(name))
-                    {
-                        continue;
-                    }
-                    let Some(column) = Self::columns()
-                        .iter()
-                        .copied()
-                        .find(|c| c.eq_ignore_ascii_case(name))
-                    else {
-                        continue;
-                    };
-                    if let Some(value) = self.column_value(column) {
-                        sets.push((column, value));
-                    }
-                }
-            });
+        if let Some(sets) = self.dirty_column_sets() {
             if sets.is_empty() {
+                // 没有任何修改：不产生数据库写入
                 self.clear_dirty();
                 return Ok(0);
             }
@@ -638,6 +611,128 @@ pub trait Entity: Sized {
                 state.remove(column);
             }
         }
+        Ok(affected)
+    }
+
+    /// 收集脏列集合（`None` = 无脏追踪实体；`Some` 可能为空 = 有脏追踪但无修改）。
+    ///
+    /// 与 [`Entity::update_with`] 共用同一套取值逻辑：持锁遍历脏列、跳过主键/自增列、
+    /// 不分配列名字符串（生成实体的列名是 `'static` 字面量）。
+    fn dirty_column_sets(&self) -> Option<Vec<(&'static str, DbValue)>> {
+        let state = self.dirty_state()?;
+        let pks = Self::primary_keys();
+        let identity = Self::identity_column();
+        let mut sets: Vec<(&'static str, DbValue)> = Vec::new();
+        state.with_columns(|items| {
+            sets.reserve(items.len());
+            for (name, _) in items.iter() {
+                if pks.iter().any(|pk| pk.eq_ignore_ascii_case(name))
+                    || identity.is_some_and(|id| id.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
+                let Some(column) = Self::columns()
+                    .iter()
+                    .copied()
+                    .find(|c| c.eq_ignore_ascii_case(name))
+                else {
+                    continue;
+                };
+                if let Some(value) = self.column_value(column) {
+                    sets.push((column, value));
+                }
+            }
+        });
+        Some(sets)
+    }
+
+    /// **条件更新（CAS / 乐观锁）**：只写脏列，并要求库内 `expected` 各列仍等于给定旧值。
+    ///
+    /// 对应多应用共享同一张表的并发写场景（见 `docs/使用规范.md` §4.5）：
+    /// 一条 `UPDATE ... SET 脏列 WHERE 主键 AND 期望列=旧值` 完成“检查 + 更新”，
+    /// 不会把旧值覆盖到别的系统刚写入的行上。
+    ///
+    /// - `expected` 传**读取时的旧值**（不是实体当前值）；常用版本列或参与判定的业务列；
+    /// - 无脏数据 → 返回 `Ok(0)`（不发 SQL）；
+    /// - 受影响 0 行 → 返回 [`Error::Conflict`]：主键不存在**或**任一期望列已被修改；
+    /// - 冲突时**不清空脏数据**（调用方重读合并后可再次提交）；成功后清空；
+    /// - 无脏追踪实体（手写/`derive`）写全部非主键列，共享表不建议使用；
+    /// - 分表（`DataScale="timeShard:..."`）暂不支持（返回 [`Error::Unsupported`]）。
+    fn update_if_unchanged(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        expected: &[(&str, DbValue)],
+    ) -> Result<u64> {
+        Self::ensure_writable()?;
+        if self.should_validate() {
+            self.validate()?;
+        }
+        let table = dal.table(Self::table())?;
+        self.update_with_expected(&table, session, expected)
+    }
+
+    /// 条件更新到指定表句柄（语义同 [`Entity::update_if_unchanged`]）。
+    fn update_with_expected(
+        &self,
+        table: &TableRef<'_>,
+        session: &mut dyn SqlSession,
+        expected: &[(&str, DbValue)],
+    ) -> Result<u64> {
+        let pks = Self::primary_keys();
+        if pks.is_empty() {
+            return Err(Error::Model(format!(
+                "实体 {} 没有主键，无法按主键更新",
+                Self::table()
+            )));
+        }
+        let sets = match self.dirty_column_sets() {
+            Some(sets) => sets,
+            None => {
+                // 无脏追踪：写全部非主键列（与 update_with 的兼容分支一致）
+                let identity = Self::identity_column();
+                let fields = self.to_fields();
+                let sets: Vec<(&'static str, DbValue)> = fields
+                    .iter()
+                    .filter(|pair| {
+                        if pks.iter().any(|pk| pk.eq_ignore_ascii_case(pair.0))
+                            || identity.is_some_and(|id| id.eq_ignore_ascii_case(pair.0))
+                        {
+                            return false;
+                        }
+                        true
+                    })
+                    .map(|pair| (pair.0, pair.1.clone()))
+                    .collect();
+                if sets.is_empty() {
+                    return Err(Error::Model(format!(
+                        "实体 {} 除主键/自增列外没有可更新字段",
+                        Self::table()
+                    )));
+                }
+                sets
+            }
+        };
+        if sets.is_empty() {
+            // 有脏追踪但没有修改：不产生数据库写入
+            self.clear_dirty();
+            return Ok(0);
+        }
+        let pk_values = pk_values(self, pks)?;
+        let affected = table.update_if(session, &sets, &pk_values, expected)?;
+        if affected == 0 {
+            // 冲突：保留脏数据，便于调用方重读合并后再次提交
+            return Err(Error::Conflict(format!(
+                "实体 {} 条件更新冲突：主键不存在，或 {} 已不是期望的旧值",
+                Self::table(),
+                expected
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join("、")
+            )));
+        }
+        self.clear_dirty();
         Ok(affected)
     }
 

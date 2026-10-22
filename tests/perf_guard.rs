@@ -527,3 +527,109 @@ fn bench_select_row() {
     report("查询一行（20 列，不取值）", N, t.elapsed(), alloc_since(mark));
     assert!(sink >= N);
 }
+
+// ---------------------------------------------------------------------------
+// 条件更新（CAS）基准（2026-10-23 审计新增）
+// ---------------------------------------------------------------------------
+
+/// 带主键的窄表模型（CAS 需要主键定位）。
+const CAS_MODEL: &str = r#"<EntityModel><Tables><Table Name="Cas" TableName="DH_Cas">
+  <Columns>
+    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+    <Column Name="Code" DataType="String" Length="50" />
+    <Column Name="Amount" DataType="Int32" />
+    <Column Name="Version" DataType="Int32" />
+  </Columns>
+</Table></Tables></EntityModel>"#;
+
+fn bench_cas_dal(tag: &str) -> pek_rcode::Dal {
+    let dir = std::env::temp_dir().join(format!("pek-rcode-cas-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = format!("Data Source={};Provider=SQLite", dir.join("c.db").display());
+    let dal = pek_rcode::Dal::open_with_model(
+        &conn,
+        pek_rcode::model::EntityModel::parse(CAS_MODEL).unwrap(),
+    )
+    .unwrap();
+    dal.sync_schema().unwrap();
+    dal
+}
+
+/// 条件更新（CAS）端到端：成功 / 冲突，与普通 `update_by_pk` 对照。
+///
+/// 三者都走同一条 SQLite 语句缓存与参数绑定路径，差异只在 `WHERE` 多出的
+/// `expected` 条件与冲突时的缓存失效（无缓存时为原子读快路）。
+#[test]
+#[ignore]
+fn bench_update_if() {
+    use pek_rcode::DbValue;
+    const N: usize = 20_000;
+    let dal = bench_cas_dal("update-if");
+    let table = dal.table("Cas").unwrap();
+    let mut session = dal.open_session().unwrap();
+    let id = table
+        .insert(
+            session.as_mut(),
+            &[
+                ("Code", DbValue::Text("A".into())),
+                ("Amount", DbValue::Int(1)),
+                ("Version", DbValue::Int(1)),
+            ],
+        )
+        .unwrap();
+
+    session.begin().unwrap();
+
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        table
+            .update_by_pk(session.as_mut(), &[("Amount", DbValue::Int(1))], &[DbValue::Int(id)])
+            .unwrap();
+    }
+    let plain = t.elapsed();
+    let plain_allocs = alloc_since(mark);
+
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        let affected = table
+            .update_if(
+                session.as_mut(),
+                &[("Amount", DbValue::Int(1))],
+                &[DbValue::Int(id)],
+                &[("Version", DbValue::Int(1))],
+            )
+            .unwrap();
+        assert_eq!(affected, 1);
+    }
+    let cas_ok = t.elapsed();
+    let cas_ok_allocs = alloc_since(mark);
+
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        let affected = table
+            .update_if(
+                session.as_mut(),
+                &[("Amount", DbValue::Int(2))],
+                &[DbValue::Int(id)],
+                &[("Version", DbValue::Int(999))],
+            )
+            .unwrap();
+        assert_eq!(affected, 0);
+    }
+    let cas_conflict = t.elapsed();
+    let cas_conflict_allocs = alloc_since(mark);
+
+    session.commit().unwrap();
+
+    report("update_by_pk（对照，事务内）", N, plain, plain_allocs);
+    report("update_if 成功（CAS，事务内）", N, cas_ok, cas_ok_allocs);
+    report(
+        "update_if 冲突（0 行 + 缓存失效快路）",
+        N,
+        cas_conflict,
+        cas_conflict_allocs,
+    );
+}

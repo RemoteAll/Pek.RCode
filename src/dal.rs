@@ -2284,6 +2284,67 @@ impl<'a> TableRef<'a> {
         Ok(affected)
     }
 
+    /// **条件更新（CAS / 乐观锁）**：仅当库内 `expected` 各列仍等于给定旧值时才写入 `sets`。
+    ///
+    /// 一条 `UPDATE ... SET ... WHERE 主键 AND 列=旧值` 完成“检查 + 更新”，
+    /// 多应用共享同一张表时用它防止把旧值覆盖到别的系统刚写入的数据上
+    /// （见 `docs/使用规范.md` §4.5）。
+    ///
+    /// - 返回受影响行数：`1` = 成功；`0` = 主键不存在**或**任一期望列已被修改（统一视为冲突）；
+    /// - `expected` 传**读取时的旧值**（不是“实体当前值”）；空时等价 [`TableRef::update_by_pk`]；
+    /// - **零额外往返、零新线程**：条件与 `SET` 在同一条语句里；参数比 `update_by_pk` 多
+    ///   `expected.len()` 个，`sets`/`expected` 均为借用切片；
+    /// - 冲突（0 行）时**也会失效本表缓存**：否则调用方重试会继续命中旧缓存、永远冲突；
+    /// - 分表（`DataScale="timeShard:..."`）表请用具体分表句柄调用（本方法不做自动路由）；
+    /// - 视图/仅插入表拒绝。
+    pub fn update_if(
+        &self,
+        session: &mut dyn SqlSession,
+        sets: &[(&str, DbValue)],
+        pk: &[DbValue],
+        expected: &[(&str, DbValue)],
+    ) -> Result<u64> {
+        self.ensure_writable()?;
+        if sets.is_empty() {
+            return Err(Error::Argument("条件更新至少需要一个待更新字段".into()));
+        }
+        if self.shard_spec().is_some() {
+            return Err(Error::Unsupported(format!(
+                "表 {} 是分表，条件更新请用具体分表句柄",
+                self.table.name
+            )));
+        }
+        let mut filter = self.pk_filter(pk)?;
+        for (column, value) in expected {
+            if self.table.column(column).is_none() {
+                return Err(Error::Model(format!(
+                    "表 {} 不存在列 {column}",
+                    self.table.name
+                )));
+            }
+            filter = filter.eq(*column, value.clone());
+        }
+        // 拦截器刷新审计字段（对应实体拦截器 OnValid）
+        let values = crate::interceptor::prepare(
+            self.table,
+            crate::interceptor::DataMethod::Update,
+            sets,
+        );
+        let (sql, params) = sqlbuild::update_sql_owned_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            values,
+            &filter,
+        )?;
+        self.dal.log_sql(&sql);
+        let affected = session.execute(&sql, &params)?;
+        // 成功 → 本进程缓存过期；冲突（0 行）→ 说明本进程读到的值已过期，同样必须失效，
+        // 否则调用方重读会继续命中旧缓存、永远冲突。
+        self.dal.invalidate_cache(self.physical_name());
+        Ok(affected)
+    }
+
     /// 按主键删除，返回受影响行数。
     ///
     /// 表带 `DataScale="timeShard:..."` 时**自动按分表路由**（按雪花主键解析时间；

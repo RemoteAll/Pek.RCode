@@ -23,6 +23,10 @@ pub enum Error {
     #[error("数据校验失败：{0}")]
     Validation(String),
 
+    /// 并发冲突（条件更新时行不存在，或期望列已被其它写入修改）
+    #[error("并发冲突：{0}")]
+    Conflict(String),
+
     /// 数据库访问错误
     #[error("数据库错误：{0}")]
     Db(String),
