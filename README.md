@@ -729,12 +729,18 @@ Pek.RCode/
 | ~~`FieldCache<T>`~~ | `Cache/FieldCache.cs` | ✅ **已实现**（`Dal::field_cache` + 生成 `xxx_list`） | 分类/字典下拉：每 10 分钟 1 次 `GROUP BY` |
 | ~~`SingleCache` 接入按主键查询~~ | 生成 `return Meta.SingleCache[id]` | ✅ **已接入** `Entity::find`（`MaxCacheCount>0`） | 主键热点读 0 次查询 |
 | ~~条件批量更新~~ | `EntityPersistence.Update(where,...)` | ✅ `TableRef::update_where` / `Entity::update_where` | 批量改同值：1 条语句改 N 行 |
+| ~~**`AdditionalFields`（原子累加）**~~ | `Entity/IEntityAddition.cs` | ✅ **已实现**（`TableRef::increment` / `increment_by_pk` / `Entity::increment`） | `Count = Count + n` 一条语句内完成，**并发不丢更新** |
 | ~~`Valid` / `OnValid` 校验钩子~~ | `Entity.Valid` | ✅ **已实现**（`Entity::validate` + `insert`/`update`/`insert_sharded` 写前拦截 + 生成必填校验 + `save_without_valid`） | 业务：统一校验，失败不发 SQL |
 | **`DbCache`**（业务键单实体缓存） | `Cache/DbCache.cs` | **有意不做**（需实体实现 `IDbCache`，本质是业务键缓存） | 用 `SingleCache` / `find_cached_by` / 业务表缓存替代 |
 | **`LongCount` 异步刷新** | `EntitySession.LongCount` | ⚠️ `Dal::cached_count` 为**同步** 60s 缓存 | 并发首次各有一次采样（已足够） |
 | `InsertOnly` 表跳过更新/查询方法生成 | `EntityBuilder` | ⚠️ 运行时拦截（`insert_only()` 已生成） | DX 为主 |
 | `Fields` 静态列元数据（`Order._.Name`） | `EntityBuilder` 生成 | **有意不做** | 运行时用 `TableMeta.columns` / `Entity::columns()` 即可 |
 | `Transform` 抽取器 | `Entity/Transform.cs` | **有意不做** | 用普通查询组装 |
+| `ValidHelper`（`Object`→强类型转换） | `Common/ValidHelper.cs` | **有意不做** | Rust 强类型 + `DbValue::as_*`；无装箱转换需求 |
+| `KeyedLocker`（8 桶键锁） | `Common/KeyedLocker.cs` | **有意不做** | 单机并发可用 `Mutex`/分片锁自建；跨进程去重应用层解决 |
+| `SearchBuilder`（UI 搜索→Where） | `Code/SearchBuilder.cs` | **有意不做** | `Where::new().like(..)` 组合即可 |
+| `WindowFunction`（行号/排名） | `DataAccessLayer/WindowFunction.cs` | **有意不做** | 需要时在 `Query` 里手写 SQL 片段 |
+| `Membership/*`（用户/角色/菜单/部门/地区） | `Membership/` | **有意不做** | .NET 特定（`IArea`/`IManageProvider`）；各项目用 `Pek.RAdmin` 或自研 |
 | 读写分离 `IgnoreTimes` | `ReadWriteStrategy` | **有意不做** | 用 `set_primary_only` 替代 |
 | Oracle/MySQL 参数数组式批量 Update | `IDbSession` | **有意不做** | 逐条回退语义等价 |
 | `HtmlBuilder`（Razor 页面生成） | `Code/HtmlBuilder.cs` | **有意不做** | 由 C# XCodeTool 继续使用 |
@@ -745,7 +751,11 @@ Pek.RCode/
 > 本轮已补齐：**`InsertOnly`（仅插入表）**、**`IsView`（视图禁写 + 跳过迁移）**、
 > **`MaxCacheCount`（小表自动走实体缓存 + 唯一索引 `find_by_xxx` 生成 + 60s 行数缓存）**、
 > **读写分离与只读连接**、**实体脏字段更新**、**批量写入族**、**缓存一致性（Blocking/SWR）+ 单飞刷新**、
-> **`Valid` 校验链（`validate` + 生成必填校验 + `save_without_valid`）**。
+> **`Valid` 校验链（`validate` + 生成必填校验 + `save_without_valid`）**、
+> **`AdditionalFields` 原子累加（`increment`）**。
+>
+> 驱动层能力对齐（2026-10-22 第十二轮）：**SQLite 语句缓存 + 参数借用**（`prepare_cached`、`ValueRef`）、
+> **MySQL 语句缓存**（`stmt_cache_size(64)`）、**PostgreSQL / SQL Server 参数借用化**（Text/Blob 不再逐列复制）。
 
 **已完成（2026-09-27 补迁移批次）**：
 

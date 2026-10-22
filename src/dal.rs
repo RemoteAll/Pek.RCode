@@ -2151,6 +2151,62 @@ impl<'a> TableRef<'a> {
         self.delete_where(session, &filter)
     }
 
+    /// **原子累加**（对应 DH.NCode 的 `AdditionalFields` / `Count = Count + n` 语义）。
+    ///
+    /// 由数据库在一条语句内完成「读-加-写」，并发安全、不会丢更新；
+    /// 比「读出实体 → 改值 → Save」少一次查询且无并发风险。
+    ///
+    /// - `deltas`：累加列与增量（必须是数值列；空则报错）；
+    /// - `filter`：条件（通常传主键；为空即全表，慎用）。
+    ///
+    /// 拦截器仍会补 `UpdateTime`（普通赋值），写入后相关缓存失效。
+    pub fn increment(
+        &self,
+        session: &mut dyn SqlSession,
+        deltas: &[(&str, DbValue)],
+        filter: &Where,
+    ) -> Result<u64> {
+        self.ensure_writable()?;
+        if deltas.is_empty() {
+            return Err(Error::Argument("原子累加至少需要一个累加字段".into()));
+        }
+        // 拦截器会把 `UpdateTime` 之类补进待写列；它们应作为「普通赋值」而非累加
+        let prepared = crate::interceptor::prepare(
+            self.table,
+            crate::interceptor::DataMethod::Update,
+            deltas,
+        );
+        let names: Vec<String> = deltas.iter().map(|(n, _)| n.to_string()).collect();
+        let (delta_values, assign_values): (Vec<_>, Vec<_>) = prepared
+            .into_iter()
+            .partition(|(name, _)| names.iter().any(|n| n.eq_ignore_ascii_case(name)));
+        let (sql, params) = sqlbuild::increment_sql_owned_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            delta_values,
+            assign_values,
+            filter,
+        )?;
+        self.dal.log_sql(&sql);
+        let affected = session.execute(&sql, &params)?;
+        if affected > 0 {
+            self.dal.invalidate_cache(self.physical_name());
+        }
+        Ok(affected)
+    }
+
+    /// 按主键原子累加（[`TableRef::increment`] 的便捷版）。
+    pub fn increment_by_pk(
+        &self,
+        session: &mut dyn SqlSession,
+        pk: &[DbValue],
+        deltas: &[(&str, DbValue)],
+    ) -> Result<u64> {
+        let filter = self.pk_filter(pk)?;
+        self.increment(session, deltas, &filter)
+    }
+
     /// 自然键 upsert：按 `keys` 查行（取主键），命中则 `update_by_pk` 更新 `values`，
     /// 未命中则插入 `keys + values + insert_extra`（`insert_extra` 为“仅插入”初值列，
     /// 如统计计数置零；更新路径不碰这些列）；返回是否为插入（true = 新增）。

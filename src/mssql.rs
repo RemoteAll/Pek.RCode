@@ -199,11 +199,11 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 /// SQL Server 参数：按 Rust 类型直接绑定（tiberius 的 RPC 参数声明类型）。
 #[derive(Debug)]
-struct MssqlParam(DbValue);
+struct MssqlParam<'a>(&'a DbValue);
 
-impl ToSql for MssqlParam {
+impl ToSql for MssqlParam<'_> {
     fn to_sql(&self) -> ColumnData<'_> {
-        match &self.0 {
+        match self.0 {
             // NULL 以文本 NULL 声明，SQL Server 会按目标列类型隐式转换
             DbValue::Null => ColumnData::String(None),
             DbValue::Bool(v) => v.to_sql(),
@@ -304,7 +304,7 @@ impl SqlSession for MssqlSession {
     }
 
     fn execute(&mut self, sql: &str, params: &[DbValue]) -> Result<u64> {
-        let bound: Vec<MssqlParam> = params.iter().cloned().map(MssqlParam).collect();
+        let bound: Vec<MssqlParam> = params.iter().map(MssqlParam).collect();
         let refs: Vec<&dyn ToSql> = bound.iter().map(|p| p as &dyn ToSql).collect();
         let client = &mut self.client;
 
@@ -315,7 +315,7 @@ impl SqlSession for MssqlSession {
     }
 
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
-        let bound: Vec<MssqlParam> = params.iter().cloned().map(MssqlParam).collect();
+        let bound: Vec<MssqlParam> = params.iter().map(MssqlParam).collect();
         let refs: Vec<&dyn ToSql> = bound.iter().map(|p| p as &dyn ToSql).collect();
         let client = &mut self.client;
 
@@ -456,33 +456,33 @@ mod tests {
     #[test]
     fn param_conversion() {
         assert_eq!(
-            MssqlParam(DbValue::Bool(true)).to_sql(),
+            MssqlParam(&DbValue::Bool(true)).to_sql(),
             ColumnData::Bit(Some(true))
         );
         assert_eq!(
-            MssqlParam(DbValue::Int(5)).to_sql(),
+            MssqlParam(&DbValue::Int(5)).to_sql(),
             ColumnData::I64(Some(5))
         );
         assert_eq!(
-            MssqlParam(DbValue::Float(1.5)).to_sql(),
+            MssqlParam(&DbValue::Float(1.5)).to_sql(),
             ColumnData::F64(Some(1.5))
         );
-        match MssqlParam(DbValue::Text("abc".into())).to_sql() {
+        match MssqlParam(&DbValue::Text("abc".into())).to_sql() {
             ColumnData::String(Some(v)) => assert_eq!(v, "abc"),
             other => panic!("文本应绑定为字符串：{other:?}"),
         }
-        match MssqlParam(DbValue::Blob(vec![1, 2])).to_sql() {
+        match MssqlParam(&DbValue::Blob(vec![1, 2])).to_sql() {
             ColumnData::Binary(Some(v)) => assert_eq!(&v[..], &[1, 2]),
             other => panic!("二进制应绑定为 varbinary：{other:?}"),
         }
         let d = "12.3400".parse::<rust_decimal::Decimal>().unwrap();
-        match MssqlParam(DbValue::Decimal(d)).to_sql() {
+        match MssqlParam(&DbValue::Decimal(d)).to_sql() {
             ColumnData::Numeric(Some(_)) => {}
             other => panic!("Decimal 应绑定为 numeric：{other:?}"),
         }
         // NULL 以文本 NULL 声明
         assert_eq!(
-            MssqlParam(DbValue::Null).to_sql(),
+            MssqlParam(&DbValue::Null).to_sql(),
             ColumnData::String(None)
         );
     }

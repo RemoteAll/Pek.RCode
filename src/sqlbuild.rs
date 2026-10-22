@@ -754,6 +754,58 @@ fn default_order_columns(table: &TableMeta) -> Vec<String> {
         .collect()
 }
 
+/// 组装「原子累加」UPDATE 语句：`SET 列 = 列 + @n`（对应 DH.NCode 的 `AdditionalFields` 语义）。
+///
+/// - `deltas`：累加列与增量（**列必须已存在**，类型由数据库隐式提升；文本列会报错，属预期）；
+/// - `assigns`：普通赋值列（如拦截器补的 `UpdateTime`）；
+/// - `filter`：条件（为空即全表，慎用；调用方通常传主键）。
+///
+/// 与 [`update_sql_owned_named`] 的区别：累加写成 `列 = 列 + 增量`，
+/// 由数据库在**一条语句内**完成读-加-写，天然并发安全（不会丢更新）。
+pub fn increment_sql_owned_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    deltas: Vec<(String, DbValue)>,
+    assigns: Vec<(String, DbValue)>,
+    filter: &Where,
+) -> Result<(String, Vec<DbValue>)> {
+    if deltas.is_empty() {
+        return Err(Error::Model(format!(
+            "表 {} 的累加语句至少需要一个累加字段",
+            table.name
+        )));
+    }
+
+    let mut params = Vec::with_capacity(deltas.len() + assigns.len() + 4);
+    let mut parts = Vec::with_capacity(deltas.len() + assigns.len());
+
+    for (field, value) in deltas {
+        let column = kind.quote(column_name(table, &field)?);
+        let mark = kind.placeholder(params.len());
+        parts.push(format!("{column} = {column} + {mark}"));
+        params.push(value);
+    }
+    for (field, value) in assigns {
+        let mark = kind.placeholder(params.len());
+        parts.push(format!("{} = {mark}", kind.quote(column_name(table, &field)?)));
+        params.push(value);
+    }
+
+    let where_sql = filter.render(kind, &mut params);
+    let mut sql = format!(
+        "UPDATE {} SET {}",
+        kind.quote(table_name),
+        parts.join(", ")
+    );
+    if !where_sql.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_sql);
+    }
+
+    Ok((sql, params))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,3 +1270,4 @@ mod tests {
         );
     }
 }
+

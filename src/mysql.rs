@@ -232,6 +232,10 @@ fn build_opts(settings: &MysqlSettings, tls: bool) -> Opts {
     // v28 无 charset 选项：通过会话初始化命令设置（字符集已严格校验）
     builder = builder.init(vec![format!("SET NAMES {}", settings.charset)]);
 
+    // 预编译语句缓存：`mysql` crate 的 `exec`/`exec_iter` 按 SQL 文本复用已编译语句，
+    // 默认容量较小；ORM 生成的 SQL 高度同构（同表同列），调大后同构 SQL 只编译一次。
+    builder = builder.stmt_cache_size(64);
+
     if let Some(db) = &settings.database {
         builder = builder.db_name(Some(db.clone()));
     }

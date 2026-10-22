@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::dialect::DatabaseKind;
 use crate::error::Result;
@@ -69,8 +69,44 @@ pub(crate) type SessionFactory = Arc<dyn Fn() -> Result<Box<dyn SqlSession>> + S
 struct IdleSession {
     /// 会话
     session: Box<dyn SqlSession>,
-    /// 归还时刻
-    since: Instant,
+    /// 归还时刻（粗时钟毫秒；见 [`coarse_now_ms`]）
+    since_ms: u64,
+}
+
+/// 系统粗时钟（毫秒）。
+///
+/// 为什么不用 `Instant::now()`：Windows 上它是 `QueryPerformanceCounter`，实测≈60 ns；
+/// 而一次会话借还总共才 150 ns —— 两次取时间就占了 **78%**（实测 118.4 ns）。
+/// 空闲超时是秒级判定，1 ms 精度完全够用：
+/// - Windows：`GetTickCount64`（系统启动毫秒数，~3 ns，直接链接 kernel32，无需额外依赖）
+/// - Unix：进程内固定 epoch 的 `Instant::elapsed()`（vDSO，~20 ns）
+#[inline]
+fn coarse_now_ms() -> u64 {
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            safe fn GetTickCount64() -> u64;
+        }
+        GetTickCount64()
+    }
+    #[cfg(unix)]
+    {
+        use std::sync::OnceLock;
+        static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+        EPOCH
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        use std::sync::OnceLock;
+        static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+        EPOCH
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
 }
 
 /// 空闲队列分片数：按 CPU 核数（2–16）。
@@ -99,6 +135,8 @@ pub struct SessionPool {
     shards: Box<[Mutex<VecDeque<IdleSession>>]>,
     /// 每分片空闲上限（总量≈`options.max`）
     per_shard_cap: usize,
+    /// 空闲超时（毫秒，避免每次比较重新转换）
+    idle_time_ms: u64,
     /// 分片分配计数器
     next_shard: AtomicUsize,
     /// 累计创建（每分片独立计数：高并发下各线程只写自己的 cacheline，避免伪共享）
@@ -129,6 +167,7 @@ impl SessionPool {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             per_shard_cap,
+            idle_time_ms: options.idle_time.as_millis() as u64,
             next_shard: AtomicUsize::new(0),
             created: (0..shards).map(|_| AtomicU64::new(0)).collect(),
             reused: (0..shards).map(|_| AtomicU64::new(0)).collect(),
@@ -222,27 +261,27 @@ impl SessionPool {
     /// 归还会话（仅供 `PooledSession` 调用）。
     fn checkin(&self, session: Box<dyn SqlSession>) {
         let index = self.shard_index();
-        if self.per_shard_cap == 0 {
+        // `max=0` 或 `idle_time=0` 都表示「不缓存空闲会话」（后者对齐原有语义）
+        if self.per_shard_cap == 0 || self.idle_time_ms == 0 {
             self.note_discard(index);
             return;
         }
+        let since_ms = coarse_now_ms();
         let mut idle = lock(&self.shards[index]);
-        self.sweep_expired(&mut idle, index);
+        self.sweep_expired(&mut idle, index, since_ms);
         if idle.len() >= self.per_shard_cap {
             self.note_discard(index);
             return;
         }
-        idle.push_back(IdleSession {
-            session,
-            since: Instant::now(),
-        });
+        idle.push_back(IdleSession { session, since_ms });
     }
 
     /// 从指定分片取出一个未过期的空闲会话（顺带清理过期项）。
     fn take_idle(&self, index: usize) -> Option<Box<dyn SqlSession>> {
+        let now_ms = coarse_now_ms();
         let mut idle = lock(&self.shards[index]);
         while let Some(entry) = idle.pop_front() {
-            if entry.since.elapsed() <= self.options.idle_time {
+            if now_ms.saturating_sub(entry.since_ms) <= self.idle_time_ms {
                 return Some(entry.session);
             }
             self.note_discard(index);
@@ -251,9 +290,9 @@ impl SessionPool {
     }
 
     /// 清理队首的过期会话（FIFO 队列，过期者必在队首连续分布）。
-    fn sweep_expired(&self, idle: &mut VecDeque<IdleSession>, index: usize) {
+    fn sweep_expired(&self, idle: &mut VecDeque<IdleSession>, index: usize, now_ms: u64) {
         while let Some(entry) = idle.front() {
-            if entry.since.elapsed() > self.options.idle_time {
+            if now_ms.saturating_sub(entry.since_ms) > self.idle_time_ms {
                 idle.pop_front();
                 self.note_discard(index);
             } else {

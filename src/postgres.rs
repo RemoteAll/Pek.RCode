@@ -488,31 +488,25 @@ mod rustls_tls {
 /// 布尔 `true/false`、DECIMAL 定长文本、`bytea` 的 `\x` 十六进制、
 /// 时间 `yyyy-MM-dd HH:mm:ss.fffffff` 均被 PostgreSQL 接受。
 #[derive(Debug)]
-struct PgParam(DbValue);
+struct PgParam<'a>(&'a DbValue);
 
-impl ToSql for PgParam {
+impl ToSql for PgParam<'_> {
     fn to_sql(
         &self,
         _ty: &Type,
         out: &mut BytesMut,
     ) -> std::result::Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        let text = match &self.0 {
+        // 注意：`Text`/`Blob` 直接借用写出（不复制）；数值类才格式化
+        match self.0 {
             DbValue::Null => return Ok(IsNull::Yes),
-            DbValue::Bool(v) => {
-                if *v {
-                    "true".to_string()
-                } else {
-                    "false".to_string()
-                }
-            }
-            DbValue::Int(v) => v.to_string(),
-            DbValue::Float(v) => v.to_string(),
-            DbValue::Decimal(v) => v.to_string(),
-            DbValue::Text(v) => v.clone(),
-            DbValue::Blob(v) => format!("\\x{}", to_hex(v)),
-            DbValue::DateTime(v) => format_datetime(v),
-        };
-        out.extend_from_slice(text.as_bytes());
+            DbValue::Bool(v) => out.extend_from_slice(if *v { b"true" } else { b"false" }),
+            DbValue::Int(v) => out.extend_from_slice(v.to_string().as_bytes()),
+            DbValue::Float(v) => out.extend_from_slice(v.to_string().as_bytes()),
+            DbValue::Decimal(v) => out.extend_from_slice(v.to_string().as_bytes()),
+            DbValue::Text(v) => out.extend_from_slice(v.as_bytes()),
+            DbValue::Blob(v) => out.extend_from_slice(format!("\\x{}", to_hex(v)).as_bytes()),
+            DbValue::DateTime(v) => out.extend_from_slice(format_datetime(v).as_bytes()),
+        }
         Ok(IsNull::No)
     }
 
@@ -607,13 +601,13 @@ impl SqlSession for PostgresSession {
     }
 
     fn execute(&mut self, sql: &str, params: &[DbValue]) -> Result<u64> {
-        let bound: Vec<PgParam> = params.iter().cloned().map(PgParam).collect();
+        let bound: Vec<PgParam> = params.iter().map(PgParam).collect();
         let refs: Vec<&(dyn ToSql + Sync)> = bound.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
         self.client.execute(sql, &refs).map_err(map_err)
     }
 
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
-        let bound: Vec<PgParam> = params.iter().cloned().map(PgParam).collect();
+        let bound: Vec<PgParam> = params.iter().map(PgParam).collect();
         let refs: Vec<&(dyn ToSql + Sync)> = bound.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
         // 预编译后取列信息：空结果集也能返回列名（与其它驱动行为一致）
@@ -842,7 +836,7 @@ mod tests {
     #[test]
     fn param_text_encoding() {
         let mut buffer = BytesMut::new();
-        let param = PgParam(DbValue::Int(42));
+        let param = PgParam(&DbValue::Int(42));
         assert!(matches!(
             param.to_sql(&Type::INT8, &mut buffer),
             Ok(IsNull::No)
@@ -850,20 +844,20 @@ mod tests {
         assert_eq!(&buffer[..], b"42");
 
         let mut buffer = BytesMut::new();
-        let _ = PgParam(DbValue::Bool(true)).to_sql(&Type::BOOL, &mut buffer);
+        let _ = PgParam(&DbValue::Bool(true)).to_sql(&Type::BOOL, &mut buffer);
         assert_eq!(&buffer[..], b"true");
 
         // NULL 不写入内容
         let mut buffer = BytesMut::new();
         assert!(matches!(
-            PgParam(DbValue::Null).to_sql(&Type::TEXT, &mut buffer),
+            PgParam(&DbValue::Null).to_sql(&Type::TEXT, &mut buffer),
             Ok(IsNull::Yes)
         ));
         assert!(buffer.is_empty());
 
         // 二进制 → bytea 十六进制文本
         let mut buffer = BytesMut::new();
-        let _ = PgParam(DbValue::Blob(vec![0x01, 0xab, 0xff])).to_sql(&Type::BYTEA, &mut buffer);
+        let _ = PgParam(&DbValue::Blob(vec![0x01, 0xab, 0xff])).to_sql(&Type::BYTEA, &mut buffer);
         assert_eq!(&buffer[..], b"\\x01abff");
 
         // 时间 → 7 位小数秒文本（PostgreSQL 解析为微秒精度）
@@ -872,7 +866,7 @@ mod tests {
             .and_hms_micro_opt(18, 1, 2, 123_000)
             .unwrap();
         let mut buffer = BytesMut::new();
-        let _ = PgParam(DbValue::DateTime(dt)).to_sql(&Type::TIMESTAMP, &mut buffer);
+        let _ = PgParam(&DbValue::DateTime(dt)).to_sql(&Type::TIMESTAMP, &mut buffer);
         assert_eq!(
             String::from_utf8(buffer.to_vec()).unwrap(),
             "2026-09-26 18:01:02.1230000"
@@ -881,7 +875,7 @@ mod tests {
         // DECIMAL 保持文本精度
         let mut buffer = BytesMut::new();
         let d = "12.3400".parse::<Decimal>().unwrap();
-        let _ = PgParam(DbValue::Decimal(d)).to_sql(&Type::NUMERIC, &mut buffer);
+        let _ = PgParam(&DbValue::Decimal(d)).to_sql(&Type::NUMERIC, &mut buffer);
         assert_eq!(&buffer[..], b"12.3400");
     }
 }

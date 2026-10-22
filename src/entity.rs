@@ -533,6 +533,39 @@ pub trait Entity: Sized {
         dal.table(Self::table())?.update_where(session, sets, filter)
     }
 
+    /// **原子累加并回读**（对应 DH.NCode 的 `AdditionalFields`：`Count = Count + n`）。
+    ///
+    /// 一条 `UPDATE ... SET Count = Count + ?` 完成累加：并发安全、不会丢更新，
+    /// 也不需要「先查再改」。成功后把新值写回本对象（调用方拿到的对象与库内一致）。
+    ///
+    /// 返回受影响行数（主键不存在时为 0）。
+    fn increment(
+        &mut self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        deltas: &[(&str, DbValue)],
+    ) -> Result<u64> {
+        Self::ensure_writable()?;
+        if deltas.is_empty() {
+            return Ok(0);
+        }
+        let table = dal.table(Self::table())?;
+        let pk = pk_values_of(&self.to_fields(), Self::primary_keys())?;
+        let affected = table.increment_by_pk(session, &pk, deltas)?;
+        if affected == 0 {
+            return Ok(0);
+        }
+        // 库内已是「原值 + 增量」，同步到对象（取不到旧值的列保持不动）
+        for (column, delta) in deltas {
+            if let Some(current) = self.column_value(column)
+                && let Some(sum) = add_values(&current, delta)
+            {
+                let _ = self.set_field(column, sum);
+            }
+        }
+        Ok(affected)
+    }
+
     /// 按指定的列集合更新（显式列集；对应 C# `Entity.Update(names, values)`）。
     ///
     /// - 用于“只想更新少数列”的窄更新场景（底层走 [`TableRef::update_by_pk`]）；
@@ -1858,3 +1891,19 @@ pub trait AuditExt: Entity {
 }
 
 impl<T: Entity> AuditExt for T {}
+
+/// 数值相加（用于 [`Entity::increment`] 把库内的新值同步回对象）。
+///
+/// 只处理数值类型；类型不匹配（如 Text + Int）返回 `None`（由数据库侧报错或业务自行处理）。
+fn add_values(current: &DbValue, delta: &DbValue) -> Option<DbValue> {
+    match (current, delta) {
+        (DbValue::Int(a), DbValue::Int(b)) => Some(DbValue::Int(a.wrapping_add(*b))),
+        (DbValue::Float(a), DbValue::Float(b)) => Some(DbValue::Float(a + b)),
+        (DbValue::Int(a), DbValue::Float(b)) => Some(DbValue::Float(*a as f64 + b)),
+        (DbValue::Float(a), DbValue::Int(b)) => Some(DbValue::Float(a + *b as f64)),
+        (DbValue::Decimal(a), DbValue::Decimal(b)) => Some(DbValue::Decimal(*a + *b)),
+        (DbValue::Decimal(a), DbValue::Int(b)) => Some(DbValue::Decimal(*a + rust_decimal::Decimal::from(*b))),
+        (DbValue::Int(a), DbValue::Decimal(b)) => Some(DbValue::Decimal(rust_decimal::Decimal::from(*a) + *b)),
+        _ => None,
+    }
+}
