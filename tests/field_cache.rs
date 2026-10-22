@@ -122,3 +122,64 @@ fn field_cache_is_shared_per_table_and_column() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 表级 `find_cached_by`：小表按唯一键查询走整表缓存（手写结构体消费方用）。
+#[test]
+fn table_find_cached_by_uses_entity_cache_and_invalidates() {
+    let (dir, dal) = setup("table-find");
+    let table = dal.table("Article").unwrap();
+    let mut session = dal.open_session().unwrap();
+
+    table
+        .insert(session.as_mut(), &[("Category", DbValue::Text("Redis".into()))])
+        .unwrap();
+
+    // 首次命中（此时可能走 SQL），字符串忽略大小写
+    let row = table
+        .find_cached_by(&dal, session.as_mut(), &[("Category", DbValue::Text("redis".into()))])
+        .unwrap()
+        .expect("应能按唯一键查到");
+    assert_eq!(
+        row.get_by_name("Category").map(DbValue::to_text).as_deref(),
+        Some("Redis")
+    );
+
+    // 再查一次：应命中缓存（行数 < MaxCacheCount），结果一致
+    let again = table
+        .find_cached_by(&dal, session.as_mut(), &[("Category", DbValue::Text("REDIS".into()))])
+        .unwrap()
+        .expect("缓存命中");
+    assert_eq!(
+        again.get_by_name("Id").and_then(DbValue::as_i64),
+        row.get_by_name("Id").and_then(DbValue::as_i64)
+    );
+
+    // 未命中
+    assert!(
+        table
+            .find_cached_by(&dal, session.as_mut(), &[("Category", DbValue::Text("Nope".into()))])
+            .unwrap()
+            .is_none()
+    );
+
+    // 写入后缓存失效：新行立即可查
+    table
+        .insert(session.as_mut(), &[("Category", DbValue::Text("Kafka".into()))])
+        .unwrap();
+    assert!(
+        table
+            .find_cached_by(&dal, session.as_mut(), &[("Category", DbValue::Text("Kafka".into()))])
+            .unwrap()
+            .is_some(),
+        "写入后缓存应失效，新行立即可查"
+    );
+
+    // 空键拒绝（避免退化为"取首行"的危险语义）
+    assert!(
+        table
+            .find_cached_by(&dal, session.as_mut(), &[])
+            .is_err()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

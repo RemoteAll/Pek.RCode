@@ -1801,8 +1801,9 @@ fn is_empty_pk_value(value: &DbValue) -> bool {
 /// 结果集列的取值与键值是否匹配（实体缓存内存匹配用）。
 ///
 /// 字符串忽略大小写（与 SQLite `COLLATE NOCASE`、C# `EqualIgnoreCase` 一致），其余按值相等。
-fn row_value_matches(row_value: Option<&DbValue>, key: &DbValue) -> bool {
+pub(crate) fn row_value_matches(row_value: Option<&DbValue>, key: &DbValue) -> bool {
     match (row_value, key) {
+        // 缓存匹配对字符串忽略大小写（与数据库的排序规则差异解耦）
         (Some(DbValue::Text(left)), DbValue::Text(right)) => left.eq_ignore_ascii_case(right),
         (Some(left), right) => left == right,
         (None, DbValue::Null) => true,

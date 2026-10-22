@@ -2151,6 +2151,45 @@ impl<'a> TableRef<'a> {
         self.delete_where(session, &filter)
     }
 
+    /// 按唯一键查一行（**小表自动走整表缓存，零 SQL**）。
+    ///
+    /// 与 [`Entity::find_cached_by`](crate::Entity::find_cached_by) 同一套语义，供
+    /// **手写结构体 + 表级 API** 的消费方使用（不依赖对象实体）：
+    /// - 表行数 < `Model.xml` 的 `MaxCacheCount` → 整表缓存内存匹配（字符串忽略大小写）；
+    /// - 否则退化为 `WHERE ... LIMIT 1`。
+    ///
+    /// 返回 `None` 表示没查到（或缓存里没有匹配项）。
+    pub fn find_cached_by(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        key: &[(&str, DbValue)],
+    ) -> Result<Option<crate::session::DbRow>> {
+        if key.is_empty() {
+            return Err(Error::Argument("按唯一键查询至少需要一个键".into()));
+        }
+        let max = self.table.max_cache_count;
+        if max > 0 && dal.cached_count(&self.table.name, session)? < i64::from(max) {
+            let cache = dal.entity_cache(&self.table.name)?;
+            let rows = cache.entities(dal, session)?;
+            for row in rows.iter() {
+                if key
+                    .iter()
+                    .all(|(column, value)| crate::entity::row_value_matches(row.get_by_name(column), value))
+                {
+                    return Ok(Some(row.clone()));
+                }
+            }
+            return Ok(None);
+        }
+        let mut filter = Where::new();
+        for (column, value) in key {
+            filter = filter.eq(*column, value.clone());
+        }
+        let set = self.query(session, &Query::new().filter(filter).take(1))?;
+        Ok(set.rows.into_iter().next())
+    }
+
     /// **原子累加**（对应 DH.NCode 的 `AdditionalFields` / `Count = Count + n` 语义）。
     ///
     /// 由数据库在一条语句内完成「读-加-写」，并发安全、不会丢更新；
