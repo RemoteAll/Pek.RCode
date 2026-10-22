@@ -387,6 +387,41 @@ order.delete(&dal, session.as_mut())?;
 **表名 / 连接名生成规则与 C# 完全一致**（`TablePolicy` / `ConnPolicy` 模板 + .NET 日期格式子集），
 两边可直接共用同一批数据库表。模型列标注 `DataScale="timeShard:表模板[:连接模板]"` 后，`rcodegen` 会生成 `shard_policy()`。
 
+#### 透明分表（表级 API 自动路由，对齐 C# `Meta.ShardPolicy`）
+
+模型里声明 `DataScale="timeShard:..."` 后，**表级 CRUD 无需显式调用 `*_sharded`**：
+
+```rust
+let table = dal.table("WmsLog")?;          // 模型里 CreateTime 有 DataScale="timeShard:yyyyMMdd"
+
+// 写入：按 CreateTime 路由到 WmsLog_20260927（不存在时自动建表）
+table.insert(session.as_mut(), &[("CreateTime", time.into()), ("Note", "x".into())])?;
+
+// 查询/计数/条件删除：按 Where 中的时间区间跨分表
+let filter = Where::new().ge("CreateTime", start).lt("CreateTime", end);
+let rows = table.query(session.as_mut(), &Query::new().filter(filter.clone()))?;
+let n = table.count(session.as_mut(), Some(&filter))?;
+let deleted = table.delete_where(session.as_mut(), &filter)?;
+
+// 批量写入：按分表字段逐行分组（对齐 C# BatchInsert 分表分支）
+table.insert_batch(session.as_mut(), &rows, None)?;
+
+// 按主键：雪花 Id 主键表可按主键解析时间自动路由
+table.update_by_pk(session.as_mut(), &[("Note", "y".into())], &[id.into()])?;
+table.delete_by_pk(session.as_mut(), &[id.into()])?;
+```
+
+规则（与 C# 逐条对齐）：
+
+| 场景 | 行为 |
+|---|---|
+| 无条件查询 / 条件里没有分表字段 | 查**模型默认表**（C# `where == null` 同样不走分表） |
+| 目标分表不存在 | 写入自动建表（受迁移档位约束）；更新/删除返回 0 |
+| 显式物理表 `dal.table_as(name, "X_20260927")` | **永不自动分表**（分表引擎内部依赖此机制防递归） |
+| 分表字段是雪花 `Int64` 主键 | 按雪花解析时间路由（`update_by_pk`/`delete_by_pk` 也可用） |
+
+#### 显式分表 API（需要自选分片/区间遍历时）
+
 ```rust
 let policy = WmsLog::shard_policy();
 // 或手工构造：

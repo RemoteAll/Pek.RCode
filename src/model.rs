@@ -178,6 +178,57 @@ impl TableMeta {
             _ => &column.name,
         }
     }
+
+    /// 时间分表规格（`None` = 该表不分表）。
+    ///
+    /// 来源：某列的 `DataScale="timeShard:表模板[:连接模板]"`（对应 C# `EntityBuilder.BuildShardPolicy`）。
+    /// 模板按 C# 规则包装为 `{0}_{1:段}`：
+    /// - `timeShard:dd` → 表模板 `{0}_{1:dd}`（按天分表）；
+    /// - `timeShard:yyyyMMdd:yyyy` → 表模板 `{0}_{1:yyyyMMdd}` + 连接模板 `{0}_{1:yyyy}`（按天分表 + 按年分库）。
+    ///
+    /// `field` 取**物理列名**，与 [`crate::dal::TableRef::insert`] 的列名、`Where` 条件的列名一致。
+    pub fn shard_spec(&self) -> Option<ShardSpec> {
+        let column = self.columns.iter().find(|c| {
+            c.data_scale
+                .as_deref()
+                .is_some_and(|v| v.trim().to_ascii_lowercase().starts_with("timeshard:"))
+        })?;
+        let raw = column.data_scale.as_deref().unwrap_or("").trim();
+        let mut parts = raw.split(':');
+        parts.next(); // 前缀 timeShard
+        let table_part = parts.next().unwrap_or("").trim();
+        let conn_part = parts.next().unwrap_or("").trim();
+        if table_part.is_empty() && conn_part.is_empty() {
+            return None;
+        }
+        let wrap = |p: &str| format!("{{0}}_{{1:{p}}}");
+        Some(ShardSpec {
+            field: self.effective_column_name(column).to_string(),
+            table_policy: if table_part.is_empty() {
+                String::new()
+            } else {
+                wrap(table_part)
+            },
+            conn_policy: if conn_part.is_empty() {
+                String::new()
+            } else {
+                wrap(conn_part)
+            },
+        })
+    }
+}
+
+/// 时间分表规格（`DataScale="timeShard:表模板[:连接模板]"` 的解析结果）。
+///
+/// 只做"描述"，执行由 [`crate::shards::TimeShardPolicy`] 完成（见 `ShardSpec::to_policy`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardSpec {
+    /// 分表字段（物理列名）
+    pub field: String,
+    /// 表名模板（`{0}_{1:...}`；空 = 不按表拆）
+    pub table_policy: String,
+    /// 连接名模板（`{0}_{1:...}`；空 = 不按库拆）
+    pub conn_policy: String,
 }
 
 /// 数据列定义（`<Column>`）。

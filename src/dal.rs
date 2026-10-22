@@ -196,6 +196,8 @@ pub struct Dal {
     pub(crate) count_cache: RwLock<HashMap<String, (i64, std::time::Instant)>>,
     /// 模型表名索引（小写实体名/物理表名 → 表下标；避免每次操作线性扫 176 表）
     table_index: OnceLock<HashMap<String, usize>>,
+    /// 时间分表规格（表名 → 规格；解析期算一次，未命中即"不分表"）
+    shard_specs: OnceLock<HashMap<String, Arc<crate::model::ShardSpec>>>,
     /// 会话连接池（懒创建；`Pooling=false` 时不使用）
     pool: OnceLock<Arc<SessionPool>>,
     /// 是否启用连接池
@@ -480,6 +482,7 @@ impl Dal {
             field_caches: Mutex::new(HashMap::new()),
             count_cache: RwLock::new(HashMap::new()),
             table_index: OnceLock::new(),
+            shard_specs: OnceLock::new(),
             pool: OnceLock::new(),
             pool_enabled,
             readonly: AtomicBool::new(readonly),
@@ -807,7 +810,27 @@ impl Dal {
             dal: self,
             table,
             table_name: None,
+            shard: self.shard_spec_of(table),
         })
+    }
+
+    /// 表的时间分表规格（`None` = 不分表）。
+    ///
+    /// 模型解析期算一次并缓存（表名 → 规格）；非分表表命中空表，仅一次 HashMap 查找。
+    fn shard_spec_of(&self, table: &TableMeta) -> Option<Arc<crate::model::ShardSpec>> {
+        let specs = self.shard_specs.get_or_init(|| {
+            let mut map: HashMap<String, Arc<crate::model::ShardSpec>> = HashMap::new();
+            let Some(model) = self.model.as_ref() else {
+                return map;
+            };
+            for item in &model.tables {
+                if let Some(spec) = item.shard_spec() {
+                    map.insert(item.name.clone(), Arc::new(spec));
+                }
+            }
+            map
+        });
+        specs.get(&table.name).cloned()
     }
 
     /// 按实体名/物理表名取表定义（**走表名索引**，O(1)）。
@@ -832,6 +855,8 @@ impl Dal {
     pub fn table_as(&self, name: &str, table_name: &str) -> Result<TableRef<'_>> {
         let mut handle = self.table(name)?;
         handle.table_name = Some(table_name.to_string());
+        // 显式指定物理表 = 调用方已自行路由（分表引擎内部走这里），**不再自动分表**（防递归）
+        handle.shard = None;
         Ok(handle)
     }
 
@@ -1638,6 +1663,9 @@ pub struct TableRef<'a> {
     table: &'a TableMeta,
     /// 物理表名覆盖（分表场景：模型表 → 分表物理表；None 时用模型的物理名）
     table_name: Option<String>,
+    /// 时间分表规格（`Some` = 表级 `DataScale="timeShard:..."`，CRUD 自动路由；
+    /// 显式物理表（[`Dal::table_as`]）时为 `None`，防递归）
+    shard: Option<Arc<crate::model::ShardSpec>>,
 }
 
 impl<'a> TableRef<'a> {
@@ -1651,6 +1679,11 @@ impl<'a> TableRef<'a> {
         self.table_name
             .as_deref()
             .unwrap_or_else(|| self.table.effective_table_name())
+    }
+
+    /// 时间分表规格（`None` = 不分表；[`Dal::table_as`] 显式物理表恒为 `None`）。
+    pub(crate) fn shard_spec(&self) -> Option<&crate::model::ShardSpec> {
+        self.shard.as_deref()
     }
 
     /// 所属数据访问层。
@@ -1723,6 +1756,19 @@ impl<'a> TableRef<'a> {
 
     /// 插入一行（**已执行拦截器补全**且列集合已拥有：值移入 SQL 参数）。
     pub(crate) fn insert_prepared_owned(
+        &self,
+        session: &mut dyn SqlSession,
+        fields: Vec<(String, DbValue)>,
+    ) -> Result<i64> {
+        // 透明分表：表带 `DataScale="timeShard:..."` 时按分表字段值路由
+        if let Some(spec) = self.shard_spec().cloned() {
+            return self.insert_auto_sharded(session, &spec, fields);
+        }
+        self.insert_prepared_owned_single(session, fields)
+    }
+
+    /// 插入一行（**单表**实现：不做分表路由，分表引擎内部直接调用）。
+    pub(crate) fn insert_prepared_owned_single(
         &self,
         session: &mut dyn SqlSession,
         fields: Vec<(String, DbValue)>,
@@ -1826,6 +1872,21 @@ impl<'a> TableRef<'a> {
 
     /// 通用批量写入（**已执行拦截器补全**的行；分表批量路径复用，避免拦截器重复执行）。
     pub(crate) fn write_batch_prepared(
+        &self,
+        session: &mut dyn SqlSession,
+        rows: &[Vec<(String, DbValue)>],
+        mode: BatchWriteMode,
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        // 透明分表：按分表字段逐行分组后分组写入（对齐 C# `BatchInsert` 的分表分支）
+        if let Some(spec) = self.shard_spec().cloned() {
+            return self.write_batch_auto_sharded(session, &spec, rows, mode, batch_size);
+        }
+        self.write_batch_prepared_single(session, rows, mode, batch_size)
+    }
+
+    /// 通用批量写入（**单表**实现：不分组）。
+    pub(crate) fn write_batch_prepared_single(
         &self,
         session: &mut dyn SqlSession,
         rows: &[Vec<(String, DbValue)>],
@@ -2107,7 +2168,28 @@ impl<'a> TableRef<'a> {
     }
 
     /// 按主键查找（主键值按 `TableMeta::primary_keys()` 顺序传入）。
+    ///
+    /// 表带 `DataScale="timeShard:..."` 且**主键为雪花 Id** 时自动路由到对应分表
+    /// （无法从主键推时间时按模型默认表查，与 C# 一致）。
     pub fn find_by_pk(&self, session: &mut dyn SqlSession, pk: &[DbValue]) -> Result<Option<DbRow>> {
+        if let Some(spec) = self.shard_spec().cloned()
+            && let Ok(shard) = self.auto_shard_model(&spec, None, pk)
+        {
+            return Ok(self
+                .run_on_shard(session, &shard, false, |table, session| {
+                    table.find_by_pk_single(session, pk)
+                })?
+                .flatten());
+        }
+        self.find_by_pk_single(session, pk)
+    }
+
+    /// 按主键查找（**单表**实现）。
+    pub(crate) fn find_by_pk_single(
+        &self,
+        session: &mut dyn SqlSession,
+        pk: &[DbValue],
+    ) -> Result<Option<DbRow>> {
         let filter = self.pk_filter(pk)?;
         let query = Query::new().filter(filter).take(1);
         let (sql, params) =
@@ -2118,7 +2200,23 @@ impl<'a> TableRef<'a> {
     }
 
     /// 按主键更新，返回受影响行数。
+    ///
+    /// 表带 `DataScale="timeShard:..."` 时**自动按分表路由**（分片字段优先取 `sets`，
+    /// 其次按雪花主键解析；目标分表不存在时返回 0，不建表）。
     pub fn update_by_pk(
+        &self,
+        session: &mut dyn SqlSession,
+        sets: &[(&str, DbValue)],
+        pk: &[DbValue],
+    ) -> Result<u64> {
+        if let Some(spec) = self.shard_spec().cloned() {
+            return self.update_by_pk_auto_sharded(session, &spec, sets, pk);
+        }
+        self.update_by_pk_single(session, sets, pk)
+    }
+
+    /// 按主键更新（**单表**实现）。
+    pub(crate) fn update_by_pk_single(
         &self,
         session: &mut dyn SqlSession,
         sets: &[(&str, DbValue)],
@@ -2187,9 +2285,24 @@ impl<'a> TableRef<'a> {
     }
 
     /// 按主键删除，返回受影响行数。
+    ///
+    /// 表带 `DataScale="timeShard:..."` 时**自动按分表路由**（按雪花主键解析时间；
+    /// 目标分表不存在时返回 0）。
     pub fn delete_by_pk(&self, session: &mut dyn SqlSession, pk: &[DbValue]) -> Result<u64> {
+        if let Some(spec) = self.shard_spec().cloned() {
+            return self.delete_by_pk_auto_sharded(session, &spec, pk);
+        }
+        self.delete_by_pk_single(session, pk)
+    }
+
+    /// 按主键删除（**单表**实现）。
+    pub(crate) fn delete_by_pk_single(
+        &self,
+        session: &mut dyn SqlSession,
+        pk: &[DbValue],
+    ) -> Result<u64> {
         let filter = self.pk_filter(pk)?;
-        self.delete_where(session, &filter)
+        self.delete_where_single(session, &filter)
     }
 
     /// 按唯一键查一行（**小表自动走整表缓存，零 SQL**）。
@@ -2352,8 +2465,21 @@ impl<'a> TableRef<'a> {
 
     /// 按条件删除，返回受影响行数（空条件会清空全表，请先用 [`Where::is_empty`] 防护）。
     ///
-    /// 对应 C# `Entity.Delete(Expression)` 的单表部分；分表删除见 [`TableRef::delete_sharded`](crate::dal::TableRef::delete_sharded)。
+    /// 对应 C# `Entity.Delete(Expression)`；表带 `DataScale="timeShard:..."` 时**自动按分表路由**
+    /// （语义见 [`crate::shards`]）。
     pub fn delete_where(&self, session: &mut dyn SqlSession, filter: &Where) -> Result<u64> {
+        if let Some(spec) = self.shard_spec().cloned() {
+            return self.delete_sharded(session, &crate::shards::policy_of(&spec), filter);
+        }
+        self.delete_where_single(session, filter)
+    }
+
+    /// 按条件删除（**单表**实现；分表引擎内部直接调用，不再分流）。
+    pub(crate) fn delete_where_single(
+        &self,
+        session: &mut dyn SqlSession,
+        filter: &Where,
+    ) -> Result<u64> {
         self.ensure_writable()?;
         // 拦截器通知（对应 OnValid/Delete；默认拦截器不处理删除，保留扩展点）
         let mut notify: Vec<(String, DbValue)> = Vec::new();
@@ -2463,8 +2589,20 @@ impl<'a> TableRef<'a> {
         Ok(values)
     }
 
-    /// 统计行数。
+    /// 统计行数（表带 `DataScale="timeShard:..."` 时自动跨分表统计）。
     pub fn count(&self, session: &mut dyn SqlSession, filter: Option<&Where>) -> Result<i64> {
+        if let Some(spec) = self.shard_spec().cloned() {
+            return self.count_sharded(session, &crate::shards::policy_of(&spec), filter);
+        }
+        self.count_single(session, filter)
+    }
+
+    /// 统计行数（**单表**实现）。
+    pub(crate) fn count_single(
+        &self,
+        session: &mut dyn SqlSession,
+        filter: Option<&Where>,
+    ) -> Result<i64> {
         let (sql, params) =
             sqlbuild::count_sql_named(self.dal.kind, self.physical_name(), filter);
         self.dal.log_sql(&sql);
@@ -2476,8 +2614,20 @@ impl<'a> TableRef<'a> {
             .unwrap_or(0))
     }
 
-    /// 查询。
+    /// 查询（表带 `DataScale="timeShard:..."` 时自动跨分表查询 + 跨表续页）。
     pub fn query(&self, session: &mut dyn SqlSession, query: &Query) -> Result<RowSet> {
+        if let Some(spec) = self.shard_spec().cloned() {
+            return self.query_sharded(session, &crate::shards::policy_of(&spec), query);
+        }
+        self.query_single(session, query)
+    }
+
+    /// 查询（**单表**实现）。
+    pub(crate) fn query_single(
+        &self,
+        session: &mut dyn SqlSession,
+        query: &Query,
+    ) -> Result<RowSet> {
         let (sql, params) =
             sqlbuild::select_sql_named(self.dal.kind, self.table, self.physical_name(), query);
         self.dal.log_sql(&sql);

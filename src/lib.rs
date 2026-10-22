@@ -171,7 +171,7 @@ pub use dal::Dal;
 pub use dialect::DatabaseKind;
 pub use entity::Entity;
 pub use migration::Migration;
-pub use model::{ColumnMeta, EntityModel, IndexMeta, TableMeta};
+pub use model::{ColumnMeta, EntityModel, IndexMeta, ShardSpec, TableMeta};
 pub use query::{Query, Where};
 pub use session::{DbRow, RowSet, SqlSession};
 pub use types::DataType;

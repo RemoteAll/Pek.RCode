@@ -4,6 +4,21 @@
 //! **表名/连接名生成规则与 C# 版完全一致**（`String.Format` 模板 + .NET 日期格式子集），
 //! 两边可直接共用同一批数据库表。
 //!
+//! ## 透明分表（与 C# 自动路由对齐，2026-10-23）
+//!
+//! 模型里某列声明 `DataScale="timeShard:表模板[:连接模板]"` 后，**表级 CRUD 自动分流**，
+//! 与 C# `Meta.ShardPolicy` 一致，无需调用方感知：
+//!
+//! | 入口 | 路由依据 |
+//! |------|----------|
+//! | `insert` / `insert_owned` / `write_batch` | 分表字段值（`DateTime` 或雪花 `Int64`） |
+//! | `query` / `count` / `delete_where` | `Where` 中的时间/雪花区间（无该字段时查模型默认表，同 C# `where == null`） |
+//! | `update_by_pk` | `sets` 中的分表字段值，否则按雪花主键解析 |
+//! | `delete_by_pk` | 按雪花主键解析时间 |
+//!
+//! 防递归：`Dal::table_as`（显式物理表）**永不自动分表**，分表引擎内部全部走它。
+//! 分表不存在时：写入自动建表（受迁移档位约束），更新/删除直接返回 0。
+//!
 //! ## 与 C# 的对应关系
 //!
 //! | C# / DH.NCode | Rust / pek-rcode |
@@ -39,7 +54,7 @@ use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeDelta, Timelike};
 
 use crate::dal::{Dal, TableRef};
 use crate::error::{Error, Result};
-use crate::model::TableMeta;
+use crate::model::{ShardSpec, TableMeta};
 use crate::query::{Op, OrderBy, Query, Where};
 use crate::session::{DbRow, RowSet, SqlSession};
 use crate::snowflake::Snowflake;
@@ -117,6 +132,42 @@ impl<'a> ShardBase<'a> {
         self.conn_name = conn_name;
         self
     }
+}
+
+/// `ShardSpec`（模型解析结果）→ 可执行策略。
+///
+/// 步进推断规则与 C# `EntityBuilder.BuildShardPolicy` 一致：
+/// `HH`→1 小时、`dd`→1 天、`MM`→30 天、`yy`→365 天、其余 1 天。
+impl ShardSpec {
+    /// 转换为可执行的分表策略（雪花解析器由调用方按需附加）。
+    pub fn to_policy(&self) -> TimeShardPolicy {
+        let haystack = format!("{}{}", self.table_policy, self.conn_policy);
+        let mut policy = TimeShardPolicy::new(&self.field);
+        if !self.table_policy.is_empty() {
+            policy = policy.with_table_policy(&self.table_policy);
+        }
+        if !self.conn_policy.is_empty() {
+            policy = policy.with_conn_policy(&self.conn_policy);
+        }
+        if haystack.contains("HH") {
+            policy.with_step_hours(1)
+        } else if haystack.contains("dd") {
+            policy.with_step_days(1)
+        } else if haystack.contains("MM") {
+            policy.with_step_days(30)
+        } else if haystack.contains("yy") {
+            policy.with_step_days(365)
+        } else {
+            policy.with_step_days(1)
+        }
+    }
+}
+
+/// 由模型规格构造可执行策略（附带共享雪花解析器，支持雪花 Id 分表字段）。
+///
+/// 透明分表（`TableRef::insert/query/count/delete_where` 自动路由）与显式 API 共用。
+pub fn policy_of(spec: &ShardSpec) -> TimeShardPolicy {
+    spec.to_policy().with_snow(crate::snowflake::shared())
 }
 
 /// 时间分表策略（对应 C# `TimeShardPolicy`）。
@@ -937,6 +988,9 @@ fn fix_shard_order(
     result
 }
 
+/// 批量写入分组：目标分片 + 该分片的行集合。
+type ShardBatchRows = (ShardModel, Vec<Vec<(String, DbValue)>>);
+
 /// 分表执行引擎：表句柄上的跨表操作（对应 C# `Entity.FindAll/FindCount/Delete/AutoShard` 的分表分支）。
 impl<'a> TableRef<'a> {
     /// 分表基础信息（连接名取表级 / 模型级配置，表名取模型物理名）。
@@ -949,6 +1003,231 @@ impl<'a> TableRef<'a> {
         ShardBase {
             conn_name: conn,
             table_name: self.meta().effective_table_name(),
+        }
+    }
+
+    /// 自动分表写入（透明路由）：按分表字段值决定目标库/表后写入。
+    ///
+    /// 对齐 C# 的透明分表（`Entity.Insert/Save` → `Meta.ShardPolicy.Shard(entity)`）：
+    /// - 分表字段缺失 → 报错（与 C# “分表策略要求指定时间字段”一致）；
+    /// - 目标为模型默认表时直接写当前会话（无额外开销）；
+    /// - 分表不存在时自动建表（对齐 C# `CheckTable`，受迁移档位约束）；
+    /// - 跨库分片用目标连接独立会话，自动归还。
+    pub(crate) fn insert_auto_sharded(
+        &self,
+        session: &mut dyn SqlSession,
+        spec: &ShardSpec,
+        fields: Vec<(String, DbValue)>,
+    ) -> Result<i64> {
+        let policy = policy_of(spec);
+        let value = fields
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&spec.field))
+            .map(|(_, value)| value)
+            .ok_or_else(|| {
+                Error::Model(format!(
+                    "分表策略要求指定时间字段（表 {} 缺少列 {}）",
+                    self.meta().name,
+                    spec.field
+                ))
+            })?;
+
+        let base = self.shard_base();
+        let Some(shard) = policy.shard_of_value(base, value)? else {
+            // 未配置模板（如 DataScale 只写了 timeShard）→ 走单表
+            return self.insert_prepared_owned_single(session, fields);
+        };
+
+        let meta = self.meta();
+        let physical = shard
+            .table_name
+            .clone()
+            .unwrap_or_else(|| meta.effective_table_name().to_string());
+        let same_table = physical.eq_ignore_ascii_case(meta.effective_table_name());
+        let same_conn = match shard.conn_name.as_deref() {
+            None => true,
+            Some(conn) => base
+                .conn_name
+                .is_some_and(|c| c.eq_ignore_ascii_case(conn)),
+        };
+        if same_table && same_conn {
+            return self.insert_prepared_owned_single(session, fields);
+        }
+
+        // 跨库：解析目标连接（已注册 / 未注册自动 SQLite 库）并持有独立会话
+        match resolve_shard_dal(&shard, base, self.dal())? {
+            None => {
+                let target = self.dal().table_as(&meta.name, &physical)?;
+                self.dal()
+                    .ensure_shard_table(&meta.name, &physical)
+                    .ok();
+                target.insert_prepared_owned_single(session, fields)
+            }
+            Some(reg) => {
+                reg.ensure_shard_table(&meta.name, &physical).ok();
+                let target = reg.table_as(&meta.name, &physical)?;
+                let mut own = reg.open_session()?;
+                target.insert_prepared_owned_single(own.as_mut(), fields)
+            }
+        }
+    }
+
+    /// 自动分表批量写入（透明路由）：按分表字段逐行分组，再按分组批量写入。
+    ///
+    /// 对齐 C# `BatchInsert` 的分表分支（`EntityExtension`：`fact.ShardPolicy.Shard(e)` 分组）。
+    /// 分组保持出现顺序，同一分片内的行仍走多行 `INSERT` 优化。
+    pub(crate) fn write_batch_auto_sharded(
+        &self,
+        session: &mut dyn SqlSession,
+        spec: &ShardSpec,
+        rows: &[Vec<(String, DbValue)>],
+        mode: crate::sqlbuild::BatchWriteMode,
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        let policy = policy_of(spec);
+        let base = self.shard_base();
+        let mut groups: Vec<ShardBatchRows> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+
+        for row in rows.iter().filter(|r| !r.is_empty()) {
+            let value = row
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&spec.field))
+                .map(|(_, value)| value)
+                .ok_or_else(|| {
+                    Error::Model(format!(
+                        "分表策略要求指定时间字段（表 {} 缺少列 {}）",
+                        self.meta().name,
+                        spec.field
+                    ))
+                })?;
+            let Some(shard) = policy.shard_of_value(base, value)? else {
+                return Err(Error::Model("分表策略因条件不足无法执行分表操作！".into()));
+            };
+            let key = shard.key();
+            match index.get(&key) {
+                Some(&i) => groups[i].1.push(row.clone()),
+                None => {
+                    index.insert(key, groups.len());
+                    groups.push((shard, vec![row.clone()]));
+                }
+            }
+        }
+
+        let mut total = 0u64;
+        for (shard, list) in groups {
+            let affected = self
+                .run_on_shard(session, &shard, true, |table, session| {
+                    table.write_batch_prepared_single(session, &list, mode, batch_size)
+                })?
+                .unwrap_or(0);
+            total += affected;
+        }
+        Ok(total)
+    }
+
+    /// 自动分表更新（透明路由）：按 `sets` 中的分片字段值（其次雪花主键）定位分表。
+    ///
+    /// 目标分表不存在时返回 0（更新不建表，对齐"只改已存在数据"的语义）。
+    pub(crate) fn update_by_pk_auto_sharded(
+        &self,
+        session: &mut dyn SqlSession,
+        spec: &ShardSpec,
+        sets: &[(&str, DbValue)],
+        pk: &[DbValue],
+    ) -> Result<u64> {
+        let value = sets
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&spec.field))
+            .map(|(_, value)| value);
+        let shard = self.auto_shard_model(spec, value, pk)?;
+        Ok(self
+            .run_on_shard(session, &shard, false, |table, session| {
+                table.update_by_pk_single(session, sets, pk)
+            })?
+            .unwrap_or(0))
+    }
+
+    /// 自动分表删除（透明路由）：按雪花主键解析时间定位分表（同 C# `Shard(Int64)`）。
+    pub(crate) fn delete_by_pk_auto_sharded(
+        &self,
+        session: &mut dyn SqlSession,
+        spec: &ShardSpec,
+        pk: &[DbValue],
+    ) -> Result<u64> {
+        let shard = self.auto_shard_model(spec, None, pk)?;
+        Ok(self
+            .run_on_shard(session, &shard, false, |table, session| {
+                table.delete_by_pk_single(session, pk)
+            })?
+            .unwrap_or(0))
+    }
+
+    /// 解析自动路由的目标分片（字段值优先，其次雪花主键；都不可用时按 C# 报"条件不足"）。
+    pub(crate) fn auto_shard_model(
+        &self,
+        spec: &ShardSpec,
+        value: Option<&DbValue>,
+        pk: &[DbValue],
+    ) -> Result<ShardModel> {
+        let policy = policy_of(spec);
+        let base = self.shard_base();
+        if let Some(value) = value
+            && let Some(model) = policy.shard_of_value(base, value)?
+        {
+            return Ok(model);
+        }
+        // 主键与分片字段同列（雪花 Id 主键分表）：单主键、单值才可解析
+        if pk.len() == 1
+            && let Ok(Some(model)) = policy.shard_of_value(base, &pk[0])
+        {
+            return Ok(model);
+        }
+        Err(Error::Model(
+            "分表策略因条件不足无法执行分表操作！".into(),
+        ))
+    }
+
+    /// 在指定分片上执行（必要时自动建表 / 跨库开会话）。
+    ///
+    /// `create = false` 时若目标分表不存在，直接返回 `None`（更新/删除不建表）。
+    pub(crate) fn run_on_shard<R, F>(
+        &self,
+        session: &mut dyn SqlSession,
+        shard: &ShardModel,
+        create: bool,
+        f: F,
+    ) -> Result<Option<R>>
+    where
+        F: FnOnce(&TableRef<'_>, &mut dyn SqlSession) -> Result<R>,
+    {
+        let meta = self.meta();
+        let base = self.shard_base();
+        let physical = shard
+            .table_name
+            .clone()
+            .unwrap_or_else(|| meta.effective_table_name().to_string());
+        match resolve_shard_dal(shard, base, self.dal())? {
+            None => {
+                if create {
+                    self.dal().ensure_shard_table(&meta.name, &physical).ok();
+                } else if !session.table_exists(&physical)? {
+                    return Ok(None);
+                }
+                let table = self.dal().table_as(&meta.name, &physical)?;
+                f(&table, session).map(Some)
+            }
+            Some(reg) => {
+                if create {
+                    reg.ensure_shard_table(&meta.name, &physical).ok();
+                }
+                let mut own = reg.open_session()?;
+                if !create && !own.table_exists(&physical)? {
+                    return Ok(None);
+                }
+                let table = reg.table_as(&meta.name, &physical)?;
+                f(&table, own.as_mut()).map(Some)
+            }
         }
     }
 
@@ -966,14 +1245,14 @@ impl<'a> TableRef<'a> {
         query: &Query,
     ) -> Result<RowSet> {
         let Some(filter) = query.filter.clone() else {
-            return self.query(session, query);
+            return self.query_single(session, query);
         };
 
         let base = self.shard_base();
         let mut trimmed = filter;
         let shards = policy.shards_of_trim(base, &mut trimmed)?;
         if shards.is_empty() {
-            return self.query(session, query);
+            return self.query_single(session, query);
         }
 
         let meta = self.meta();
@@ -1062,14 +1341,14 @@ impl<'a> TableRef<'a> {
         filter: Option<&Where>,
     ) -> Result<i64> {
         let Some(filter) = filter else {
-            return self.count(session, None);
+            return self.count_single(session, None);
         };
 
         let base = self.shard_base();
         let mut trimmed = filter.clone();
         let shards = policy.shards_of_trim(base, &mut trimmed)?;
         if shards.is_empty() {
-            return self.count(session, Some(filter));
+            return self.count_single(session, Some(filter));
         }
 
         let meta = self.meta();
@@ -1114,7 +1393,7 @@ impl<'a> TableRef<'a> {
         let mut trimmed = filter.clone();
         let shards = policy.shards_of_trim(base, &mut trimmed)?;
         if shards.is_empty() {
-            return self.delete_where(session, filter);
+            return self.delete_where_single(session, filter);
         }
 
         let meta = self.meta();
