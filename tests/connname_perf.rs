@@ -98,3 +98,85 @@ fn routing_overhead_baseline() {
     shards::clear_connections();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 连接名小写化：旧实现（每次 `to_lowercase()` 堆分配）vs 新实现（≤64B ASCII 栈缓冲），
+/// 单线程与 8 线程并发各测一次（并发更能暴露分配器争用）。
+#[test]
+#[ignore = "性能基线，手动运行：cargo test --release --test connname_perf -- --ignored --nocapture"]
+fn lowercase_lookup_single_vs_concurrent() {
+    use std::collections::HashMap;
+    use std::hint::black_box;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let mut map: HashMap<String, u32> = HashMap::new();
+    map.insert("iotdata".to_string(), 1);
+    map.insert("dh_2027".to_string(), 2);
+    map.insert("standarddata".to_string(), 3);
+    let map = Arc::new(map);
+
+    let name = "IoTData";
+    let iters = 2_000_000u32;
+
+    // 单线程：旧（堆分配）
+    let t = Instant::now();
+    for _ in 0..iters {
+        black_box(map.get(&black_box(name).to_lowercase()).copied());
+    }
+    let old_ns = t.elapsed().as_nanos() as f64 / iters as f64;
+
+    // 单线程：新（栈缓冲）
+    let t = Instant::now();
+    for _ in 0..iters {
+        let src = black_box(name);
+        let mut buf = [0u8; 64];
+        for (i, b) in src.as_bytes().iter().enumerate() {
+            buf[i] = b.to_ascii_lowercase();
+        }
+        let lower = std::str::from_utf8(&buf[..src.len()]).unwrap_or(src);
+        black_box(map.get(lower).copied());
+    }
+    let new_ns = t.elapsed().as_nanos() as f64 / iters as f64;
+
+    println!("单线程  旧(to_lowercase) {old_ns:>8.1} ns/op");
+    println!("单线程  新(栈缓冲)      {new_ns:>8.1} ns/op");
+
+    // 8 线程并发：分配器争用对比
+    fn run_threads(map: &'static HashMap<String, u32>, iters: u32, stack: bool) -> f64 {
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = map;
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..iters {
+                    let src = black_box("IoTData");
+                    if stack {
+                        let mut buf = [0u8; 64];
+                        for (i, b) in src.as_bytes().iter().enumerate() {
+                            buf[i] = b.to_ascii_lowercase();
+                        }
+                        let lower = std::str::from_utf8(&buf[..src.len()]).unwrap_or(src);
+                        black_box(m.get(lower).copied());
+                    } else {
+                        black_box(m.get(&src.to_lowercase()).copied());
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        start.elapsed().as_nanos() as f64 / (iters as f64 * 8.0)
+    }
+
+    let map_static: &'static HashMap<String, u32> = Box::leak(Box::new((*map).clone()));
+    let old_mt = run_threads(map_static, 300_000, false);
+    let new_mt = run_threads(map_static, 300_000, true);
+    println!("8线程   旧(to_lowercase) {old_mt:>8.1} ns/op（每线程均摊）");
+    println!("8线程   新(栈缓冲)      {new_mt:>8.1} ns/op（每线程均摊）");
+    println!(
+        "提升：单线程 {:.1}x，8 线程 {:.1}x",
+        old_ns / new_ns,
+        old_mt / new_mt
+    );
+}

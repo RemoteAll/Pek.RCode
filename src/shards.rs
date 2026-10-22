@@ -713,20 +713,43 @@ pub fn register_connection(name: &str, dal: Arc<Dal>) -> Result<()> {
         ));
     }
     let mut map = connections().lock().unwrap_or_else(|e| e.into_inner());
-    map.insert(name.to_lowercase(), dal);
+    with_lower_ascii(name, |lower| map.insert(lower.to_string(), dal));
     Ok(())
 }
 
 /// 注销命名连接，返回是否实际移除（自动创建的回退连接同样可注销）。
 pub fn unregister_connection(name: &str) -> bool {
     let mut map = connections().lock().unwrap_or_else(|e| e.into_inner());
-    map.remove(&name.trim().to_lowercase()).is_some()
+    with_lower_ascii(name, |lower| map.remove(lower).is_some())
 }
 
 /// 按名称解析已注册连接（大小写不敏感；未注册返回 `None`，**不做自动创建**）。
+///
+/// 连接名 ≤ 64 字节且为 ASCII 时走**栈缓冲**小写化（零堆分配），
+/// 供 `resolve_table_dal`/分片路由等高频路径使用。
 pub fn registered_connection(name: &str) -> Option<Arc<Dal>> {
     let map = connections().lock().unwrap_or_else(|e| e.into_inner());
-    map.get(&name.trim().to_lowercase()).cloned()
+    with_lower_ascii(name, |lower| map.get(lower).cloned())
+}
+
+/// 用栈缓冲把 ASCII 连接名转小写后回调（避免每次 `to_lowercase()` 的堆分配）。
+///
+/// 非 ASCII / 超长（> 64B）连接名回退到 `to_lowercase()`（正确性优先；连接名极短，几乎不会命中）。
+fn with_lower_ascii<R>(name: &str, f: impl FnOnce(&str) -> R) -> R {
+    const STACK: usize = 64;
+    let name = name.trim();
+    if name.len() <= STACK && name.is_ascii() {
+        let mut buf = [0u8; STACK];
+        for (i, b) in name.as_bytes().iter().enumerate() {
+            buf[i] = b.to_ascii_lowercase();
+        }
+        // ASCII 子集一定是合法 UTF-8
+        let lower = std::str::from_utf8(&buf[..name.len()]).unwrap_or(name);
+        f(lower)
+    } else {
+        let lower = name.to_lowercase();
+        f(&lower)
+    }
 }
 
 /// 当前已注册的连接名（小写形式，含未注册回退时自动创建的连接；已排序）。
@@ -819,7 +842,9 @@ pub fn resolve_table_dal(
     // 并发首用同一连接名：锁外先建（可能重复创建、代价可控），锁内以先到者为准
     let auto = open_auto_sqlite(conn, base_dal)?;
     let mut map = connections().lock().unwrap_or_else(|e| e.into_inner());
-    Ok(Some(map.entry(conn.to_lowercase()).or_insert(auto).clone()))
+    Ok(Some(with_lower_ascii(conn, |lower| {
+        map.entry(lower.to_string()).or_insert(auto).clone()
+    })))
 }
 
 /// 解析分片对应的数据访问层（对应 C# `DAL.Create(shard.ConnName)` 的连接解析）：
@@ -844,7 +869,9 @@ pub(crate) fn resolve_shard_dal(
     // 并发首用同一连接名：锁外先建（可能重复创建、代价可控），锁内以先到者为准
     let auto = open_auto_sqlite(conn, base_dal)?;
     let mut map = connections().lock().unwrap_or_else(|e| e.into_inner());
-    Ok(Some(map.entry(conn.to_lowercase()).or_insert(auto).clone()))
+    Ok(Some(with_lower_ascii(conn, |lower| {
+        map.entry(lower.to_string()).or_insert(auto).clone()
+    })))
 }
 
 /// 分片执行上下文：基础连接沿用调用方会话；跨库分片持有目标连接的独立会话
