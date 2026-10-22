@@ -293,10 +293,10 @@ pub struct Databases {
     remote_schema_sync: bool,
     /// 连接首次打开成功后执行的**初始化数据**（对齐 DH.NCode `Entity<T>.InitData`；默认无）。
     /// 见 [`Databases::with_init_data`]。
-    init_data: Option<Arc<dyn Fn(&str, &Dal) -> Result<(), String> + Send + Sync>>,
+    init_data: Option<InitDataFn>,
     /// 驱动分发管理器（需要时按 `[DriverStore]` 惰性构建；仅 driver-pack）。
     #[cfg(feature = "driver-pack")]
-    manager: Mutex<Option<Arc<DriverManager>>>,
+    manager: Mutex<Option<DriverManagerSlot>>,
 }
 
 impl Databases {
@@ -446,6 +446,12 @@ impl Databases {
 
     /// 取（或按 `[DriverStore]` 惰性构建）驱动分发管理器。
     #[cfg(feature = "driver-pack")]
+    pub fn driver_manager(&self) -> Option<Arc<DriverManager>> {
+        self.manager().ok()
+    }
+
+    /// 取（或按 `[DriverStore]` 惰性构建）驱动分发管理器。
+    #[cfg(feature = "driver-pack")]
     fn manager(&self) -> Result<Arc<DriverManager>, String> {
         let mut slot = self.manager.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = slot.as_ref() {
@@ -484,6 +490,13 @@ impl Databases {
         Ok(manager)
     }
 }
+
+/// 驱动分发管理器槽（惰性构建；`[DriverStore]` 配置后才存在）。
+#[cfg(feature = "driver-pack")]
+type DriverManagerSlot = Arc<DriverManager>;
+
+/// 初始化数据回调（连接首次打开成功后执行；对齐 DH.NCode `Entity<T>.InitData`）。
+type InitDataFn = Arc<dyn Fn(&str, &Dal) -> Result<(), String> + Send + Sync>;
 
 #[cfg(test)]
 mod tests {

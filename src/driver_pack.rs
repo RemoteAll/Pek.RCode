@@ -289,6 +289,54 @@ impl DriverManager {
         Ok((component, version, dir))
     }
 
+    /// 组件源中该组件的**最新版本**（只读目录，**不下载**）。
+    ///
+    /// - 未配置组件源（`store_url` 为空 = 仅本地缓存模式）→ `Ok(None)`；
+    /// - 组件源不可达/验签失败 → `Err`（调用方自行决定是否降级为「只看本地」）；
+    /// - 当前平台没有对应 target 的包 → `Ok(None)`。
+    pub fn latest_version(&self, component: &str) -> Result<Option<String>> {
+        if self.catalog_url.is_empty() {
+            return Ok(None);
+        }
+        let entries = self.load_catalog()?;
+        let Some(target) = current_target() else {
+            return Ok(None);
+        };
+        Ok(entries
+            .iter()
+            .filter(|e| e.id == component && e.target == target)
+            .max_by(|a, b| version_cmp(&a.version, &b.version))
+            .map(|e| e.version.clone()))
+    }
+
+    /// 本地缓存中该组件的**最高版本**（只读目录，且只认含可执行文件的版本目录）。
+    pub fn local_version(&self, component: &str) -> Option<String> {
+        self.local_versions(component)
+            .last()
+            .map(|(version, _)| version.clone())
+    }
+
+    /// 组件 id → 该组件在组件源中的**全部可用版本**（升序；只读目录，不下载）。
+    ///
+    /// 未配置组件源时返回空 `Vec`（缓存模式无远端版本概念）。
+    pub fn catalog_versions(&self, component: &str) -> Result<Vec<String>> {
+        if self.catalog_url.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries = self.load_catalog()?;
+        let Some(target) = current_target() else {
+            return Ok(Vec::new());
+        };
+        let mut versions: Vec<String> = entries
+            .iter()
+            .filter(|e| e.id == component && e.target == target)
+            .map(|e| e.version.clone())
+            .collect();
+        versions.sort_by(|a, b| version_cmp(a, b));
+        versions.dedup();
+        Ok(versions)
+    }
+
     /// 停止指定连接串对应的宿主；返回是否存在并已停止。
     pub fn stop(&self, conn_str: &str) -> bool {
         let key = conn_str.trim();
