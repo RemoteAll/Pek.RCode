@@ -79,7 +79,18 @@ impl ReadWriteStrategy {
         if self.is_primary_only() {
             return false;
         }
+        // 无忽略表是最常见情形：直接放行，不做小写化与哈希查找
+        if self.ignore_tables.is_empty() {
+            return true;
+        }
         !self.ignore_tables.contains(&table.to_ascii_lowercase())
+    }
+
+    /// 读路径是否需要做策略判定（有忽略表或全局切主库）。
+    ///
+    /// 为 `false` 时可完全跳过策略锁与小写化（`Dal::read_session_for` 的快路径）。
+    pub fn needs_check(&self) -> bool {
+        self.is_primary_only() || !self.ignore_tables.is_empty()
     }
 
     /// 复制一份策略（`Dal` 在锁内改配置时用；原子开关一并复制）。

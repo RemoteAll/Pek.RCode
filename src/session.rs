@@ -19,8 +19,8 @@ pub struct RowSet {
     pub columns: Arc<Vec<String>>,
     /// 数据行
     pub rows: Vec<DbRow>,
-    /// 列名索引（同一结果集的所有行共享一份）
-    pub(crate) index: OnceLock<Arc<HashMap<String, usize>>>,
+    /// 列名索引（同一结果集的所有行共享一份；**惰性构建**——只数行不取值的场景零成本）
+    pub(crate) index: Arc<OnceLock<Arc<HashMap<String, usize>>>>,
 }
 
 impl RowSet {
@@ -29,23 +29,18 @@ impl RowSet {
         Self {
             columns: Arc::new(columns),
             rows: Vec::new(),
-            index: OnceLock::new(),
+            index: Arc::new(OnceLock::new()),
         }
     }
 
     /// 追加一行。
     pub fn push(&mut self, values: Vec<DbValue>) {
-        // 宽表：同一结果集只构建一次列名索引，各行共享；小表直接线性比较无需索引
-        if self.columns.len() <= SMALL_COLUMN_COUNT {
-            self.rows.push(DbRow::new(self.columns.clone(), values));
-            return;
-        }
-        let index = self
-            .index
-            .get_or_init(|| Arc::new(build_column_index(&self.columns)))
-            .clone();
-        self.rows
-            .push(DbRow::with_index(self.columns.clone(), values, index));
+        // 宽表：列名索引与本结果集共享，**首次按名取值时才构建**；小表直接线性比较无需索引
+        self.rows.push(DbRow::with_shared_index(
+            self.columns.clone(),
+            values,
+            self.index.clone(),
+        ));
     }
 
     /// 行数。
@@ -74,7 +69,7 @@ impl RowSet {
         let index = self
             .index
             .get_or_init(|| Arc::new(build_column_index(&self.columns)));
-        index.get(&name.to_ascii_lowercase()).copied()
+        lookup_column(index, name)
     }
 }
 
@@ -97,50 +92,69 @@ pub struct DbRow {
     columns: Arc<Vec<String>>,
     /// 值（与列一一对应）
     values: Vec<DbValue>,
-    /// 列名（ASCII 小写）→ 下标（结果集共享；单行创建时惰性构建）
-    index: OnceLock<Arc<HashMap<String, usize>>>,
+    /// 列名 → 下标（**与结果集共享**：仅 8 字节指针，首次按名取值时才构建索引）
+    index: Arc<OnceLock<Arc<HashMap<String, usize>>>>,
 }
 
-/// 构建列名索引（ASCII 小写 → 下标；重复列名保留首个）。
+/// 构建列名索引（**原文 + ASCII 小写**双键；重复列名保留首个）。
+///
+/// 双键的收益：调用方绝大多数直接传模型里的原文列名（生成代码即如此），
+/// 此时命中原文键 → **零分配**；只有确实用小写/混合大小写时才退化为一次小写化。
 fn build_column_index(columns: &[String]) -> HashMap<String, usize> {
-    let mut map = HashMap::with_capacity(columns.len());
+    let mut map = HashMap::with_capacity(columns.len() * 2);
     for (position, name) in columns.iter().enumerate() {
-        map.entry(name.to_ascii_lowercase()).or_insert(position);
+        map.entry(name.clone()).or_insert(position);
+        let lower = name.to_ascii_lowercase();
+        if lower != *name {
+            map.entry(lower).or_insert(position);
+        }
     }
     map
 }
 
+/// 按列名查索引：先原文精确匹配（不分配），未命中再小写化查找。
+fn lookup_column(index: &HashMap<String, usize>, name: &str) -> Option<usize> {
+    if let Some(position) = index.get(name) {
+        return Some(*position);
+    }
+    // 原文未命中：大小写不同的情况（`HashMap<String, _>` 可直接用 `&str` 查，无需先分配）
+    if name.bytes().all(|b| !b.is_ascii_uppercase()) {
+        return None;
+    }
+    index.get(&name.to_ascii_lowercase()).copied()
+}
+
 impl Clone for DbRow {
     fn clone(&self) -> Self {
-        // 克隆时重置索引缓存（避免复制索引表；取值时按需重建）
+        // 索引是共享的（`Arc`），克隆只加一次引用计数
         Self {
             columns: self.columns.clone(),
             values: self.values.clone(),
-            index: OnceLock::new(),
+            index: self.index.clone(),
         }
     }
 }
 
 impl DbRow {
-    /// 创建一行。
+    /// 创建一行（自带独立列名索引）。
     pub fn new(columns: Arc<Vec<String>>, values: Vec<DbValue>) -> Self {
         Self {
             columns,
             values,
-            index: OnceLock::new(),
+            index: Arc::new(OnceLock::new()),
         }
     }
 
     /// 创建一行并复用共享列名索引（[`RowSet`] 使用）。
-    pub(crate) fn with_index(
+    pub(crate) fn with_shared_index(
         columns: Arc<Vec<String>>,
         values: Vec<DbValue>,
-        index: Arc<HashMap<String, usize>>,
+        index: Arc<OnceLock<Arc<HashMap<String, usize>>>>,
     ) -> Self {
         Self {
             columns,
             values,
-            index: OnceLock::from(index),
+            index,
         }
     }
 
@@ -174,8 +188,7 @@ impl DbRow {
                 .position(|c| c.eq_ignore_ascii_case(name))?;
             return self.values.get(position);
         }
-        let key = name.to_ascii_lowercase();
-        let position = *self.name_index().get(&key)?;
+        let position = lookup_column(self.name_index(), name)?;
         self.values.get(position)
     }
 

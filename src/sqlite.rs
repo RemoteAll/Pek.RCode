@@ -3,12 +3,18 @@
 //! 打开连接时套用与 XCode 一致的优化参数（WAL 日志、忙等待超时），
 //! 保证与 C# 版共用同一个 `DG.db` 文件时的行为一致。
 
-use rusqlite::types::{Value as SqlValue, ValueRef};
+use rusqlite::types::{ToSql, ToSqlOutput, Value as SqlValue, ValueRef};
 
 use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
 use crate::session::{DbRow, RowSet, SqlSession};
 use crate::value::{DbValue, format_datetime};
+
+/// 预编译语句缓存容量（按 SQL 文本命中；ORM 生成的 SQL 高度同构，一次编译反复复用）。
+///
+/// 单张表一次 `insert`/`select` 只产生 1 条 SQL，几十张表的常规业务 ≤ 64 条即可覆盖；
+/// 超出后按 LRU 淘汰，不影响正确性。
+pub const STATEMENT_CACHE_CAPACITY: usize = 64;
 
 /// SQLite 会话。
 pub struct SqliteSession {
@@ -20,6 +26,10 @@ impl SqliteSession {
     /// 打开数据库文件（支持 `:memory:` 内存库）。
     pub fn open(path: &str) -> Result<Self> {
         let conn = rusqlite::Connection::open(path)?;
+
+        // 预编译语句缓存：此前每次 `execute`/`query` 都重新编译 SQL（SQLite 编译 20 列表的
+        // INSERT 开销与执行同级）；开启缓存后同构 SQL 只编译一次。
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
 
         // 忙等待：多进程/多连接共用同一个 DG.db 时减少 "database is locked"
         let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
@@ -42,20 +52,40 @@ impl SqliteSession {
     }
 }
 
-/// `DbValue` → rusqlite 参数值。
+/// 绑定参数：能借用就借用（`Text`/`Blob` 零拷贝），需渲染成文本的才分配。
 ///
 /// 说明：时间统一按 XCode 的文本格式（7 位小数秒）存入 TEXT 列，
 /// 与 C# 写入的数据保持一致的字符串形态，便于 SQLite 侧比较与排序。
-fn to_sql_value(value: &DbValue) -> SqlValue {
+///
+/// 大批量写入时每行每列复制一次字符串是纯开销 —— 这里的 `Borrowed` 分支把它省掉。
+enum SqlParam<'a> {
+    /// 借用自 `DbValue`（Text/Blob/数值）
+    Borrowed(ValueRef<'a>),
+    /// 需临时渲染（Decimal/DateTime）
+    Owned(SqlValue),
+}
+
+impl ToSql for SqlParam<'_> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        match self {
+            // `ValueRef` 自身可直接作为绑定值（rusqlite 的 `ToSqlOutput::Borrowed`）
+            SqlParam::Borrowed(value) => Ok(ToSqlOutput::Borrowed(*value)),
+            SqlParam::Owned(value) => value.to_sql(),
+        }
+    }
+}
+
+/// `DbValue` → 绑定参数（Text/Blob 借用，不复制）。
+fn to_param(value: &DbValue) -> SqlParam<'_> {
     match value {
-        DbValue::Null => SqlValue::Null,
-        DbValue::Bool(v) => SqlValue::Integer(i64::from(*v)),
-        DbValue::Int(v) => SqlValue::Integer(*v),
-        DbValue::Float(v) => SqlValue::Real(*v),
-        DbValue::Decimal(v) => SqlValue::Text(v.to_string()),
-        DbValue::Text(v) => SqlValue::Text(v.clone()),
-        DbValue::Blob(v) => SqlValue::Blob(v.clone()),
-        DbValue::DateTime(v) => SqlValue::Text(format_datetime(v)),
+        DbValue::Null => SqlParam::Borrowed(ValueRef::Null),
+        DbValue::Bool(v) => SqlParam::Borrowed(ValueRef::Integer(i64::from(*v))),
+        DbValue::Int(v) => SqlParam::Borrowed(ValueRef::Integer(*v)),
+        DbValue::Float(v) => SqlParam::Borrowed(ValueRef::Real(*v)),
+        DbValue::Text(v) => SqlParam::Borrowed(ValueRef::Text(v.as_bytes())),
+        DbValue::Blob(v) => SqlParam::Borrowed(ValueRef::Blob(v)),
+        DbValue::Decimal(v) => SqlParam::Owned(SqlValue::Text(v.to_string())),
+        DbValue::DateTime(v) => SqlParam::Owned(SqlValue::Text(format_datetime(v))),
     }
 }
 
@@ -76,16 +106,16 @@ impl SqlSession for SqliteSession {
     }
 
     fn execute(&mut self, sql: &str, params: &[DbValue]) -> Result<u64> {
-        let values: Vec<SqlValue> = params.iter().map(to_sql_value).collect();
-        let affected = self
-            .conn
-            .execute(sql, rusqlite::params_from_iter(values))?;
+        let values: Vec<SqlParam> = params.iter().map(to_param).collect();
+        // 语句缓存：同构 SQL 免重复编译（缓存未命中时与 `execute` 等价）
+        let mut stmt = self.conn.prepare_cached(sql)?;
+        let affected = stmt.execute(rusqlite::params_from_iter(values))?;
         Ok(affected as u64)
     }
 
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
-        let values: Vec<SqlValue> = params.iter().map(to_sql_value).collect();
-        let mut stmt = self.conn.prepare(sql)?;
+        let values: Vec<SqlParam> = params.iter().map(to_param).collect();
+        let mut stmt = self.conn.prepare_cached(sql)?;
 
         // 先取出列名（借用在查询前结束）
         let columns: Vec<String> = stmt

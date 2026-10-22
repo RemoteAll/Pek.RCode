@@ -192,6 +192,18 @@ impl DatabaseFile {
     pub fn names(&self) -> Vec<&str> {
         self.connections.keys().map(String::as_str).collect()
     }
+
+    /// 解析指定连接名（SQLite 相对路径按 `base` 绝对化）。
+    ///
+    /// 供读写分离等“按连接名取实际连接串”的场景使用。
+    pub fn resolve_connection(&self, base: &Path, name: &str) -> Result<String, String> {
+        let name = name.trim();
+        let entry = self
+            .connections
+            .get(name)
+            .ok_or_else(|| format!("连接 {name} 不存在"))?;
+        resolve_connection(base, entry.connection_string())
+    }
 }
 
 /// 约定文件完整路径（`{base}/Config/Database.toml`）。

@@ -233,6 +233,14 @@ fn report_sizes() {
         "size_of::<EntityCache>()           = {}",
         std::mem::size_of::<EntityCache>()
     );
+    println!(
+        "size_of::<DbRow>()                 = {}",
+        std::mem::size_of::<pek_rcode::DbRow>()
+    );
+    println!(
+        "size_of::<DbValue>()               = {}",
+        std::mem::size_of::<pek_rcode::DbValue>()
+    );
 }
 
 /// 模型表查找：线性扫描（旧路径）vs 表名索引（新路径）。
@@ -299,4 +307,223 @@ fn bench_model_table_lookup() {
     let _ = std::fs::remove_file(
         std::env::temp_dir().join(format!("pek-rcode-lookup-{}.db", std::process::id())),
     );
+}
+// ---------------------------------------------------------------------------
+// 端到端路径基准（第十二轮审计新增）：会话借还 / 行取值 / 写读往返
+// ---------------------------------------------------------------------------
+
+/// 宽表模型（20 列）与窄表模型（6 列），用于行取值基准。
+const WIDE_MODEL: &str = r#"<EntityModel><Tables><Table Name="Wide" TableName="DH_Wide">
+  <Columns>
+    <Column Name="C1" DataType="String" Length="50" /><Column Name="C2" DataType="String" Length="50" />
+    <Column Name="C3" DataType="String" Length="50" /><Column Name="C4" DataType="String" Length="50" />
+    <Column Name="C5" DataType="String" Length="50" /><Column Name="C6" DataType="String" Length="50" />
+    <Column Name="C7" DataType="String" Length="50" /><Column Name="C8" DataType="String" Length="50" />
+    <Column Name="C9" DataType="String" Length="50" /><Column Name="C10" DataType="String" Length="50" />
+    <Column Name="C11" DataType="String" Length="50" /><Column Name="C12" DataType="String" Length="50" />
+    <Column Name="C13" DataType="String" Length="50" /><Column Name="C14" DataType="String" Length="50" />
+    <Column Name="C15" DataType="String" Length="50" /><Column Name="C16" DataType="String" Length="50" />
+    <Column Name="C17" DataType="String" Length="50" /><Column Name="C18" DataType="String" Length="50" />
+    <Column Name="C19" DataType="String" Length="50" /><Column Name="C20" DataType="String" Length="50" />
+  </Columns>
+</Table></Tables></EntityModel>"#;
+
+fn bench_dal(tag: &str) -> pek_rcode::Dal {
+    let dir = std::env::temp_dir().join(format!("pek-rcode-perf-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = format!("Data Source={};Provider=SQLite", dir.join("p.db").display());
+    let dal = pek_rcode::Dal::open_with_model(
+        &conn,
+        pek_rcode::model::EntityModel::parse(WIDE_MODEL).unwrap(),
+    )
+    .unwrap();
+    dal.sync_schema().unwrap();
+    dal
+}
+
+/// 会话借出 + 归还（连接池一次完整周期）；高并发下的登记/复用开销。
+#[test]
+#[ignore]
+fn bench_session_checkout() {
+    use std::sync::Arc;
+    const N: usize = 200_000;
+    let dal = Arc::new(bench_dal("checkout"));
+
+    // 预热：让池里有一个空闲会话
+    drop(dal.open_session().unwrap());
+
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        let s = dal.open_session().unwrap();
+        drop(s);
+    }
+    report("会话借出+归还（连接池，单线程）", N, t.elapsed(), alloc_since(mark));
+
+    const THREADS: usize = 8;
+    const PER: usize = 50_000;
+    let start = Instant::now();
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let dal = dal.clone();
+            std::thread::spawn(move || {
+                for _ in 0..PER {
+                    let s = dal.open_session().unwrap();
+                    drop(s);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    report(
+        &format!("会话借出+归还（{THREADS} 线程并发）"),
+        THREADS * PER,
+        start.elapsed(),
+        0,
+    );
+}
+
+/// 读会话获取（读写分离判定路径）。
+#[test]
+#[ignore]
+fn bench_read_session() {
+    const N: usize = 200_000;
+    let dal = bench_dal("read-session");
+    drop(dal.read_session().unwrap());
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        let s = dal.read_session_for("DH_Wide").unwrap();
+        drop(s);
+    }
+    report("读会话获取（read_session_for）", N, t.elapsed(), alloc_since(mark));
+}
+
+/// 行取值：宽表（20 列）按列名取 20 次。
+#[test]
+#[ignore]
+fn bench_row_lookup_wide() {
+    use pek_rcode::RowSet;
+    const N: usize = 100_000;
+    let columns: Vec<String> = (1..=20).map(|i| format!("C{i}")).collect();
+    let mut set = RowSet::new(columns.clone());
+    for _ in 0..4 {
+        set.push(vec![pek_rcode::DbValue::Int(1); 20]);
+    }
+    let row = set.first().unwrap();
+
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    let mut sink = 0usize;
+    for _ in 0..N {
+        for c in &columns {
+            sink += usize::from(row.get_by_name(c).is_some());
+        }
+    }
+    report("行取值（20 列，原文列名 × 20）", N * 20, t.elapsed(), alloc_since(mark));
+
+    // 小写列名（模拟手写代码/OR 映射传小写）
+    let lower: Vec<String> = columns.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        for c in &lower {
+            sink += usize::from(row.get_by_name(c).is_some());
+        }
+    }
+    report("行取值（20 列，小写列名 × 20）", N * 20, t.elapsed(), alloc_since(mark));
+    assert!(sink > 0);
+}
+
+/// 写一行（10 列文本）：SQL 构建 + 参数绑定 + 执行（事务内，不含 fsync）。
+#[test]
+#[ignore]
+fn bench_insert_row() {
+    const N: usize = 20_000;
+    let dal = bench_dal("insert");
+    let table = dal.table("Wide").unwrap();
+    let mut session = dal.open_session().unwrap();
+    let sets: Vec<(&'static str, pek_rcode::DbValue)> = (1..=20)
+        .map(|i| {
+            let name: &'static str = match i {
+                1 => "C1", 2 => "C2", 3 => "C3", 4 => "C4", 5 => "C5",
+                6 => "C6", 7 => "C7", 8 => "C8", 9 => "C9", 10 => "C10",
+                11 => "C11", 12 => "C12", 13 => "C13", 14 => "C14", 15 => "C15",
+                16 => "C16", 17 => "C17", 18 => "C18", 19 => "C19", _ => "C20",
+            };
+            (name, pek_rcode::DbValue::Text("0123456789abcdef".into()))
+        })
+        .collect();
+
+    session.begin().unwrap();
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        table.insert(session.as_mut(), &sets).unwrap();
+    }
+    let elapsed = t.elapsed();
+    let allocs = alloc_since(mark);
+    session.commit().unwrap();
+    report("插入一行（20 列文本，事务内）", N, elapsed, allocs);
+}
+
+/// 批量插入摊销（5000/批）。
+#[test]
+#[ignore]
+fn bench_insert_batch() {
+    const ROWS: usize = 20_000;
+    let dal = bench_dal("batch");
+    let table = dal.table("Wide").unwrap();
+    let mut session = dal.open_session().unwrap();
+    let sets: Vec<(&'static str, pek_rcode::DbValue)> = (1..=20)
+        .map(|i| {
+            let name: &'static str = match i {
+                1 => "C1", 2 => "C2", 3 => "C3", 4 => "C4", 5 => "C5",
+                6 => "C6", 7 => "C7", 8 => "C8", 9 => "C9", 10 => "C10",
+                11 => "C11", 12 => "C12", 13 => "C13", 14 => "C14", 15 => "C15",
+                16 => "C16", 17 => "C17", 18 => "C18", 19 => "C19", _ => "C20",
+            };
+            (name, pek_rcode::DbValue::Text("0123456789abcdef".into()))
+        })
+        .collect();
+    let rows: Vec<Vec<(&str, pek_rcode::DbValue)>> = (0..ROWS).map(|_| sets.clone()).collect();
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    table.write_batch(session.as_mut(), &rows, pek_rcode::sqlbuild::BatchWriteMode::Insert, Some(5000)).unwrap();
+    report("批量插入摊销（5000/批，20 列）", ROWS, t.elapsed(), alloc_since(mark));
+}
+
+/// 查询一行并取值（20 列）。
+#[test]
+#[ignore]
+fn bench_select_row() {
+    const N: usize = 20_000;
+    let dal = bench_dal("select");
+    let table = dal.table("Wide").unwrap();
+    let mut session = dal.open_session().unwrap();
+    let sets: Vec<(&'static str, pek_rcode::DbValue)> = (1..=20)
+        .map(|i| {
+            let name: &'static str = match i {
+                1 => "C1", 2 => "C2", 3 => "C3", 4 => "C4", 5 => "C5",
+                6 => "C6", 7 => "C7", 8 => "C8", 9 => "C9", 10 => "C10",
+                11 => "C11", 12 => "C12", 13 => "C13", 14 => "C14", 15 => "C15",
+                16 => "C16", 17 => "C17", 18 => "C18", 19 => "C19", _ => "C20",
+            };
+            (name, pek_rcode::DbValue::Text("0123456789abcdef".into()))
+        })
+        .collect();
+    table.insert(session.as_mut(), &sets).unwrap();
+
+    let query = pek_rcode::Query::new().take(1);
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    let mut sink = 0usize;
+    for _ in 0..N {
+        let set = table.query(session.as_mut(), &query).unwrap();
+        sink += set.len();
+    }
+    report("查询一行（20 列，不取值）", N, t.elapsed(), alloc_since(mark));
+    assert!(sink >= N);
 }

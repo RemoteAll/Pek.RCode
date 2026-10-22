@@ -190,6 +190,8 @@ pub struct Dal {
     /// 字段缓存注册表（表（小写）→ 列（小写）→ 共享实例；对应 DH.NCode 的 `FieldCache<T>`）
     pub(crate) field_caches:
         Mutex<HashMap<String, HashMap<String, Arc<crate::cache::FieldCache>>>>,
+    /// 是否注册过任一类缓存（写入路径快路：无缓存时零锁零分配）
+    pub(crate) has_caches: AtomicBool,
     /// 表行数缓存（表名→（行数, 时刻）；对应 C# `EntitySession.Count` 的 60 秒缓存；读多写少用 RwLock）
     pub(crate) count_cache: RwLock<HashMap<String, (i64, std::time::Instant)>>,
     /// 模型表名索引（小写实体名/物理表名 → 表下标；避免每次操作线性扫 176 表）
@@ -201,7 +203,11 @@ pub struct Dal {
     /// 连接是否只读（连接串 `Readonly=true`；对应 C# `DbBase.Readonly`）
     readonly: AtomicBool,
     /// 只读副本（对应 C# `DAL.Reads`；读操作轮询分流）
-    read_replicas: RwLock<Vec<Arc<Dal>>>,
+    read_replicas: RwLock<Arc<Vec<Arc<Dal>>>>,
+    /// 是否有可用副本（读路径快路：false 时直接走主库，零锁零分配）
+    has_replicas: AtomicBool,
+    /// 读写分离策略是否需要判定（有忽略表或全局切主库）；false 时读路径免锁
+    rw_needs_check: AtomicBool,
     /// 读写分离策略（运行期可调）
     rw_strategy: RwLock<ReadWriteStrategy>,
     /// 副本轮询计数器
@@ -470,13 +476,16 @@ impl Dal {
             conn_migration,
             entity_caches: Mutex::new(HashMap::new()),
             single_caches: Mutex::new(HashMap::new()),
+            has_caches: AtomicBool::new(false),
             field_caches: Mutex::new(HashMap::new()),
             count_cache: RwLock::new(HashMap::new()),
             table_index: OnceLock::new(),
             pool: OnceLock::new(),
             pool_enabled,
             readonly: AtomicBool::new(readonly),
-            read_replicas: RwLock::new(Vec::new()),
+            read_replicas: RwLock::new(Arc::new(Vec::new())),
+        has_replicas: AtomicBool::new(false),
+        rw_needs_check: AtomicBool::new(false),
             rw_strategy: RwLock::new(ReadWriteStrategy::new()),
             read_cursor: AtomicUsize::new(0),
         })
@@ -602,14 +611,22 @@ impl Dal {
     /// 典型来源是连接名约定 `X.readonly` / `X.readonly.rd0..`（见
     /// [`open_replicas_from_file`](Self::open_replicas_from_file)）。
     pub fn attach_read_replicas(&self, replicas: Vec<Arc<Dal>>) {
+        let has = !replicas.is_empty();
+        // 先发布副本列表，再置标志（读路径先查标志）
         *self
             .read_replicas
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = replicas;
+            .unwrap_or_else(|e| e.into_inner()) = Arc::new(replicas);
+        self.has_replicas.store(has, Ordering::Release);
     }
 
-    /// 当前只读副本。
+    /// 当前只读副本（**每次调用分配一个 `Vec`**；热路径请用 [`Dal::read_replicas_arc`]）。
     pub fn read_replicas(&self) -> Vec<Arc<Dal>> {
+        self.read_replicas_arc().as_ref().clone()
+    }
+
+    /// 当前只读副本快照（`Arc` 共享，零拷贝；读路径内部使用）。
+    pub fn read_replicas_arc(&self) -> Arc<Vec<Arc<Dal>>> {
         self.read_replicas
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -618,11 +635,7 @@ impl Dal {
 
     /// 是否有可用副本。
     pub fn has_read_replicas(&self) -> bool {
-        !self
-            .read_replicas
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+        self.has_replicas.load(Ordering::Acquire)
     }
 
     /// 读写分离策略快照（忽略表 + 当前开关）。
@@ -637,6 +650,8 @@ impl Dal {
     pub fn set_ignore_tables(&self, tables: &[&str]) {
         let mut guard = self.rw_strategy.write().unwrap_or_else(|e| e.into_inner());
         *guard = guard.snapshot().ignore_tables(tables);
+        drop(guard);
+        self.refresh_rw_needs_check();
     }
 
     /// 当前忽略表（小写）。
@@ -656,6 +671,7 @@ impl Dal {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .set_primary_only(value);
+        self.refresh_rw_needs_check();
     }
 
     /// 是否已全局切主库。
@@ -673,7 +689,11 @@ impl Dal {
     ///
     /// 只读查询应该用本方法；写入必须用 [`open_session`](Self::open_session)。
     pub fn read_session(&self) -> Result<Box<dyn SqlSession>> {
-        let replicas = self.read_replicas();
+        // 常见情形（未配从库）：一个原子读即回主库，不取锁、不分配
+        if !self.has_replicas.load(Ordering::Acquire) {
+            return self.open_session();
+        }
+        let replicas = self.read_replicas_arc();
         if replicas.is_empty() {
             return self.open_session();
         }
@@ -687,16 +707,29 @@ impl Dal {
 
     /// 按表名策略取只读会话：命中忽略表或全局切主库时走主库。
     pub fn read_session_for(&self, table: &str) -> Result<Box<dyn SqlSession>> {
-        let allow = self
+        // 常见情形（无忽略表、未切主库）：直接进读路径，不碰策略锁
+        if !self.rw_needs_check.load(Ordering::Acquire) || self.allows_replica(table) {
+            return self.read_session();
+        }
+        self.open_session()
+    }
+
+    /// 指定表是否允许走从库（内部使用）。
+    fn allows_replica(&self, table: &str) -> bool {
+        self.rw_strategy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .allows_replica(table)
+    }
+
+    /// 重算并发布「读写分离是否需要判定」标志（配置变更后调用）。
+    fn refresh_rw_needs_check(&self) {
+        let needs = self
             .rw_strategy
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .allows_replica(table);
-        if allow {
-            self.read_session()
-        } else {
-            self.open_session()
-        }
+            .needs_check();
+        self.rw_needs_check.store(needs, Ordering::Release);
     }
 
     /// 从 `Config/Database.toml` 按 C# 连接名约定创建副本集合。
@@ -1839,6 +1872,22 @@ impl<'a> TableRef<'a> {
             (max_params / columns.len()).clamp(1, batch)
         };
         let mut affected = 0u64;
+        // 列 → 行内位置：同一批的行来自同一套字段（列集与顺序一致），
+        // 只需按首行算一次位置，后续行按位置取值（原来每行每列都要线性比较一遍列名）。
+        let Some(first) = rows.first() else {
+            return Ok(0);
+        };
+        let positions: Vec<Option<usize>> = columns
+            .iter()
+            .map(|column| {
+                first
+                    .iter()
+                    .position(|(k, _)| k.eq_ignore_ascii_case(column))
+            })
+            .collect();
+        let aligned = rows
+            .iter()
+            .all(|row| !row.is_empty() && positions.iter().all(|p| p.is_some_and(|i| i < row.len())));
         for chunk in rows.chunks(per_statement) {
             let sql = sqlbuild::multi_write_sql_named(
                 self.dal.kind,
@@ -1849,15 +1898,25 @@ impl<'a> TableRef<'a> {
                 mode,
             )?;
             let mut params = Vec::with_capacity(chunk.len() * columns.len());
-            for row in chunk {
-                for column in columns {
-                    // 按列名投影（大小写不敏感；缺失补 NULL）
-                    params.push(
-                        row.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(column))
-                            .map(|(_, v)| v.clone())
-                            .unwrap_or(DbValue::Null),
-                    );
+            if aligned {
+                for row in chunk {
+                    for position in &positions {
+                        // `aligned` 已保证位置有效
+                        let (_, value) = &row[position.unwrap_or(0)];
+                        params.push(value.clone());
+                    }
+                }
+            } else {
+                // 防御路径：行内列集与首行不一致时按列名查找（缺失补 NULL）
+                for row in chunk {
+                    for column in columns {
+                        params.push(
+                            row.iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case(column))
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(DbValue::Null),
+                        );
+                    }
                 }
             }
             self.dal.log_sql(&sql);

@@ -591,6 +591,8 @@ impl Dal {
     ///
     /// `table` 可传实体名或物理表名，`column` 可传属性名或列名。
     pub fn field_cache(&self, table: &str, column: &str) -> Result<Arc<FieldCache>> {
+        self.has_caches
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let meta = self.table_meta(table)?;
         let physical_table = meta.effective_table_name().to_string();
         let col = meta
@@ -610,6 +612,8 @@ impl Dal {
 
     /// 获取实体缓存（按表共享，惰性创建；对应 DH.NCode 的 `Meta.Cache`）。
     pub fn entity_cache(&self, table: &str) -> Result<Arc<EntityCache>> {
+        self.has_caches
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let name = self.table_meta(table)?.effective_table_name().to_string();
         let key = name.to_ascii_lowercase();
         let mut map = lock(&self.entity_caches);
@@ -621,6 +625,8 @@ impl Dal {
 
     /// 获取单对象缓存（按表共享，惰性创建；对应 DH.NCode 的 `Meta.SingleCache`）。
     pub fn single_cache(&self, table: &str) -> Result<Arc<SingleCache>> {
+        self.has_caches
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let name = self.table_meta(table)?.effective_table_name().to_string();
         let key = name.to_ascii_lowercase();
         let mut map = lock(&self.single_caches);
@@ -635,6 +641,10 @@ impl Dal {
     /// 对应 DH.NCode：任何添删改操作都让缓存马上过期。
     /// `table` 可传实体名或实际表名（忽略大小写）。
     pub fn invalidate_cache(&self, table: &str) {
+        // 快路径：从未创建过任何缓存（写多读少的应用常见）→ 直接返回，不取锁、不做小写化
+        if !self.has_caches.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let key = match self.table_meta(table) {
             Ok(meta) => meta.effective_table_name().to_ascii_lowercase(),
             Err(_) => table.to_ascii_lowercase(),
