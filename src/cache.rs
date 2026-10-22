@@ -37,7 +37,8 @@ pub mod invalidator;
 pub mod lazy;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use crate::dal::{Dal, TableRef};
@@ -48,6 +49,21 @@ use crate::value::DbValue;
 
 /// 默认过期时间（秒，与 DH.NCode 一致）。
 pub const DEFAULT_EXPIRE_SECONDS: u64 = 60;
+
+/// 实体缓存一致性模式（按业务场景选择）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheConsistency {
+    /// 过期后同步重载（**默认**；强一致优先，读会阻塞一次查询）。
+    /// 适合权限、余额、库存等不能接受旧值的场景。
+    #[default]
+    Blocking,
+    /// 过期后先返回旧数据、下次访问刷新（读不阻塞；允许最长 `max_stale`）。
+    /// 适合参数、字典、分类等读多写少且可容忍短暂旧值的场景。
+    StaleWhileRevalidate {
+        /// 过期后允许继续返回旧数据的最长时间（超过则同步刷新）
+        max_stale: Duration,
+    },
+}
 
 /// 单对象缓存默认最大实体数（与 DH.NCode 一致）。
 pub const DEFAULT_MAX_ENTITY: usize = 10_000;
@@ -77,8 +93,12 @@ pub struct EntityCache {
     table: String,
     /// 过期时间
     expire: Mutex<Duration>,
-    /// 缓存状态
-    state: Mutex<EntityCacheState>,
+    /// 一致性模式
+    consistency: Mutex<CacheConsistency>,
+    /// 缓存状态（写锁用于刷新，保证并发过期时只有一个线程查库）
+    state: RwLock<EntityCacheState>,
+    /// 已向调用方返回过“过期旧值”（SWR 模式）
+    stale_served: AtomicBool,
 }
 
 /// 实体缓存内部状态。
@@ -88,8 +108,6 @@ struct EntityCacheState {
     data: Option<Arc<Vec<DbRow>>>,
     /// 加载完成时刻
     loaded_at: Option<Instant>,
-    /// 已向调用方返回过“过期旧值”，等待下次访问刷新
-    stale_served: bool,
 }
 
 impl EntityCache {
@@ -98,8 +116,20 @@ impl EntityCache {
         Self {
             table: table.to_string(),
             expire: Mutex::new(Duration::from_secs(DEFAULT_EXPIRE_SECONDS)),
-            state: Mutex::new(EntityCacheState::default()),
+            consistency: Mutex::new(CacheConsistency::default()),
+            state: RwLock::new(EntityCacheState::default()),
+            stale_served: AtomicBool::new(false),
         }
+    }
+
+    /// 读锁（被投毒时恢复内部数据）。
+    fn read_state(&self) -> RwLockReadGuard<'_, EntityCacheState> {
+        self.state.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 写锁（被投毒时恢复内部数据）。
+    fn write_state(&self) -> RwLockWriteGuard<'_, EntityCacheState> {
+        self.state.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 表名（小写）。
@@ -117,55 +147,90 @@ impl EntityCache {
         *lock(&self.expire) = Duration::from_secs(seconds);
     }
 
+    /// 当前一致性模式。
+    pub fn consistency(&self) -> CacheConsistency {
+        *lock(&self.consistency)
+    }
+
+    /// 设置一致性模式（强一致用 [`CacheConsistency::Blocking`]；读多写少、可容忍短暂旧值的表
+    /// 可开 [`CacheConsistency::StaleWhileRevalidate`]）。
+    pub fn set_consistency(&self, mode: CacheConsistency) {
+        *lock(&self.consistency) = mode;
+    }
+
     /// 缓存是否可用（已加载且未过期）。
     pub fn is_valid(&self) -> bool {
         let expire = *lock(&self.expire);
-        let state = lock(&self.state);
+        let state = self.read_state();
         state
             .loaded_at
             .is_some_and(|at| at.elapsed() < expire)
             && state.data.is_some()
     }
 
-    /// 取得整表数据（对应 C# `Meta.Cache.Entities` 的“旧值 + 延迟刷新”语义）。
+    /// 取得整表数据（按一致性模式处理过期，对应 C# `Meta.Cache.Entities`）。
     ///
-    /// - 未过期：直接返回缓存；
-    /// - **首次发现过期：先返回旧数据（不阻塞调用方）**，并标记待刷新；
-    /// - 下一次访问：同步重载后返回新数据（无额外线程/连接，语义接近 C# 的异步刷新）。
+    /// - 未过期：直接返回缓存（读锁）；
+    /// - 过期 + [`CacheConsistency::Blocking`]（默认）：同步重载（强一致）；
+    /// - 过期 + [`CacheConsistency::StaleWhileRevalidate`]：在 `max_stale` 内先返回旧值
+    ///   （不阻塞），下次访问刷新；超过窗口则同步重载。
+    ///
+    /// 重载在**写锁内**执行：并发过期时只有一个线程查库，其余线程等它完成后直接拿新数据，
+    /// 避免缓存击穿（N 个线程同时整表查询）。
     pub fn entities(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<Arc<Vec<DbRow>>> {
+        let expire = *lock(&self.expire);
+        let mode = *lock(&self.consistency);
+
+        // 快路径：读锁
         {
-            let expire = *lock(&self.expire);
-            let mut state = lock(&self.state);
+            let state = self.read_state();
             if let (Some(data), Some(at)) = (state.data.clone(), state.loaded_at) {
-                if at.elapsed() < expire {
+                let elapsed = at.elapsed();
+                if elapsed < expire {
                     return Ok(data);
                 }
-                if !state.stale_served {
-                    state.stale_served = true;
+                if let CacheConsistency::StaleWhileRevalidate { max_stale } = mode
+                    && elapsed < expire.saturating_add(max_stale)
+                    && !self.stale_served.load(Ordering::Relaxed)
+                {
+                    self.stale_served.store(true, Ordering::Relaxed);
                     return Ok(data);
                 }
             }
         }
-        self.reload(dal, session)
+
+        // 慢路径：写锁内双重检查 + 查询（单飞）
+        let mut state = self.write_state();
+        if let (Some(data), Some(at)) = (state.data.clone(), state.loaded_at)
+            && at.elapsed() < expire
+        {
+            return Ok(data);
+        }
+        let rows = dal.select_all_rows(&self.table, session)?;
+        let data = Arc::new(rows);
+        state.data = Some(data.clone());
+        state.loaded_at = Some(Instant::now());
+        self.stale_served.store(false, Ordering::Relaxed);
+        Ok(data)
     }
 
     /// 强制重新加载整表。
     pub fn reload(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<Arc<Vec<DbRow>>> {
+        let mut state = self.write_state();
         let rows = dal.select_all_rows(&self.table, session)?;
         let data = Arc::new(rows);
-        let mut state = lock(&self.state);
         state.data = Some(data.clone());
         state.loaded_at = Some(Instant::now());
-        state.stale_served = false;
+        self.stale_served.store(false, Ordering::Relaxed);
         Ok(data)
     }
 
     /// 使缓存失效（写入后由 DAL 自动调用；下次访问重新加载）。
     pub fn invalidate(&self) {
-        let mut state = lock(&self.state);
+        let mut state = self.write_state();
         state.data = None;
         state.loaded_at = None;
-        state.stale_served = false;
+        self.stale_served.store(false, Ordering::Relaxed);
     }
 
     /// 在已缓存的整表数据上做过滤查找（未加载时返回空列表）。
@@ -173,7 +238,7 @@ impl EntityCache {
     where
         P: Fn(&DbRow) -> bool,
     {
-        let state = lock(&self.state);
+        let state = self.read_state();
         match &state.data {
             Some(data) => data.iter().filter(|row| predicate(row)).cloned().collect(),
             None => Vec::new(),
@@ -185,7 +250,7 @@ impl EntityCache {
     where
         P: Fn(&DbRow) -> bool,
     {
-        let state = lock(&self.state);
+        let state = self.read_state();
         state
             .data
             .as_ref()
@@ -549,14 +614,75 @@ mod tests {
             )
             .unwrap();
 
-        // 过期时间置 0：任何访问都视为过期
+        // 默认 Blocking：过期后第一次访问即同步重载（强一致）
         cache.set_expire_seconds(0);
         assert!(!cache.is_valid());
-        // 首次过期访问：返回旧值（不阻塞，对应 C# “旧值 + 异步刷新”）
-        assert_eq!(cache.entities(&dal, session.as_mut()).unwrap().len(), 1);
-        // 下次访问：同步重载
         assert_eq!(cache.entities(&dal, session.as_mut()).unwrap().len(), 2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_while_revalidate_serves_old_then_refreshes() {
+        let (dal, dir) = temp_dal("stale");
+        let mut session = dal.open_session().unwrap();
+        let table = dal.table("Item").unwrap();
+        table
+            .insert(session.as_mut(), &[("Code", "A".into())])
+            .unwrap();
+
+        let cache = dal.entity_cache("Item").unwrap();
+        assert_eq!(cache.entities(&dal, session.as_mut()).unwrap().len(), 1);
+
+        session
+            .execute(
+                "INSERT INTO \"DH_Item\" (\"Code\") VALUES (?)",
+                &[DbValue::Text("B".into())],
+            )
+            .unwrap();
+
+        // 开启 SWR 并立即过期：首次访问返回旧值，第二次访问刷新
+        cache.set_consistency(CacheConsistency::StaleWhileRevalidate {
+            max_stale: Duration::from_secs(60),
+        });
+        cache.set_expire_seconds(0);
+        assert_eq!(cache.entities(&dal, session.as_mut()).unwrap().len(), 1);
+        assert_eq!(cache.entities(&dal, session.as_mut()).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 并发过期：写锁内单飞刷新，所有线程都能拿到数据（不会击穿成多次整表查询）。
+    #[test]
+    fn concurrent_expiry_single_flight() {
+        let (dal, dir) = temp_dal("single-flight");
+        {
+            let mut session = dal.open_session().unwrap();
+            let table = dal.table("Item").unwrap();
+            table
+                .insert(session.as_mut(), &[("Code", "A".into())])
+                .unwrap();
+            let cache = dal.entity_cache("Item").unwrap();
+            assert_eq!(cache.entities(&dal, session.as_mut()).unwrap().len(), 1);
+            cache.set_expire_seconds(0);
+        }
+
+        let dal = std::sync::Arc::new(dal);
+        let cache = dal.entity_cache("Item").unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let dal = dal.clone();
+            let cache = cache.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut session = dal.open_session().unwrap();
+                cache.entities(&dal, session.as_mut()).unwrap().len()
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), 1, "并发过期应都能拿到数据");
+        }
+
+        drop(dal);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

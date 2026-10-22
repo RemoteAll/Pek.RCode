@@ -45,7 +45,7 @@ Pek 生态的 Rust 数据中间件（独立项目）：让 C#/.NET 项目（DH.N
 | `pool` | `ConnectionPool` | ✅ 会话连接池（按连接串共享；Min=CPU(2–8)/Max=1000/空闲 30s；`Pooling=false` 关闭） |
 | `async_dal` | `IAsyncDbSession` / `*Async` | ✅ 异步门面（tokio `spawn_blocking` 包装全驱动；`run`/`with_session` 覆盖全部同步 API） |
 | `catalog` | 各 `DbBase.OnGetTables` 元数据 | ✅ 全驱动目录读取（表/列/索引；MongoDB 除外；Access 走 ODBC 元数据） |
-| `cache` | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | ✅ 整表实体缓存 + 单对象缓存（默认 60s 过期；**过期后先返回旧值、下次访问刷新**——不阻塞读；写入自动失效）；✅ Redis 版本号（feature `redis`，底层为 **Pek.RRedis** 自研客户端） |
+| `cache` | `XCode.Cache`（`Meta.Cache` / `Meta.SingleCache`） | ✅ 整表实体缓存 + 单对象缓存（默认 60s 过期；**一致性模式可选**——默认 `Blocking` 过期即同步重载，或 `StaleWhileRevalidate` 允许短暂旧值；写入自动失效）；✅ Redis 版本号（feature `redis`，底层为 **Pek.RRedis** 自研客户端） |
 | `reverse` | `DAL.GetTables`（反向工程） | ✅ 数据库 → `EntityModel` / `Model.xml`（**全部驱动**、含索引/唯一约束；`rcodegen --conn`） |
 | `entity` | `Entity` 基类（对象实体） | ✅ `insert / save / update / delete / find / query / count`；**脏字段更新**（生成实体 `set_xxx` 登记脏列，`update` 只写变化列、无修改不发 SQL）；`AuditExt` 审计字段访问；`#[derive(Entity)]` 宏；分表变体 `insert_sharded` / `find_sharded` / `query_sharded` 等 |
 | `batch` | `BatchFinder` / `EntityExtension`（批量写入） | ✅ 批量写入全清单：`insert_batch`（多行 VALUES）/ `insert_batch_sharded`（**分片提前计算、按（连接, 物理表）分组批量插入**，跨库自动路由）/ `insert_ignore_batch` / `replace_batch` / `upsert_batch` / `upsert_batch_sharded`（On Conflict 多行 Upsert）/ `update_batch` / `update_batch_sharded` / `save_batch` / `save_batch_sharded`（新增合并批插、已存在逐条更新，对齐 `Save(list)`）/ `delete_batch` / `delete_batch_sharded`（主键 `IN` 分批）/ `TableRef::delete_where_batched`（C# 分批删除矩阵：LIMIT/TOP/ctid/ROWID/rowid，默认 10000/批 + 100ms 间隔）；导航批量装载 `load_ones` / `load_manys`（`BatchLoadNavigations` 等价）；`enqueue_save` 入队 + `EntityQueue` 批量刷入（**`SaveAsync` 等价物**）；批量查找 `BatchFinder`（主键 `IN` 合并） |
@@ -365,7 +365,16 @@ order.delete(&dal, session.as_mut())?;
 - `save_batch` 对“无自增列 + 单一主键”一次 `IN` 查询判定存在性（N 次点查 → 1 次）；
   `save_batch_sharded` 按 `(连接, 物理表)` 分组后每组一次 `IN`（跨库自动路由）；
 - `RowSet` 的列名索引**同结果集只构建一次**（各行共享），多列/多行装载不再 O(列数²)；
-- 实体缓存过期后先返回旧值（不阻塞），下次访问同步刷新；无脏数据时 `update` / `save` / `update_columns` 不发 SQL、`enqueue_save` 不入队。
+- 实体缓存默认 **`Blocking`**（过期即同步重载，强一致安全）；读多写少、可容忍短暂旧值的表可
+  `cache.set_consistency(pek_rcode::cache::CacheConsistency::StaleWhileRevalidate { max_stale })`（过期后在窗口内先返回旧值、下次访问刷新）；
+- 无脏数据时 `update` / `save` / `update_columns` 不发 SQL、`enqueue_save` 不入队。
+
+> **缓存选型建议**：权限/余额/库存等强一致数据 → 用 `Blocking`，或直接 `find`/`find_by_pk` 查库（不经整表缓存）；
+> 参数/字典/分类等读多写少 → 可开 `StaleWhileRevalidate`；跨进程写入的实时性任何进程内缓存都无法保证，用短过期或直查。
+>
+> **数据库压力**：整表缓存每表**每 60s 至多一次** `SELECT *`（仅在有访问时触发），且**并发过期单飞**
+> （写锁内只查一次，其它线程等待复用结果）；≤1000 行的小表可忽略，万行以上或写频繁的表不建议用整表缓存
+> （写后失效会让每次读都整表重载）。
 
 > 生成产物已用真实模型（`JiLiYu`、`VerifyCode`）做过编译与运行验证。
 
