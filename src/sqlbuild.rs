@@ -225,20 +225,10 @@ pub fn multi_write_sql_named(
         )));
     }
 
-    let cols: Vec<String> = columns
-        .iter()
-        .map(|field| column_name(table, field).map(|name| kind.quote(name)))
-        .collect::<Result<_>>()?;
-
-    let mut tuples = Vec::with_capacity(rows);
-    let mut index = 0usize;
-    for _ in 0..rows {
-        let mut marks = Vec::with_capacity(columns.len());
-        for _ in columns {
-            marks.push(kind.placeholder(index));
-            index += 1;
-        }
-        tuples.push(format!("({})", marks.join(", ")));
+    // 校验列名并解析物理名（不分配；后续直接按方言引用写入 SQL）
+    let mut resolved: Vec<&str> = Vec::with_capacity(columns.len());
+    for field in columns {
+        resolved.push(column_name(table, field)?);
     }
 
     let (head, tail): (&str, String) = match mode {
@@ -332,12 +322,43 @@ pub fn multi_write_sql_named(
         }
     };
 
-    Ok(format!(
-        "{head} {} ({}) VALUES {}{tail}",
-        kind.quote(table_name),
-        cols.join(", "),
-        tuples.join(", ")
-    ))
+    // 零中间分配拼接：直接写入预分配缓冲（每行不再建 Vec/format 字符串）
+    // 单个占位符最长约 8 字符（`@p123456` / `$123456`），其余方言 1 字符
+    let slot = match kind {
+        DatabaseKind::PostgreSql | DatabaseKind::Oracle | DatabaseKind::SqlServer => 8,
+        _ => 1,
+    };
+    let mut sql = String::with_capacity(
+        32 + resolved.len() * 16 + rows * (resolved.len() * (slot + 2) + 4) + tail.len(),
+    );
+    sql.push_str(head);
+    sql.push(' ');
+    kind.push_quoted(&mut sql, table_name);
+    sql.push_str(" (");
+    for (position, name) in resolved.iter().enumerate() {
+        if position > 0 {
+            sql.push_str(", ");
+        }
+        kind.push_quoted(&mut sql, name);
+    }
+    sql.push_str(") VALUES ");
+    let mut index = 0usize;
+    for row in 0..rows {
+        if row > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('(');
+        for column in 0..resolved.len() {
+            if column > 0 {
+                sql.push_str(", ");
+            }
+            kind.push_placeholder(&mut sql, index);
+            index += 1;
+        }
+        sql.push(')');
+    }
+    sql.push_str(&tail);
+    Ok(sql)
 }
 
 /// 组装多行 INSERT 语句（[`BatchWriteMode::Insert`] 的便捷入口，保留原签名）。
@@ -838,24 +859,26 @@ pub fn select_sql_named(
     table_name: &str,
     query: &Query,
 ) -> (String, Vec<DbValue>) {
-    // 查询列
-    let columns = if query.select.is_empty() {
-        "*".to_string()
+    // 查询列（直接写入缓冲：不建 `columns` 中的 String、不 join）
+    let mut sql = String::with_capacity(64 + table.columns.len() * 8);
+    sql.push_str("SELECT ");
+    if query.select.is_empty() {
+        sql.push('*');
     } else {
-        query
-            .select
-            .iter()
-            .map(|c| match table.column(c) {
-                Some(col) => kind.quote(table.effective_column_name(col)),
-                None => c.clone(), // 原始表达式（函数、别名等）
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+        for (position, column) in query.select.iter().enumerate() {
+            if position > 0 {
+                sql.push_str(", ");
+            }
+            match table.column(column) {
+                Some(col) => kind.push_quoted(&mut sql, table.effective_column_name(col)),
+                None => sql.push_str(column), // 原始表达式（函数、别名等）
+            }
+        }
+    }
+    sql.push_str(" FROM ");
+    kind.push_quoted(&mut sql, table_name);
 
     let mut params = Vec::new();
-    let mut sql = format!("SELECT {columns} FROM {}", kind.quote(table_name));
-
     if let Some(filter) = &query.filter {
         let where_sql = filter.render(kind, &mut params);
         if !where_sql.is_empty() {
@@ -873,7 +896,7 @@ pub fn select_sql_named(
         && (paging || query.limit.is_some() || query.offset.is_some())
         && !table.primary_keys().is_empty()
     {
-        order_sql = render_order_of(kind, table, &default_order_columns(table));
+        order_sql = render_order_of(kind, table, &primary_key_names(table));
     }
 
     // 分页优先于 offset/limit；offset 无 limit 时按"跳到末尾取全部"处理（BIGINT 上限）
@@ -893,46 +916,54 @@ pub fn select_sql_named(
     (sql, params)
 }
 
-/// 渲染 `ORDER BY` 子句（空列表返回空串）。
+/// 渲染 `ORDER BY` 子句（空列表返回空串；列名直接写入缓冲，不建中间 String 列表）。
 fn render_order(kind: DatabaseKind, table: &TableMeta, orders: &[OrderBy]) -> String {
     if orders.is_empty() {
         return String::new();
     }
-    let parts: Vec<String> = orders
-        .iter()
-        .map(|o| {
-            let name = match table.column(&o.column) {
-                Some(col) => kind.quote(table.effective_column_name(col)),
-                None => o.column.clone(),
-            };
-            if o.desc {
-                format!("{name} DESC")
-            } else {
-                name.to_string()
-            }
-        })
-        .collect();
-    format!("ORDER BY {}", parts.join(", "))
+    let mut out = String::with_capacity(16 + orders.len() * 20);
+    out.push_str("ORDER BY ");
+    for (position, order) in orders.iter().enumerate() {
+        if position > 0 {
+            out.push_str(", ");
+        }
+        match table.column(&order.column) {
+            Some(col) => kind.push_quoted(&mut out, table.effective_column_name(col)),
+            None => out.push_str(&order.column),
+        }
+        if order.desc {
+            out.push_str(" DESC");
+        }
+    }
+    out
 }
 
-/// 按列名渲染升序 `ORDER BY`。
-fn render_order_of(kind: DatabaseKind, table: &TableMeta, columns: &[String]) -> String {
-    let orders: Vec<OrderBy> = columns
-        .iter()
-        .map(|c| OrderBy {
-            column: c.clone(),
-            desc: false,
-        })
-        .collect();
-    render_order(kind, table, &orders)
+/// 按物理列名渲染升序 `ORDER BY`（不再克隆列名）。
+fn render_order_of(kind: DatabaseKind, table: &TableMeta, columns: &[&str]) -> String {
+    if columns.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(16 + columns.len() * 20);
+    out.push_str("ORDER BY ");
+    for (position, column) in columns.iter().enumerate() {
+        if position > 0 {
+            out.push_str(", ");
+        }
+        match table.column(column) {
+            Some(col) => kind.push_quoted(&mut out, table.effective_column_name(col)),
+            None => out.push_str(column),
+        }
+    }
+    out
 }
 
-/// 默认排序列：主键（用于分页时保证结果稳定）。
-fn default_order_columns(table: &TableMeta) -> Vec<String> {
+/// 主键物理列名（不分配 String）。
+fn primary_key_names(table: &TableMeta) -> Vec<&str> {
     table
-        .primary_keys()
+        .columns
         .iter()
-        .map(|c| c.name.clone())
+        .filter(|column| column.primary_key)
+        .map(|column| table.effective_column_name(column))
         .collect()
 }
 
