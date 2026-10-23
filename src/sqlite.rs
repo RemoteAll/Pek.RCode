@@ -5,6 +5,9 @@
 
 use rusqlite::types::{ToSql, ToSqlOutput, Value as SqlValue, ValueRef};
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
 use crate::session::{DbRow, RowSet, SqlSession};
@@ -15,6 +18,9 @@ use crate::value::{DbValue, format_datetime};
 /// 单张表一次 `insert`/`select` 只产生 1 条 SQL，几十张表的常规业务 ≤ 64 条即可覆盖；
 /// 超出后按 LRU 淘汰，不影响正确性。
 pub const STATEMENT_CACHE_CAPACITY: usize = 64;
+
+/// 列名缓存容量（SQL → 列名列表）：超出后整表清空（动态 SQL 场景不会无界增长）。
+pub const COLUMN_CACHE_CAPACITY: usize = 128;
 
 /// 默认同步模式：**Off**（对齐 DH.NCode `SQLite.cs` 的 `Synchronous=Off`，高频写入最快）。
 ///
@@ -175,6 +181,8 @@ impl SqliteOptions {
 pub struct SqliteSession {
     /// rusqlite 连接
     conn: rusqlite::Connection,
+    /// 列名缓存（SQL → 列名）：同构查询只构建一次列名列表，省掉每轮 N 次 `String` 分配
+    column_cache: HashMap<String, Arc<Vec<String>>>,
 }
 
 impl SqliteSession {
@@ -211,12 +219,18 @@ impl SqliteSession {
             let _ = conn.execute_batch(&format!("PRAGMA cache_size={size};"));
         }
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            column_cache: HashMap::new(),
+        })
     }
 
     /// 包装现有的 rusqlite 连接（例如测试中的内存连接）。
     pub fn from_connection(conn: rusqlite::Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            column_cache: HashMap::new(),
+        }
     }
 
     /// 底层连接引用（高级用法，如批量 Prepare）。
@@ -288,16 +302,32 @@ impl SqlSession for SqliteSession {
 
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
         let values: Vec<SqlParam> = params.iter().map(to_param).collect();
-        let mut stmt = self.conn.prepare_cached(sql)?;
+        let Self {
+            conn,
+            column_cache,
+        } = self;
+        let mut stmt = conn.prepare_cached(sql)?;
 
-        // 先取出列名（借用在查询前结束）
-        let columns: Vec<String> = stmt
-            .column_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        // 列名按 SQL 缓存：分页/条件只有参数不同的同构查询，不再每轮重建列名列表
+        // （宽表每轮省 N 次 `String` 分配）；动态 SQL 超出容量时整表清空，避免无界增长。
+        let columns = match column_cache.get(sql) {
+            Some(cached) => cached.clone(),
+            None => {
+                let names = Arc::new(
+                    stmt.column_names()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                );
+                if column_cache.len() >= COLUMN_CACHE_CAPACITY {
+                    column_cache.clear();
+                }
+                column_cache.insert(sql.to_string(), names.clone());
+                names
+            }
+        };
 
-        let mut result = RowSet::new(columns);
+        let mut result = RowSet::with_columns(columns);
         let column_count = result.columns.len();
 
         let mut rows = stmt.query(rusqlite::params_from_iter(values))?;

@@ -33,6 +33,15 @@ impl RowSet {
         }
     }
 
+    /// 由**共享**列名创建空结果集（驱动层复用列名缓存时使用：同构查询不再重建列名列表）。
+    pub(crate) fn with_columns(columns: Arc<Vec<String>>) -> Self {
+        Self {
+            columns,
+            rows: Vec::new(),
+            index: Arc::new(OnceLock::new()),
+        }
+    }
+
     /// 追加一行。
     pub fn push(&mut self, values: Vec<DbValue>) {
         // 宽表：列名索引与本结果集共享，**首次按名取值时才构建**；小表直接线性比较无需索引
