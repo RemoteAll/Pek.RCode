@@ -35,6 +35,8 @@ pub enum Op {
     NotNull,
     /// 区间
     Between,
+    /// 原始 SQL 片段（`column` 原样输出，`?` 按顺序由 `values` 填占位；仅限可信字面量）
+    Raw,
 }
 
 /// 单个条件项。
@@ -175,6 +177,33 @@ impl Where {
         self.and_raw(column, Op::NotNull, vec![])
     }
 
+    /// 追加一段**原始 SQL 条件**（`?` 占位按顺序由 `values` 填充）。
+    ///
+    /// 用于表达 `AND` 无法组合的语义（如多列 `OR`）。`fragment` 必须是**可信字面量**，
+    /// 严禁拼接用户输入（值一律走 `values` 参数化）。
+    pub fn raw(self, fragment: impl Into<String>, values: Vec<DbValue>) -> Self {
+        self.and_raw(fragment, Op::Raw, values)
+    }
+
+    /// 任一列模糊匹配：`(c1 LIKE ? OR c2 LIKE ? ...)`。
+    ///
+    /// 对齐 C# `_.Name.Contains(k) | _.Code.Contains(k) | ...` 这种「关键字搜索」语义
+    /// （`Where` 的条件之间固定为 `AND`，多列任一命中需 `OR`）。
+    /// `columns` 须为受信任的列名标识符。
+    pub fn any_like(self, columns: &[&str], pattern: impl Into<String>) -> Self {
+        if columns.is_empty() {
+            return self;
+        }
+        let pattern = pattern.into();
+        let expr = columns
+            .iter()
+            .map(|c| format!("{c} LIKE ?"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let values = vec![DbValue::Text(pattern); columns.len()];
+        self.raw(format!("({expr})"), values)
+    }
+
     /// 渲染条件片段并追加参数。
     ///
     /// - 占位符编号基于 `params` 的当前长度，调用方应先把前置参数（如 UPDATE 的 SET 值）放入 `params`
@@ -234,6 +263,25 @@ impl Where {
                     out.push_str(" AND ");
                     kind.push_placeholder(out, params.len());
                     params.push(cond.values[1].clone());
+                }
+                Op::Raw => {
+                    // 片段原样输出，`?` 逐个替换为方言占位符并填参数
+                    let mut parts = cond.column.split('?');
+                    if let Some(first) = parts.next() {
+                        out.push_str(first);
+                    }
+                    let mut it = cond.values.iter();
+                    for part in parts {
+                        match it.next() {
+                            Some(value) => {
+                                kind.push_placeholder(out, params.len());
+                                params.push(value.clone());
+                            }
+                            // 占位符多于值：按原文输出，不静默吞掉（便于暴露调用方错误）
+                            None => out.push('?'),
+                        }
+                        out.push_str(part);
+                    }
                 }
                 _ => {
                     let op = match cond.op {
@@ -431,5 +479,107 @@ mod tests {
         assert_eq!(quote_or_raw(DatabaseKind::Sqlite, "COUNT(*)"), "COUNT(*)");
         // 恶意列名不会直接进入 SQL（会被整体引用或拒绝）
         assert_eq!(quote_or_raw(DatabaseKind::Sqlite, "a b"), "a b");
+    }
+
+    #[test]
+    fn raw_fragment_renders_verbatim_with_params() {
+        let mut params = Vec::new();
+        let sql = Where::new()
+            .eq("Id", 1)
+            .raw("(Name LIKE ? OR Code LIKE ?)", vec!["k".into(), "k".into()])
+            .render(DatabaseKind::Sqlite, &mut params);
+        assert_eq!(sql, "(\"Id\" = ? AND (Name LIKE ? OR Code LIKE ?))");
+        assert_eq!(params.len(), 3);
+
+        // SQL Server 占位符按序号递增，且沿用调用方已占用的下标
+        let mut params = vec![DbValue::from(9)];
+        let sql = Where::new()
+            .raw("LEN(Code) > ?", vec![3.into()])
+            .render(DatabaseKind::SqlServer, &mut params);
+        assert_eq!(sql, "(LEN(Code) > @p1)");
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn any_like_builds_or_group() {
+        let mut params = Vec::new();
+        let sql = Where::new()
+            .eq("Enable", true)
+            .any_like(&["Name", "Code", "Remark"], "%hlk%")
+            .render(DatabaseKind::Sqlite, &mut params);
+        assert_eq!(
+            sql,
+            "(\"Enable\" = ? AND (Name LIKE ? OR Code LIKE ? OR Remark LIKE ?))"
+        );
+        assert_eq!(params.len(), 4, "3 列各一个同名模式参数");
+        // 模式作用于每一列
+        assert!(params[1..].iter().all(|v| v.as_str() == Some("%hlk%")));
+
+        // 空列集合不生成条件（避免恒假/恒真）
+        let mut params = Vec::new();
+        assert_eq!(Where::new().any_like(&[], "%x%").render(DatabaseKind::Sqlite, &mut params), "");
+        assert!(params.is_empty());
+    }
+
+    /// 端到端：`any_like` 与 `raw` 在真实 SQLite 上按预期命中。
+    #[test]
+    fn any_like_matches_any_column_on_sqlite() {
+        use crate::dal::Dal;
+
+        let dir = std::env::temp_dir().join(format!(
+            "pek-where-or-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = format!(
+            "Data Source={};Provider=SQLite",
+            dir.join("where.db").display()
+        );
+        let dal = Dal::open(&conn).expect("打开 SQLite");
+        let mut s = dal.open_session().expect("会话");
+        s.execute("create table T (Id integer primary key, Name text, Code text, Remark text)", &[])
+            .expect("建表");
+        for (id, name, code, remark) in [
+            (1, "alpha", "A1", ""),
+            (2, "beta", "HLK-9", ""),
+            (3, "gamma", "G3", "hlk 备注"),
+            (4, "delta", "D4", ""),
+        ] {
+            s.execute(
+                "insert into T (Id, Name, Code, Remark) values (?, ?, ?, ?)",
+                &[id.into(), name.into(), code.into(), remark.into()],
+            )
+            .expect("插行");
+        }
+
+        let mut hit = |list: &[&str], pat: &str| -> Vec<i64> {
+            let rows = s
+                .query(
+                    &format!(
+                        "select Id from T where {} order by Id",
+                        Where::new().any_like(list, pat).render(DatabaseKind::Sqlite, &mut Vec::new())
+                    ),
+                    &{
+                        let mut p = Vec::new();
+                        Where::new().any_like(list, pat).render(DatabaseKind::Sqlite, &mut p);
+                        p
+                    },
+                )
+                .expect("查询");
+            rows.rows
+                .iter()
+                .map(|r| r.get_by_name("Id").and_then(|v| v.as_i64()).unwrap_or(0))
+                .collect()
+        };
+
+        assert_eq!(hit(&["Name", "Code", "Remark"], "%hlk%"), vec![2, 3], "Code 与 Remark 任一命中");
+        assert_eq!(hit(&["Name"], "%ta"), vec![2, 4], "只有 beta/delta 命中");
+        assert!(hit(&["Code"], "%zzz%").is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
