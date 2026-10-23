@@ -988,9 +988,6 @@ fn fix_shard_order(
     result
 }
 
-/// 批量写入分组：目标分片 + 该分片的行集合。
-type ShardBatchRows = (ShardModel, Vec<Vec<(String, DbValue)>>);
-
 /// 分表执行引擎：表句柄上的跨表操作（对应 C# `Entity.FindAll/FindCount/Delete/AutoShard` 的分表分支）。
 impl<'a> TableRef<'a> {
     /// 分表基础信息（连接名取表级 / 模型级配置，表名取模型物理名）。
@@ -1076,40 +1073,38 @@ impl<'a> TableRef<'a> {
     ///
     /// 对齐 C# `BatchInsert` 的分表分支（`EntityExtension`：`fact.ShardPolicy.Shard(e)` 分组）。
     /// 分组保持出现顺序，同一分片内的行仍走多行 `INSERT` 优化。
-    pub(crate) fn write_batch_auto_sharded(
+    /// 行类型泛型化（借用行不复制），分组只存行引用。
+    pub(crate) fn write_batch_auto_sharded<F: crate::dal::BatchField>(
         &self,
         session: &mut dyn SqlSession,
         spec: &ShardSpec,
-        rows: &[Vec<(String, DbValue)>],
+        rows: &[Vec<F>],
         mode: crate::sqlbuild::BatchWriteMode,
         batch_size: Option<usize>,
     ) -> Result<u64> {
+        use crate::dal::BatchRow;
         let policy = policy_of(spec);
         let base = self.shard_base();
-        let mut groups: Vec<ShardBatchRows> = Vec::new();
+        let mut groups: Vec<(ShardModel, Vec<&Vec<F>>)> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
 
-        for row in rows.iter().filter(|r| !r.is_empty()) {
-            let value = row
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(&spec.field))
-                .map(|(_, value)| value)
-                .ok_or_else(|| {
-                    Error::Model(format!(
-                        "分表策略要求指定时间字段（表 {} 缺少列 {}）",
-                        self.meta().name,
-                        spec.field
-                    ))
-                })?;
+        for row in rows.iter().filter(|row| !row.is_empty()) {
+            let value = row.find_value(&spec.field).ok_or_else(|| {
+                Error::Model(format!(
+                    "分表策略要求指定时间字段（表 {} 缺少列 {}）",
+                    self.meta().name,
+                    spec.field
+                ))
+            })?;
             let Some(shard) = policy.shard_of_value(base, value)? else {
                 return Err(Error::Model("分表策略因条件不足无法执行分表操作！".into()));
             };
             let key = shard.key();
             match index.get(&key) {
-                Some(&i) => groups[i].1.push(row.clone()),
+                Some(&i) => groups[i].1.push(row),
                 None => {
                     index.insert(key, groups.len());
-                    groups.push((shard, vec![row.clone()]));
+                    groups.push((shard, vec![row]));
                 }
             }
         }
@@ -1118,7 +1113,7 @@ impl<'a> TableRef<'a> {
         for (shard, list) in groups {
             let affected = self
                 .run_on_shard(session, &shard, true, |table, session| {
-                    table.write_batch_prepared_single(session, &list, mode, batch_size)
+                    table.write_batch_rows_core(session, &list, mode, batch_size)
                 })?
                 .unwrap_or(0);
             total += affected;
