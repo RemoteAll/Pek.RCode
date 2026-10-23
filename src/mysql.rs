@@ -451,6 +451,21 @@ impl SqlSession for MysqlSession {
         Ok(value.unwrap_or(0))
     }
 
+    /// 插入并返回自增主键：读驱动 OK 包中的 `last_insert_id`，**省掉一次 `SELECT LAST_INSERT_ID()` 往返**。
+    ///
+    /// 通用 [`SqlSession::last_identity`] 仍走查询（中间可能夹其它语句，语义更稳）；
+    /// 本方法只用于"插入后立即取主键"（`TableRef::insert`），两者等价。
+    fn insert_and_get_identity(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+        _table: Option<&str>,
+    ) -> Result<i64> {
+        let values: Vec<Value> = params.iter().map(dbvalue_to_mysql).collect();
+        self.conn.exec_drop(sql, values).map_err(map_err)?;
+        Ok(self.conn.last_insert_id() as i64)
+    }
+
     fn table_exists(&mut self, table: &str) -> Result<bool> {
         let count: Option<i64> = self
             .conn
