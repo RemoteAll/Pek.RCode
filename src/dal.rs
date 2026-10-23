@@ -1891,6 +1891,10 @@ impl<'a> TableRef<'a> {
         batch_size: Option<usize>,
     ) -> Result<u64> {
         self.ensure_writable()?;
+        // 无拦截器且非分表：直接用借用行执行（省每行每列一次 String 分配 + 值 clone）
+        if !crate::interceptor::has_registered() && self.shard_spec().is_none() {
+            return self.write_batch_borrowed_single(session, rows, mode, batch_size);
+        }
         let prepared: Vec<Vec<(String, DbValue)>> = rows
             .iter()
             .map(|fields| {
@@ -1992,6 +1996,89 @@ impl<'a> TableRef<'a> {
         Ok(affected)
     }
 
+    /// 借用行版本的批量写入（无拦截器/非分表快路）。
+    ///
+    /// 与 [`TableRef::write_batch_prepared_single`] 逻辑一致，仅行类型不同（`&str` 列名）。
+    /// **两份逻辑需同步修改**（行为由 `tests/batch_e2e.rs` 覆盖）。
+    fn write_batch_borrowed_single(
+        &self,
+        session: &mut dyn SqlSession,
+        rows: &[Vec<(&str, DbValue)>],
+        mode: BatchWriteMode,
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        self.ensure_writable()?;
+        let rows: Vec<&Vec<(&str, DbValue)>> =
+            rows.iter().filter(|row| !row.is_empty()).collect();
+        let Some(first) = rows.first() else {
+            return Ok(0);
+        };
+        let batch = batch_size
+            .unwrap_or(crate::batch::DEFAULT_INSERT_BATCH_SIZE)
+            .max(1);
+
+        // 列集 = 首行列集；首行自增列为 0/缺失 → 整批排除自增列（对齐 C# `BuildInsertColumns`）
+        let identity = self.table.identity().map(|c| c.name.clone());
+        let drop_identity = identity.as_ref().is_some_and(|name| {
+            first
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .and_then(|(_, v)| v.as_i64())
+                .unwrap_or(0)
+                == 0
+        });
+        let columns: Vec<&str> = first
+            .iter()
+            .map(|(k, _)| *k)
+            .filter(|k| {
+                !(drop_identity && identity.as_deref().is_some_and(|id| k.eq_ignore_ascii_case(id)))
+            })
+            .collect();
+        if columns.is_empty() {
+            return Err(Error::Model(format!(
+                "表 {} 的批量写入没有可写字段",
+                self.table.name
+            )));
+        }
+
+        let mut affected = 0u64;
+        match mode {
+            BatchWriteMode::Insert => {
+                if self.dal.kind.supports_multi_row_insert() {
+                    affected +=
+                        self.exec_multi_write_borrowed(session, &rows, &columns, batch, mode)?;
+                } else {
+                    for row in &rows {
+                        let _ = self.insert_prepared(session, row.as_slice())?;
+                        affected += 1;
+                    }
+                }
+            }
+            BatchWriteMode::InsertIgnore | BatchWriteMode::Replace => {
+                affected += self.exec_multi_write_borrowed(session, &rows, &columns, batch, mode)?;
+            }
+            BatchWriteMode::Upsert => {
+                // 回退/多行 Upsert 需要 owned 行（罕见路径）：转 owned 后复用现有实现
+                let owned: Vec<Vec<(String, DbValue)>> = rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|(name, value)| ((*name).to_string(), value.clone()))
+                            .collect()
+                    })
+                    .collect();
+                let refs: Vec<&Vec<(String, DbValue)>> = owned.iter().collect();
+                if self.dal.kind.supports_multi_upsert() {
+                    affected += self.exec_multi_write(session, &refs, &columns, batch, mode)?;
+                } else {
+                    affected += self.upsert_rows_fallback(session, &refs)?;
+                }
+            }
+        }
+        self.dal.invalidate_cache(self.physical_name());
+        Ok(affected)
+    }
+
     /// 多行写入执行（按参数上限与批大小分块；供各模式复用）。
     fn exec_multi_write(
         &self,
@@ -2044,6 +2131,71 @@ impl<'a> TableRef<'a> {
                 }
             } else {
                 // 防御路径：行内列集与首行不一致时按列名查找（缺失补 NULL）
+                for row in chunk {
+                    for column in columns {
+                        params.push(
+                            row.iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case(column))
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(DbValue::Null),
+                        );
+                    }
+                }
+            }
+            self.dal.log_sql(&sql);
+            affected += session.execute(&sql, &params)?;
+        }
+        Ok(affected)
+    }
+
+    /// 借用行版的多行写入执行（逻辑同 [`TableRef::exec_multi_write`]，仅行类型不同）。
+    fn exec_multi_write_borrowed(
+        &self,
+        session: &mut dyn SqlSession,
+        rows: &[&Vec<(&str, DbValue)>],
+        columns: &[&str],
+        batch: usize,
+        mode: BatchWriteMode,
+    ) -> Result<u64> {
+        let max_params = self.dal.kind.max_statement_params();
+        let per_statement = if max_params == 0 {
+            batch
+        } else {
+            (max_params / columns.len()).clamp(1, batch)
+        };
+        let mut affected = 0u64;
+        let Some(first) = rows.first() else {
+            return Ok(0);
+        };
+        let positions: Vec<Option<usize>> = columns
+            .iter()
+            .map(|column| {
+                first
+                    .iter()
+                    .position(|(k, _)| k.eq_ignore_ascii_case(column))
+            })
+            .collect();
+        let aligned = rows.iter().all(|row| {
+            !row.is_empty() && positions.iter().all(|p| p.is_some_and(|i| i < row.len()))
+        });
+        for chunk in rows.chunks(per_statement) {
+            let sql = sqlbuild::multi_write_sql_named(
+                self.dal.kind,
+                self.table,
+                self.physical_name(),
+                columns,
+                chunk.len(),
+                mode,
+            )?;
+            let mut params = Vec::with_capacity(chunk.len() * columns.len());
+            if aligned {
+                for row in chunk {
+                    for position in &positions {
+                        let (_, value) = &row[position.unwrap_or(0)];
+                        params.push(value.clone());
+                    }
+                }
+            } else {
                 for row in chunk {
                     for column in columns {
                         params.push(
