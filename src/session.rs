@@ -53,6 +53,45 @@ impl RowSet {
         }
     }
 
+    /// 掩码投影：保留全部列，把 `masks` 指定下标的列值替换为 `replacement` 文本。
+    ///
+    /// 用于「字段可见但值脱敏」的场景（如 `/Db/Query` 的 `mask` 策略）：调用方仍能按列名
+    /// 取到该列（不会报"字段不存在"），但拿到的是 `***`，真实数据不出本机。
+    /// 下标越界忽略；行数与行序不变。
+    pub fn mask_values(&self, masks: &[usize], replacement: &str) -> RowSet {
+        if masks.is_empty() {
+            return RowSet {
+                columns: Arc::clone(&self.columns),
+                rows: self.rows.clone(),
+                index: Arc::clone(&self.index),
+            };
+        }
+        let rows: Vec<DbRow> = self
+            .rows
+            .iter()
+            .map(|row| {
+                let values: Vec<DbValue> = row
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        if masks.contains(&index) {
+                            DbValue::Text(replacement.to_string())
+                        } else {
+                            value.clone()
+                        }
+                    })
+                    .collect();
+                DbRow::with_shared_index(self.columns.clone(), values, self.index.clone())
+            })
+            .collect();
+        RowSet {
+            columns: Arc::clone(&self.columns),
+            rows,
+            index: Arc::clone(&self.index),
+        }
+    }
+
     /// 创建空结果集。
     pub fn new(columns: Vec<String>) -> Self {
         Self {
