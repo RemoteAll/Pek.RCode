@@ -45,13 +45,20 @@ pub fn insert_sql_named(
         return Ok((influx_line_protocol(table, table_name, fields)?, Vec::new()));
     }
 
-    let mut columns = Vec::with_capacity(fields.len() + 1);
-    let mut marks = Vec::with_capacity(fields.len() + 1);
+    let mut columns_sql = String::with_capacity(fields.len() * 16);
+    let mut marks_sql = String::with_capacity(fields.len() * 4);
     let mut params = Vec::with_capacity(fields.len());
+    let mut first = true;
 
     for (index, (field, value)) in fields.iter().enumerate() {
-        columns.push(kind.quote(column_name(table, field)?));
-        marks.push(kind.placeholder(index));
+        let name = column_name(table, field)?;
+        if !first {
+            columns_sql.push_str(", ");
+            marks_sql.push_str(", ");
+        }
+        first = false;
+        kind.push_quoted(&mut columns_sql, name);
+        kind.push_placeholder(&mut marks_sql, index);
         params.push(value.clone());
     }
 
@@ -74,16 +81,23 @@ pub fn insert_sql_named(
             // Firebird：next value for "SEQ_x"
             _ => format!("next value for {}", kind.quote(&sequence)),
         };
-        columns.push(kind.quote(table.effective_column_name(identity)));
-        marks.push(expression);
+        if !first {
+            columns_sql.push_str(", ");
+            marks_sql.push_str(", ");
+        }
+        kind.push_quoted(&mut columns_sql, table.effective_column_name(identity));
+        marks_sql.push_str(&expression);
     }
 
-    let sql = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        kind.quote(table_name),
-        columns.join(", "),
-        marks.join(", ")
-    );
+    let mut sql =
+        String::with_capacity(20 + table_name.len() + columns_sql.len() + marks_sql.len());
+    sql.push_str("INSERT INTO ");
+    kind.push_quoted(&mut sql, table_name);
+    sql.push_str(" (");
+    sql.push_str(&columns_sql);
+    sql.push_str(") VALUES (");
+    sql.push_str(&marks_sql);
+    sql.push(')');
     Ok((sql, params))
 }
 
@@ -577,6 +591,78 @@ pub fn update_by_pk_sql_owned_named(
         set_sql.push_str(" = ");
         kind.push_placeholder(&mut set_sql, params.len());
         params.push(value);
+    }
+
+    let mut where_sql =
+        String::with_capacity(pk_names.len() * 16 + expected.len() * 18);
+    for (index, (name, value)) in pk_names.iter().zip(pk_values.iter()).enumerate() {
+        if index > 0 {
+            where_sql.push_str(" AND ");
+        }
+        kind.push_quoted(&mut where_sql, name);
+        where_sql.push_str(" = ");
+        kind.push_placeholder(&mut where_sql, params.len());
+        params.push(value.clone());
+    }
+    for (column, value) in expected {
+        let name = column_name(table, column)?;
+        where_sql.push_str(" AND ");
+        kind.push_quoted(&mut where_sql, name);
+        where_sql.push_str(" = ");
+        kind.push_placeholder(&mut where_sql, params.len());
+        params.push(value.clone());
+    }
+
+    let mut sql = String::with_capacity(16 + table_name.len() + set_sql.len() + where_sql.len());
+    sql.push_str("UPDATE ");
+    kind.push_quoted(&mut sql, table_name);
+    sql.push_str(" SET ");
+    sql.push_str(&set_sql);
+    sql.push_str(" WHERE ");
+    sql.push_str(&where_sql);
+
+    Ok((sql, params))
+}
+
+/// 组装**按主键 UPDATE**（借用列集版本，供无拦截器快路使用）：
+/// 与 [`update_by_pk_sql_owned_named`] 逐字节等价（单测护栏），差异仅为列集合是借用。
+pub fn update_by_pk_sql_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    sets: &[(&str, DbValue)],
+    pk_names: &[&str],
+    pk_values: &[DbValue],
+    expected: &[(&str, DbValue)],
+) -> Result<(String, Vec<DbValue>)> {
+    if sets.is_empty() {
+        return Err(Error::Model(format!(
+            "表 {} 的更新语句至少需要一个待更新字段",
+            table.name
+        )));
+    }
+    if pk_names.is_empty() || pk_names.len() != pk_values.len() {
+        return Err(Error::Model(format!(
+            "表 {} 主键列与值数量不匹配（列 {} 个，值 {} 个）",
+            table.name,
+            pk_names.len(),
+            pk_values.len()
+        )));
+    }
+
+    let mut params = Vec::with_capacity(sets.len() + pk_names.len() + expected.len() + 4);
+    let mut set_sql = String::with_capacity(sets.len() * 16);
+    let mut first = true;
+    for (field, value) in sets {
+        let name = column_name(table, field)?;
+        if !first {
+            set_sql.push_str(", ");
+        }
+        first = false;
+        kind.push_quoted(&mut set_sql, name);
+        set_sql.push_str(" = ");
+        kind.push_placeholder(&mut set_sql, params.len());
+        params.push(value.clone());
     }
 
     let mut where_sql =

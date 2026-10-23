@@ -128,6 +128,11 @@ pub fn apply_to(
     }
 }
 
+/// 是否注册过拦截器（写入路径无拦截器时可走零拷贝快路）。
+pub(crate) fn has_registered() -> bool {
+    HAS_INTERCEPTORS.load(Ordering::Relaxed)
+}
+
 /// 应用全局注册的拦截器（写入路径调用；未注册时是**无锁原子读**快路）。
 pub(crate) fn apply_registered(
     table: &TableMeta,

@@ -1716,6 +1716,10 @@ impl<'a> TableRef<'a> {
     /// - 其余：插入后通过会话读取自增函数（`last_insert_rowid()` / `LAST_INSERT_ID()` / `SCOPE_IDENTITY()`）
     pub fn insert(&self, session: &mut dyn SqlSession, fields: &[(&str, DbValue)]) -> Result<i64> {
         self.ensure_writable()?;
+        // 无拦截器且非分表：借用列集直接构建，省每列一次 String 分配
+        if !crate::interceptor::has_registered() && self.shard_spec().is_none() {
+            return self.insert_borrowed_single(session, fields);
+        }
         // 拦截器补全审计字段（对应实体拦截器 OnValid）
         let values = crate::interceptor::prepare(
             self.table,
@@ -1748,6 +1752,10 @@ impl<'a> TableRef<'a> {
         session: &mut dyn SqlSession,
         fields: &[(&str, DbValue)],
     ) -> Result<i64> {
+        // 已执行拦截器；非分表时直接借用构建（批量回退路径复用）
+        if self.shard_spec().is_none() {
+            return self.insert_borrowed_single(session, fields);
+        }
         let owned: Vec<(String, DbValue)> = fields
             .iter()
             .map(|(name, value)| (name.to_string(), value.clone()))
@@ -1774,13 +1782,38 @@ impl<'a> TableRef<'a> {
         session: &mut dyn SqlSession,
         fields: Vec<(String, DbValue)>,
     ) -> Result<i64> {
-        let identity = self.table.identity();
-        let (mut sql, params) = sqlbuild::insert_sql_owned_named(
+        let (sql, params) = sqlbuild::insert_sql_owned_named(
             self.dal.kind,
             self.table,
             self.physical_name(),
             fields,
         )?;
+        self.execute_insert_sql(session, sql, params)
+    }
+
+    /// 无拦截器/非分表快路：借用列集直接构建 INSERT（跳过 owned 转换）。
+    fn insert_borrowed_single(
+        &self,
+        session: &mut dyn SqlSession,
+        fields: &[(&str, DbValue)],
+    ) -> Result<i64> {
+        let (sql, params) = sqlbuild::insert_sql_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            fields,
+        )?;
+        self.execute_insert_sql(session, sql, params)
+    }
+
+    /// 执行已构建的 INSERT：自增回写（PG/DuckDB `RETURNING`、其余会话函数）与缓存失效。
+    fn execute_insert_sql(
+        &self,
+        session: &mut dyn SqlSession,
+        mut sql: String,
+        params: Vec<DbValue>,
+    ) -> Result<i64> {
+        let identity = self.table.identity();
 
         if let Some(id_col) = identity
             && matches!(
@@ -2233,21 +2266,33 @@ impl<'a> TableRef<'a> {
                 pk.len()
             )));
         }
-        // 拦截器刷新审计字段（对应实体拦截器 OnValid）
-        let values = crate::interceptor::prepare(
-            self.table,
-            crate::interceptor::DataMethod::Update,
-            sets,
-        );
-        let (sql, params) = sqlbuild::update_by_pk_sql_owned_named(
-            self.dal.kind,
-            self.table,
-            self.physical_name(),
-            values,
-            &pk_names,
-            pk,
-            &[],
-        )?;
+        // 拦截器刷新审计字段（对应实体拦截器 OnValid）；未启用拦截器时走借用快路
+        let (sql, params) = if crate::interceptor::has_registered() {
+            let values = crate::interceptor::prepare(
+                self.table,
+                crate::interceptor::DataMethod::Update,
+                sets,
+            );
+            sqlbuild::update_by_pk_sql_owned_named(
+                self.dal.kind,
+                self.table,
+                self.physical_name(),
+                values,
+                &pk_names,
+                pk,
+                &[],
+            )?
+        } else {
+            sqlbuild::update_by_pk_sql_named(
+                self.dal.kind,
+                self.table,
+                self.physical_name(),
+                sets,
+                &pk_names,
+                pk,
+                &[],
+            )?
+        };
         self.dal.log_sql(&sql);
         let affected = session.execute(&sql, &params)?;
         if affected > 0 {
@@ -2334,23 +2379,33 @@ impl<'a> TableRef<'a> {
                 pk.len()
             )));
         }
-        // 拦截器刷新审计字段（对应实体拦截器 OnValid）
-        let values = crate::interceptor::prepare(
-            self.table,
-            crate::interceptor::DataMethod::Update,
-            sets,
-        );
-        // 主键与期望列直接拼进 WHERE（不构造 Where：每列省 3~5 次堆分配，
-        // 且期望列经模型校验/换成物理列名，PG/Oracle 大小写安全）
-        let (sql, params) = sqlbuild::update_by_pk_sql_owned_named(
-            self.dal.kind,
-            self.table,
-            self.physical_name(),
-            values,
-            &pk_names,
-            pk,
-            expected,
-        )?;
+        // 拦截器刷新审计字段（对应实体拦截器 OnValid）；未启用拦截器时走借用快路
+        let (sql, params) = if crate::interceptor::has_registered() {
+            let values = crate::interceptor::prepare(
+                self.table,
+                crate::interceptor::DataMethod::Update,
+                sets,
+            );
+            sqlbuild::update_by_pk_sql_owned_named(
+                self.dal.kind,
+                self.table,
+                self.physical_name(),
+                values,
+                &pk_names,
+                pk,
+                expected,
+            )?
+        } else {
+            sqlbuild::update_by_pk_sql_named(
+                self.dal.kind,
+                self.table,
+                self.physical_name(),
+                sets,
+                &pk_names,
+                pk,
+                expected,
+            )?
+        };
         self.dal.log_sql(&sql);
         let affected = session.execute(&sql, &params)?;
         // 成功 → 本进程缓存过期；冲突（0 行）→ 说明本进程读到的值已过期，同样必须失效，
