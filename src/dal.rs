@@ -292,7 +292,8 @@ fn create_session(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Box
             let path = conn_str.data_source().ok_or_else(|| {
                 Error::Model("SQLite 连接串缺少 Data Source（数据库文件路径）".into())
             })?;
-            Ok(Box::new(SqliteSession::open(path)?))
+            let options = crate::sqlite::SqliteOptions::from_connection_string(conn_str);
+            Ok(Box::new(SqliteSession::open_with_options(path, &options)?))
         }
         DatabaseKind::MySql => open_mysql(conn_str),
         DatabaseKind::SqlServer => open_sqlserver(conn_str),
@@ -2223,19 +2224,29 @@ impl<'a> TableRef<'a> {
         pk: &[DbValue],
     ) -> Result<u64> {
         self.ensure_writable()?;
-        let filter = self.pk_filter(pk)?;
+        let pk_names = self.pk_names();
+        if pk_names.len() != pk.len() {
+            return Err(Error::Model(format!(
+                "表 {} 主键需要 {} 个值，实际传入 {} 个",
+                self.table.name,
+                pk_names.len(),
+                pk.len()
+            )));
+        }
         // 拦截器刷新审计字段（对应实体拦截器 OnValid）
         let values = crate::interceptor::prepare(
             self.table,
             crate::interceptor::DataMethod::Update,
             sets,
         );
-        let (sql, params) = sqlbuild::update_sql_owned_named(
+        let (sql, params) = sqlbuild::update_by_pk_sql_owned_named(
             self.dal.kind,
             self.table,
             self.physical_name(),
             values,
-            &filter,
+            &pk_names,
+            pk,
+            &[],
         )?;
         self.dal.log_sql(&sql);
         let affected = session.execute(&sql, &params)?;
@@ -2314,21 +2325,30 @@ impl<'a> TableRef<'a> {
                 self.table.name
             )));
         }
-        let filter = self.pk_filter(pk)?;
+        let pk_names = self.pk_names();
+        if pk_names.len() != pk.len() {
+            return Err(Error::Model(format!(
+                "表 {} 主键需要 {} 个值，实际传入 {} 个",
+                self.table.name,
+                pk_names.len(),
+                pk.len()
+            )));
+        }
         // 拦截器刷新审计字段（对应实体拦截器 OnValid）
         let values = crate::interceptor::prepare(
             self.table,
             crate::interceptor::DataMethod::Update,
             sets,
         );
-        // 期望列直接拼进 WHERE（不构造 Where 条件：每列省 3~5 次堆分配，
-        // 且列名经模型校验/换成物理列名，PG/Oracle 大小写安全）
-        let (sql, params) = sqlbuild::update_if_sql_owned_named(
+        // 主键与期望列直接拼进 WHERE（不构造 Where：每列省 3~5 次堆分配，
+        // 且期望列经模型校验/换成物理列名，PG/Oracle 大小写安全）
+        let (sql, params) = sqlbuild::update_by_pk_sql_owned_named(
             self.dal.kind,
             self.table,
             self.physical_name(),
             values,
-            &filter,
+            &pk_names,
+            pk,
             expected,
         )?;
         self.dal.log_sql(&sql);
@@ -2687,6 +2707,16 @@ impl<'a> TableRef<'a> {
             sqlbuild::select_sql_named(self.dal.kind, self.table, self.physical_name(), query);
         self.dal.log_sql(&sql);
         session.query(&sql, &params)
+    }
+
+    /// 主键物理列名（按模型顺序；数量与值列表对齐）。
+    fn pk_names(&self) -> Vec<&str> {
+        self.table
+            .columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .map(|column| self.table.effective_column_name(column))
+            .collect()
     }
 
     /// 组装主键过滤条件。

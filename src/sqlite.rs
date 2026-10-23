@@ -16,6 +16,161 @@ use crate::value::{DbValue, format_datetime};
 /// 超出后按 LRU 淘汰，不影响正确性。
 pub const STATEMENT_CACHE_CAPACITY: usize = 64;
 
+/// 默认同步模式：**Off**（对齐 DH.NCode `SQLite.cs` 的 `Synchronous=Off`，高频写入最快）。
+///
+/// 代价：断电/硬重启可能损坏数据库（C# 源码注释亦明确承认）。
+/// 需要强一致的项目请在连接串显式设 `Synchronous=Normal`。
+pub const DEFAULT_SYNCHRONOUS: SqliteSynchronous = SqliteSynchronous::Off;
+
+/// 默认忙等待毫秒（多连接/多进程竞争时等待而不是直接报 `database is locked`）。
+pub const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5000;
+
+/// SQLite 同步模式（连接串 `Synchronous=`，与 C# 同名）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SqliteSynchronous {
+    /// `OFF`（默认，对齐 C#）：最快；断电可能损坏数据库
+    #[default]
+    Off,
+    /// `NORMAL`：WAL 下推荐；掉电可能丢最近事务，但不会损坏
+    Normal,
+    /// `FULL`
+    Full,
+    /// `EXTRA`
+    Extra,
+}
+
+impl SqliteSynchronous {
+    /// PRAGMA 值。
+    pub fn pragma(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Normal => "NORMAL",
+            Self::Full => "FULL",
+            Self::Extra => "EXTRA",
+        }
+    }
+
+    /// 解析（忽略大小写；未知值返回 `None`，由调用方回退默认）。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Some(Self::Off),
+            "normal" | "1" => Some(Self::Normal),
+            "full" | "2" => Some(Self::Full),
+            "extra" | "3" => Some(Self::Extra),
+            _ => None,
+        }
+    }
+}
+
+/// SQLite 日志模式（连接串 `Journal Mode=`，与 C# 同名）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SqliteJournalMode {
+    /// `WAL`（默认，对齐 C#）：读写并发更好
+    #[default]
+    Wal,
+    /// `DELETE`（回滚日志）
+    Delete,
+    /// `TRUNCATE`
+    Truncate,
+    /// `PERSIST`
+    Persist,
+    /// `MEMORY`（风险高，不推荐）
+    Memory,
+    /// `OFF`（无日志，风险最高）
+    Off,
+}
+
+impl SqliteJournalMode {
+    /// PRAGMA 值。
+    pub fn pragma(self) -> &'static str {
+        match self {
+            Self::Wal => "WAL",
+            Self::Delete => "DELETE",
+            Self::Truncate => "TRUNCATE",
+            Self::Persist => "PERSIST",
+            Self::Memory => "MEMORY",
+            Self::Off => "OFF",
+        }
+    }
+
+    /// 解析（忽略大小写；未知值返回 `None`）。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "wal" => Some(Self::Wal),
+            "delete" => Some(Self::Delete),
+            "truncate" => Some(Self::Truncate),
+            "persist" => Some(Self::Persist),
+            "memory" => Some(Self::Memory),
+            "off" | "none" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// SQLite 连接参数（默认值对齐 C# DH.NCode：`Journal Mode=WAL` + `Synchronous=Off`）。
+///
+/// 连接串可覆盖（键名与 C# 一致、大小写不敏感）：
+/// `Synchronous=Off|Normal|Full|Extra`、`Cache Size=-8192`（KiB，负数为单位）、
+/// `Journal Mode=WAL|Delete|...`、`BusyTimeout=5000`（毫秒）、`Readonly=true`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqliteOptions {
+    /// 日志模式（`None` = 不设置；只读连接使用，避免在只读文件上写 WAL）
+    pub journal_mode: Option<SqliteJournalMode>,
+    /// 同步模式
+    pub synchronous: SqliteSynchronous,
+    /// 页缓存（KiB，负数；`None` = 用 SQLite 默认）。C# 默认 512 MiB/连接，本库不默认跟随
+    pub cache_size_kib: Option<i64>,
+    /// 忙等待毫秒（0 = 不设置）
+    pub busy_timeout_ms: u64,
+    /// 只读连接（不设置 journal_mode）
+    pub read_only: bool,
+}
+
+impl Default for SqliteOptions {
+    fn default() -> Self {
+        Self {
+            journal_mode: Some(SqliteJournalMode::Wal),
+            synchronous: DEFAULT_SYNCHRONOUS,
+            cache_size_kib: None,
+            busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
+            read_only: false,
+        }
+    }
+}
+
+impl SqliteOptions {
+    /// 从连接串解析（键名与 C# 一致；未知/非法值回退默认）。
+    pub fn from_connection_string(conn: &crate::dal::ConnectionString) -> Self {
+        let mut options = Self::default();
+        if let Some(mode) = conn.get("journal mode").and_then(SqliteJournalMode::parse) {
+            options.journal_mode = Some(mode);
+        }
+        if let Some(sync) = conn.get("synchronous").and_then(SqliteSynchronous::parse) {
+            options.synchronous = sync;
+        }
+        if let Some(size) = conn
+            .get("cache size")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+        {
+            options.cache_size_kib = Some(size);
+        }
+        if let Some(ms) = conn
+            .get("busytimeout")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            options.busy_timeout_ms = ms;
+        }
+        // 只读连接：跳过 journal_mode（只读文件不能写 WAL/-shm，与 C# 的 Readonly 分支一致）
+        options.read_only = conn
+            .get("readonly")
+            .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"));
+        if options.read_only {
+            options.journal_mode = None;
+        }
+        options
+    }
+}
+
 /// SQLite 会话。
 pub struct SqliteSession {
     /// rusqlite 连接
@@ -23,8 +178,14 @@ pub struct SqliteSession {
 }
 
 impl SqliteSession {
-    /// 打开数据库文件（支持 `:memory:` 内存库）。
+    /// 打开数据库文件（支持 `:memory:` 内存库），使用默认参数
+    /// （WAL + `Synchronous=Off` + busy_timeout 5s，对齐 C# 版）。
     pub fn open(path: &str) -> Result<Self> {
+        Self::open_with_options(path, &SqliteOptions::default())
+    }
+
+    /// 按指定参数打开数据库文件（连接串 `Synchronous` / `Cache Size` / `Journal Mode` / `BusyTimeout`）。
+    pub fn open_with_options(path: &str, options: &SqliteOptions) -> Result<Self> {
         let conn = rusqlite::Connection::open(path)?;
 
         // 预编译语句缓存：此前每次 `execute`/`query` 都重新编译 SQL（SQLite 编译 20 列表的
@@ -32,11 +193,23 @@ impl SqliteSession {
         conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
 
         // 忙等待：多进程/多连接共用同一个 DG.db 时减少 "database is locked"
-        let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
-        // WAL 日志：读写并发更好（内存库不支持，失败忽略）
-        let _ = conn.query_row("PRAGMA journal_mode=WAL;", [], |_| Ok(()));
-        // NORMAL 同步：性能与安全的平衡点（XCode 生产环境使用 Off，此处更保守）
-        let _ = conn.query_row("PRAGMA synchronous=NORMAL;", [], |_| Ok(()));
+        if options.busy_timeout_ms > 0 {
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(options.busy_timeout_ms));
+        }
+        // 日志模式（内存库/只读库不支持时失败忽略）
+        if let Some(mode) = options.journal_mode {
+            let sql = format!("PRAGMA journal_mode={};", mode.pragma());
+            let _ = conn.query_row(&sql, [], |_| Ok(()));
+        }
+        // 同步模式（默认 Off，对齐 C#；连接串可改 Normal/Full/Extra）
+        let _ = conn.execute_batch(&format!(
+            "PRAGMA synchronous={};",
+            options.synchronous.pragma()
+        ));
+        // 页缓存（负数 = KiB；未配置则用 SQLite 默认）
+        if let Some(size) = options.cache_size_kib {
+            let _ = conn.execute_batch(&format!("PRAGMA cache_size={size};"));
+        }
 
         Ok(Self { conn })
     }
@@ -201,6 +374,78 @@ mod tests {
 
     fn memory() -> SqliteSession {
         SqliteSession::open(":memory:").unwrap()
+    }
+
+    #[test]
+    fn default_options_match_csharp() {
+        let options = SqliteOptions::default();
+        assert_eq!(options.synchronous, SqliteSynchronous::Off, "默认对齐 C#：Synchronous=Off");
+        assert_eq!(options.journal_mode, Some(SqliteJournalMode::Wal));
+        assert_eq!(options.cache_size_kib, None);
+        assert_eq!(options.busy_timeout_ms, 5000);
+        assert!(!options.read_only);
+    }
+
+    #[test]
+    fn options_from_connection_string() {
+        let conn = crate::dal::ConnectionString::parse(
+            "Data Source=x.db;Provider=SQLite;Synchronous=Normal;Cache Size=-8192;Journal Mode=Delete;BusyTimeout=1500",
+        );
+        let options = SqliteOptions::from_connection_string(&conn);
+        assert_eq!(options.synchronous, SqliteSynchronous::Normal);
+        assert_eq!(options.journal_mode, Some(SqliteJournalMode::Delete));
+        assert_eq!(options.cache_size_kib, Some(-8192));
+        assert_eq!(options.busy_timeout_ms, 1500);
+    }
+
+    #[test]
+    fn invalid_options_fall_back_to_default() {
+        let conn = crate::dal::ConnectionString::parse(
+            "Data Source=x.db;Provider=SQLite;Synchronous=Whatever;Cache Size=abc;Journal Mode=?",
+        );
+        let options = SqliteOptions::from_connection_string(&conn);
+        assert_eq!(options.synchronous, SqliteSynchronous::Off);
+        assert_eq!(options.cache_size_kib, None);
+        assert_eq!(options.journal_mode, Some(SqliteJournalMode::Wal));
+    }
+
+    #[test]
+    fn readonly_connection_skips_journal_mode() {
+        let conn = crate::dal::ConnectionString::parse(
+            "Data Source=x.db;Provider=SQLite;Readonly=true;Journal Mode=Delete",
+        );
+        let options = SqliteOptions::from_connection_string(&conn);
+        assert!(options.read_only);
+        assert_eq!(options.journal_mode, None, "只读连接不设置 journal_mode");
+    }
+
+    #[test]
+    fn pragmas_are_applied_to_connection() {
+        let dir = std::env::temp_dir().join(format!(
+            "pek-rcode-sqlite-options-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("options.db");
+        let options = SqliteOptions {
+            synchronous: SqliteSynchronous::Normal,
+            cache_size_kib: Some(-8192),
+            ..Default::default()
+        };
+        let session = SqliteSession::open_with_options(path.to_str().unwrap(), &options).unwrap();
+        let conn = session.connection();
+        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        assert_eq!(sync, 1, "NORMAL = 1");
+        let cache: i64 = conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache, -8192);
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        drop(session);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
