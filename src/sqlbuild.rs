@@ -500,23 +500,22 @@ pub fn update_sql_named(
     }
 
     let mut params = Vec::with_capacity(sets.len() + 4);
-    let mut parts = Vec::with_capacity(sets.len());
-
-    for (field, value) in sets {
-        let mark = kind.placeholder(params.len());
-        parts.push(format!("{} = {mark}", kind.quote(column_name(table, field)?)));
+    let mut sql = String::with_capacity(24 + table_name.len() + sets.len() * 16);
+    sql.push_str("UPDATE ");
+    kind.push_quoted(&mut sql, table_name);
+    sql.push_str(" SET ");
+    for (position, (field, value)) in sets.iter().enumerate() {
+        if position > 0 {
+            sql.push_str(", ");
+        }
+        kind.push_quoted(&mut sql, column_name(table, field)?);
+        sql.push_str(" = ");
+        kind.push_placeholder(&mut sql, params.len());
         params.push(value.clone());
     }
-
-    let where_sql = filter.render(kind, &mut params);
-    let mut sql = format!(
-        "UPDATE {} SET {}",
-        kind.quote(table_name),
-        parts.join(", ")
-    );
-    if !where_sql.is_empty() {
+    if !filter.is_empty() {
         sql.push_str(" WHERE ");
-        sql.push_str(&where_sql);
+        filter.render_into(kind, &mut params, &mut sql);
     }
 
     Ok((sql, params))
@@ -539,31 +538,22 @@ pub fn update_sql_owned_named<S: AsRef<str>>(
 
     let mut params = Vec::with_capacity(sets.len() + 4);
     // 直接拼接 SET（不建 String 列表、不 format!）：每列 0 次中间分配
-    let mut set_sql = String::with_capacity(sets.len() * 16);
-    let mut first = true;
-
-    for (field, value) in sets {
-        let name = column_name(table, field.as_ref())?;
-        if !first {
-            set_sql.push_str(", ");
-        }
-        first = false;
-        kind.push_quoted(&mut set_sql, name);
-        set_sql.push_str(" = ");
-        kind.push_placeholder(&mut set_sql, params.len());
-        params.push(value);
-    }
-
-    let where_sql = filter.render(kind, &mut params);
-    let mut sql =
-        String::with_capacity(16 + table_name.len() + set_sql.len() + where_sql.len());
+    let mut sql = String::with_capacity(24 + table_name.len() + sets.len() * 16);
     sql.push_str("UPDATE ");
     kind.push_quoted(&mut sql, table_name);
     sql.push_str(" SET ");
-    sql.push_str(&set_sql);
-    if !where_sql.is_empty() {
+    for (position, (field, value)) in sets.into_iter().enumerate() {
+        if position > 0 {
+            sql.push_str(", ");
+        }
+        kind.push_quoted(&mut sql, column_name(table, field.as_ref())?);
+        sql.push_str(" = ");
+        kind.push_placeholder(&mut sql, params.len());
+        params.push(value);
+    }
+    if !filter.is_empty() {
         sql.push_str(" WHERE ");
-        sql.push_str(&where_sql);
+        filter.render_into(kind, &mut params, &mut sql);
     }
 
     Ok((sql, params))
@@ -729,12 +719,12 @@ pub fn delete_sql_named(
     filter: &Where,
 ) -> (String, Vec<DbValue>) {
     let mut params = Vec::with_capacity(4);
-    let where_sql = filter.render(kind, &mut params);
-
-    let mut sql = format!("DELETE FROM {}", kind.quote(table_name));
-    if !where_sql.is_empty() {
+    let mut sql = String::with_capacity(24 + table_name.len());
+    sql.push_str("DELETE FROM ");
+    kind.push_quoted(&mut sql, table_name);
+    if !filter.is_empty() {
         sql.push_str(" WHERE ");
-        sql.push_str(&where_sql);
+        filter.render_into(kind, &mut params, &mut sql);
     }
     (sql, params)
 }
@@ -832,13 +822,14 @@ pub fn count_sql_named(
     filter: Option<&Where>,
 ) -> (String, Vec<DbValue>) {
     let mut params = Vec::new();
-    let mut sql = format!("SELECT COUNT(*) FROM {}", kind.quote(table_name));
-    if let Some(filter) = filter {
-        let where_sql = filter.render(kind, &mut params);
-        if !where_sql.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_sql);
-        }
+    let mut sql = String::with_capacity(32 + table_name.len());
+    sql.push_str("SELECT COUNT(*) FROM ");
+    kind.push_quoted(&mut sql, table_name);
+    if let Some(filter) = filter
+        && !filter.is_empty()
+    {
+        sql.push_str(" WHERE ");
+        filter.render_into(kind, &mut params, &mut sql);
     }
     (sql, params)
 }
@@ -879,12 +870,11 @@ pub fn select_sql_named(
     kind.push_quoted(&mut sql, table_name);
 
     let mut params = Vec::new();
-    if let Some(filter) = &query.filter {
-        let where_sql = filter.render(kind, &mut params);
-        if !where_sql.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_sql);
-        }
+    if let Some(filter) = &query.filter
+        && !filter.is_empty()
+    {
+        sql.push_str(" WHERE ");
+        filter.render_into(kind, &mut params, &mut sql);
     }
 
     // 排序
@@ -1019,16 +1009,15 @@ pub fn increment_sql_owned_named<S: AsRef<str>>(
         params.push(value);
     }
 
-    let where_sql = filter.render(kind, &mut params);
     let mut sql =
-        String::with_capacity(16 + table_name.len() + set_sql.len() + where_sql.len());
+        String::with_capacity(16 + table_name.len() + set_sql.len() + 48);
     sql.push_str("UPDATE ");
     kind.push_quoted(&mut sql, table_name);
     sql.push_str(" SET ");
     sql.push_str(&set_sql);
-    if !where_sql.is_empty() {
+    if !filter.is_empty() {
         sql.push_str(" WHERE ");
-        sql.push_str(&where_sql);
+        filter.render_into(kind, &mut params, &mut sql);
     }
 
     Ok((sql, params))

@@ -183,40 +183,57 @@ impl Where {
         if self.conds.is_empty() {
             return String::new();
         }
+        let mut out = String::with_capacity(32 + self.conds.len() * 24);
+        self.render_into(kind, params, &mut out);
+        out
+    }
 
-        let mut parts = Vec::with_capacity(self.conds.len());
-        for cond in &self.conds {
-            let part = match cond.op {
-                Op::IsNull => format!("{} IS NULL", quote_or_raw(kind, &cond.column)),
-                Op::NotNull => format!("{} IS NOT NULL", quote_or_raw(kind, &cond.column)),
+    /// 渲染条件片段并**直接追加**到 `out`（零中间分配：不建 `Vec<String>`、不 `join`、不 `format!`）。
+    ///
+    /// 语义与 [`Where::render`] 完全一致（外层带括号；空条件不追加任何内容）。
+    pub fn render_into(&self, kind: DatabaseKind, params: &mut Vec<DbValue>, out: &mut String) {
+        if self.conds.is_empty() {
+            return;
+        }
+        out.push('(');
+        for (index, cond) in self.conds.iter().enumerate() {
+            if index > 0 {
+                out.push_str(" AND ");
+            }
+            match cond.op {
+                Op::IsNull => {
+                    push_quoted_or_raw(kind, out, &cond.column);
+                    out.push_str(" IS NULL");
+                }
+                Op::NotNull => {
+                    push_quoted_or_raw(kind, out, &cond.column);
+                    out.push_str(" IS NOT NULL");
+                }
                 Op::In | Op::NotIn => {
-                    let op = if cond.op == Op::In { "IN" } else { "NOT IN" };
                     if cond.values.is_empty() {
                         // 空集合：IN → 恒假；NOT IN → 恒真（避免生成非法 SQL）
-                        if cond.op == Op::In {
-                            "1 = 0".to_string()
-                        } else {
-                            "1 = 1".to_string()
-                        }
+                        out.push_str(if cond.op == Op::In { "1 = 0" } else { "1 = 1" });
                     } else {
-                        let mut marks = Vec::with_capacity(cond.values.len());
-                        for v in &cond.values {
-                            marks.push(kind.placeholder(params.len()));
-                            params.push(v.clone());
+                        push_quoted_or_raw(kind, out, &cond.column);
+                        out.push_str(if cond.op == Op::In { " IN (" } else { " NOT IN (" });
+                        for (position, value) in cond.values.iter().enumerate() {
+                            if position > 0 {
+                                out.push_str(", ");
+                            }
+                            kind.push_placeholder(out, params.len());
+                            params.push(value.clone());
                         }
-                        format!(
-                            "{} {op} ({})",
-                            quote_or_raw(kind, &cond.column),
-                            marks.join(", ")
-                        )
+                        out.push(')');
                     }
                 }
                 Op::Between => {
-                    let a = kind.placeholder(params.len());
+                    push_quoted_or_raw(kind, out, &cond.column);
+                    out.push_str(" BETWEEN ");
+                    kind.push_placeholder(out, params.len());
                     params.push(cond.values[0].clone());
-                    let b = kind.placeholder(params.len());
+                    out.push_str(" AND ");
+                    kind.push_placeholder(out, params.len());
                     params.push(cond.values[1].clone());
-                    format!("{} BETWEEN {a} AND {b}", quote_or_raw(kind, &cond.column))
                 }
                 _ => {
                     let op = match cond.op {
@@ -230,34 +247,43 @@ impl Where {
                         Op::NotLike => "NOT LIKE",
                         _ => unreachable!(),
                     };
-                    let mark = kind.placeholder(params.len());
+                    push_quoted_or_raw(kind, out, &cond.column);
+                    out.push(' ');
+                    out.push_str(op);
+                    out.push(' ');
+                    kind.push_placeholder(out, params.len());
                     params.push(cond.values[0].clone());
-                    format!("{} {op} {mark}", quote_or_raw(kind, &cond.column))
                 }
-            };
-            parts.push(part);
+            }
         }
-
-        format!("({})", parts.join(" AND "))
+        out.push(')');
     }
 }
 
-/// 列名 → SQL 片段：普通标识符按方言引用；含非标识符字符（函数、表达式）时原样使用。
-fn quote_or_raw(kind: DatabaseKind, column: &str) -> String {
+/// 列名 → SQL 片段**追加**（普通标识符按方言引用，`Table.Column` 逐段引用；含非标识符字符时原样）。
+fn push_quoted_or_raw(kind: DatabaseKind, out: &mut String, column: &str) {
     let plain = !column.is_empty()
         && column
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' );
-    if plain {
-        // 支持 "Table.Column" 形式，逐段引用
-        column
-            .split('.')
-            .map(|part| kind.quote(part))
-            .collect::<Vec<_>>()
-            .join(".")
-    } else {
-        column.to_string()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    if !plain {
+        out.push_str(column);
+        return;
     }
+    for (index, part) in column.split('.').enumerate() {
+        if index > 0 {
+            out.push('.');
+        }
+        kind.push_quoted(out, part);
+    }
+}
+
+/// 列名 → SQL 片段（`String` 版本，保留给测试与外部调用）。
+#[cfg(test)]
+fn quote_or_raw(kind: DatabaseKind, column: &str) -> String {
+    let mut out = String::with_capacity(column.len() + 4);
+    push_quoted_or_raw(kind, &mut out, column);
+    out
 }
 
 /// 排序项。

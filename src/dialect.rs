@@ -1040,12 +1040,9 @@ impl DatabaseKind {
     /// - SQL Server：`OFFSET n ROWS FETCH NEXT m ROWS ONLY`（无排序时补 `ORDER BY (SELECT NULL)`）
     /// - Oracle：ROWNUM 双层包装（兼容 11g，与 DH.NCode 的分页思路一致）
     pub fn apply_paging(&self, sql: &str, order_sql: &str, offset: usize, size: usize) -> String {
-        let with_order = |s: &mut String| {
-            if !order_sql.is_empty() {
-                s.push(' ');
-                s.push_str(order_sql);
-            }
-        };
+        use std::fmt::Write as _;
+        // 一次预分配：原 SQL + 排序 + 分页后缀（`format!` 的二次分配已消除）
+        let mut s = String::with_capacity(sql.len() + order_sql.len() + 48);
         match self {
             DatabaseKind::Sqlite
             | DatabaseKind::MySql
@@ -1056,37 +1053,52 @@ impl DatabaseKind {
             | DatabaseKind::InfluxDb
             | DatabaseKind::Hana
             | DatabaseKind::DaMeng
-            | DatabaseKind::Iris => {
-                let mut s = sql.to_string();
-                with_order(&mut s);
-                s.push_str(&format!(" LIMIT {size} OFFSET {offset}"));
+            | DatabaseKind::Iris
+            // 文档库：跳过/限制由驱动翻译器解析 SQL 文本中的 LIMIT/OFFSET
+            | DatabaseKind::MongoDb => {
+                s.push_str(sql);
+                if !order_sql.is_empty() {
+                    s.push(' ');
+                    s.push_str(order_sql);
+                }
+                let _ = write!(s, " LIMIT {size} OFFSET {offset}");
                 s
             }
             DatabaseKind::SqlServer | DatabaseKind::Db2 => {
-                let mut s = sql.to_string();
-                if !order_sql.is_empty() {
-                    with_order(&mut s);
-                } else {
+                s.push_str(sql);
+                if order_sql.is_empty() {
                     // SQL Server 分页要求 ORDER BY，缺失时给出语法合法的兜底（DB2 同样接受）
                     s.push_str(" ORDER BY (SELECT NULL)");
+                } else {
+                    s.push(' ');
+                    s.push_str(order_sql);
                 }
-                s.push_str(&format!(" OFFSET {offset} ROWS FETCH NEXT {size} ROWS ONLY"));
+                let _ = write!(s, " OFFSET {offset} ROWS FETCH NEXT {size} ROWS ONLY");
                 s
             }
             DatabaseKind::Oracle => {
-                let mut inner = sql.to_string();
-                with_order(&mut inner);
+                let mut inner = String::with_capacity(sql.len() + order_sql.len() + 16);
+                inner.push_str(sql);
+                if !order_sql.is_empty() {
+                    inner.push(' ');
+                    inner.push_str(order_sql);
+                }
                 let upper = offset + size;
-                format!(
+                let _ = write!(
+                    s,
                     "SELECT * FROM (SELECT T0.*, ROWNUM AS rowNumber FROM ({inner}) T0) \
                      WHERE rowNumber > {offset} AND rowNumber <= {upper}"
-                )
+                );
+                s
             }
             // Firebird：ROWS a TO b（1 基，含两端）
             DatabaseKind::Firebird => {
-                let mut s = sql.to_string();
-                with_order(&mut s);
-                s.push_str(&format!(" ROWS {} TO {}", offset + 1, offset + size));
+                s.push_str(sql);
+                if !order_sql.is_empty() {
+                    s.push(' ');
+                    s.push_str(order_sql);
+                }
+                let _ = write!(s, " ROWS {} TO {}", offset + 1, offset + size);
                 s
             }
             // Access：无 OFFSET，用双层 TOP 实现（需要排序，无排序时由调用方保证主键兜底）
@@ -1104,13 +1116,6 @@ impl DatabaseKind {
                         "SELECT * FROM (SELECT TOP {size} * FROM (SELECT TOP {skip} * FROM ({sql}) AS T1 {order_sql}) AS T2 {reversed}) AS T3 {order_sql}"
                     )
                 }
-            }
-            // 文档库：跳过/限制由驱动翻译器解析 SQL 文本中的 LIMIT/OFFSET
-            DatabaseKind::MongoDb => {
-                let mut s = sql.to_string();
-                with_order(&mut s);
-                s.push_str(&format!(" LIMIT {size} OFFSET {offset}"));
-                s
             }
         }
     }
