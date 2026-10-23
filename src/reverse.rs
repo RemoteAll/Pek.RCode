@@ -86,6 +86,7 @@ fn to_table_meta(info: catalog::TableInfo) -> TableMeta {
         table_name: String::new(),
         description: info.description,
         conn_name: None,
+        base_type: None,
         migration: None,
         insert_only: false,
         is_view: false,
@@ -112,6 +113,10 @@ fn to_table_meta(info: catalog::TableInfo) -> TableMeta {
                 map: None,
                 show_in: None,
                 model: None,
+                category: None,
+                item_type: None,
+                using_cache: None,
+                extra: Vec::new(),
             })
             .collect(),
         indexes: info
@@ -124,6 +129,7 @@ fn to_table_meta(info: catalog::TableInfo) -> TableMeta {
             })
             .collect(),
         audit_columns: std::sync::OnceLock::new(),
+        extra: Vec::new(),
     }
 }
 

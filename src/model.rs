@@ -129,6 +129,11 @@ pub struct TableMeta {
     pub description: String,
     /// 表级连接名覆盖（少见）
     pub conn_name: Option<String>,
+    /// 树形实体基类（`BaseType`，如 `EntityTree`）。
+    ///
+    /// 与 C# 一致：仅作为**元数据保真保留**（`EntityTree` 的树形语义：`ParentId`/`Childs`
+    /// 与递归操作）目前不做运行时实现，避免无声丢失。
+    pub base_type: Option<String>,
     /// 表级迁移档位（对应 DH.NCode 的 `TableItem.Migration`；只能收紧、不能放大，
     /// 空值表示继承全局配置）
     pub migration: Option<Migration>,
@@ -160,6 +165,8 @@ pub struct TableMeta {
     pub indexes: Vec<IndexMeta>,
     /// 审计列位图缓存（惰性，首次 [`TableMeta::audit_flags`] 时填充；**不参与相等比较**）
     pub audit_columns: OnceLock<u16>,
+    /// 未显式解析的其余属性（键值原样保留，保证解析→写出往返不丢；如 `IgnoreNameCase`）
+    pub extra: Vec<(String, String)>,
 }
 
 impl PartialEq for TableMeta {
@@ -169,12 +176,14 @@ impl PartialEq for TableMeta {
             && self.table_name == other.table_name
             && self.description == other.description
             && self.conn_name == other.conn_name
+            && self.base_type == other.base_type
             && self.migration == other.migration
             && self.insert_only == other.insert_only
             && self.is_view == other.is_view
             && self.max_cache_count == other.max_cache_count
             && self.columns == other.columns
             && self.indexes == other.indexes
+            && self.extra == other.extra
     }
 }
 
@@ -341,6 +350,14 @@ pub struct ColumnMeta {
     pub show_in: Option<String>,
     /// 模型类开关（`Model`，`"False"` 表示排除；对应 DH.NCode 的 `Properties["Model"]`）
     pub model: Option<String>,
+    /// 界面分组（`Category`；C# 模型里大量使用，Rust 侧仅保真保留）
+    pub category: Option<String>,
+    /// 编辑器/展示类型（`ItemType`，如 `file`/`GMK`/`mail`/`mobile`/`image`/`TimeSpan`；仅保真保留）
+    pub item_type: Option<String>,
+    /// 是否参与实体缓存（`UsingCache`，C# `Device.Uuid` 标了 `False`；仅保真保留）
+    pub using_cache: Option<bool>,
+    /// 未显式解析的其余属性（键值原样保留，如 C# 模型里拼写错误的 `Lengt`）
+    pub extra: Vec<(String, String)>,
 }
 
 /// 索引定义（`<Index>`）。
@@ -478,7 +495,16 @@ impl EntityModel {
                 write_attr(&mut out, "Map", col.map.as_deref());
                 write_attr(&mut out, "ShowIn", col.show_in.as_deref());
                 write_attr(&mut out, "Model", col.model.as_deref());
+                write_attr(&mut out, "Category", col.category.as_deref());
+                write_attr(&mut out, "ItemType", col.item_type.as_deref());
+                if let Some(uc) = col.using_cache {
+                    write_attr(&mut out, "UsingCache", Some(if uc { "True" } else { "False" }));
+                }
                 write_attr(&mut out, "Description", Some(&col.description));
+                // 未识别的属性原样回写（含 C# 模型里拼写错误的 `Lengt`）
+                for (k, v) in &col.extra {
+                    write_attr(&mut out, k, Some(v.as_str()));
+                }
                 out.push_str(" />\n");
             }
             out.push_str("      </Columns>\n");
@@ -530,6 +556,7 @@ fn parse_table(node: &Node) -> Result<TableMeta> {
         table_name,
         description: attr_string(node, "Description").unwrap_or_default(),
         conn_name: attr_string(node, "ConnName"),
+        base_type: attr_string(node, "BaseType"),
         migration: attr_string(node, "Migration").and_then(|v| Migration::parse(&v)),
         insert_only: attr_string(node, "InsertOnly")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
@@ -542,6 +569,20 @@ fn parse_table(node: &Node) -> Result<TableMeta> {
         columns: Vec::new(),
         indexes: Vec::new(),
         audit_columns: OnceLock::new(),
+        extra: collect_extra(
+            node,
+            &[
+                "Name",
+                "TableName",
+                "Description",
+                "ConnName",
+                "BaseType",
+                "Migration",
+                "InsertOnly",
+                "IsView",
+                "MaxCacheCount",
+            ],
+        ),
     };
 
     for child in node.children().filter(Node::is_element) {
@@ -613,6 +654,35 @@ fn parse_column(node: &Node, table_name: &str) -> Result<ColumnMeta> {
         map: attr_string(node, "Map"),
         show_in: attr_string(node, "ShowIn"),
         model: attr_string(node, "Model"),
+        category: attr_string(node, "Category"),
+        item_type: attr_string(node, "ItemType"),
+        using_cache: attr_opt_bool(node, "UsingCache"),
+        extra: collect_extra(
+            node,
+            &[
+                "Name",
+                "ColumnName",
+                "DataType",
+                "RawType",
+                "Length",
+                "Precision",
+                "Scale",
+                "Identity",
+                "PrimaryKey",
+                "Master",
+                "Nullable",
+                "DefaultValue",
+                "Type",
+                "DataScale",
+                "Map",
+                "ShowIn",
+                "Model",
+                "Description",
+                "Category",
+                "ItemType",
+                "UsingCache",
+            ],
+        ),
     })
 }
 
@@ -656,6 +726,23 @@ fn attr_bool(node: &Node, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 读取可选布尔属性（缺省 None，用于需要区分“未指定”与“False”的属性，如 `UsingCache`）。
+fn attr_opt_bool(node: &Node, name: &str) -> Option<bool> {
+    node.attribute(name)
+        .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+}
+
+/// 收集节点上**未被显式解析**的其余属性，原样保留。
+///
+/// 目的：C# Model 新增属性（或像 `Lengt` 这种拼写错误）时，解析→写出往返不丢，
+/// 保证 C# / Rust 两侧模型文件语义一致。
+fn collect_extra(node: &Node, known: &[&str]) -> Vec<(String, String)> {
+    node.attributes()
+        .filter(|a| !known.iter().any(|k| a.name().eq_ignore_ascii_case(k)))
+        .map(|a| (a.name().to_string(), a.value().to_string()))
+        .collect()
+}
+
 /// 写出属性（值为 None 时跳过）。
 fn write_attr(out: &mut String, name: &str, value: Option<&str>) {
     if let Some(v) = value
@@ -674,6 +761,9 @@ fn write_name_and_table_name(table: &TableMeta) -> String {
     if let Some(conn) = &table.conn_name {
         s.push_str(&format!(" ConnName=\"{}\"", escape_attr(conn)));
     }
+    if let Some(base_type) = &table.base_type {
+        s.push_str(&format!(" BaseType=\"{}\"", escape_attr(base_type)));
+    }
     // 表级迁移档位（收紧）：仅显式配置时写出，保证解析→写出→解析往返一致
     if let Some(migration) = table.migration {
         s.push_str(&format!(" Migration=\"{}\"", migration.name()));
@@ -689,6 +779,10 @@ fn write_name_and_table_name(table: &TableMeta) -> String {
     // 实体缓存阀值：仅非缺省（1000）时写出，保证往返一致
     if table.max_cache_count != 1000 {
         s.push_str(&format!(" MaxCacheCount=\"{}\"", table.max_cache_count));
+    }
+    // 未识别的属性原样回写（如 C# 的 `IgnoreNameCase`）
+    for (k, v) in &table.extra {
+        s.push_str(&format!(" {}=\"{}\"", k, escape_attr(v)));
     }
     s
 }
@@ -860,6 +954,66 @@ mod tests {
         let again = EntityModel::parse(&xml).expect("生产模型样本写出后应能再次解析");
         assert_eq!(model.tables.len(), again.tables.len());
         assert_eq!(model.tables[0].columns, again.tables[0].columns);
+    }
+
+    /// C# Model 全属性保真：解析 → 写出 → 再解析，不得丢任何属性。
+    ///
+    /// 覆盖：表级 `BaseType`/`MaxCacheCount`/`IgnoreNameCase`（未显式解析→extra）、
+    /// 列级 `Category`/`ItemType`/`UsingCache`、以及 C# 模型里拼写错误的 `Lengt`、
+    /// 以及 `<Indexes>`（Device.Code 等唯一索引靠它建）。
+    #[test]
+    fn csharp_model_attributes_are_preserved() {
+        let xml = r#"<EntityModel>
+  <Tables>
+    <Table Name="Device" TableName="Device" Description="设备" BaseType="EntityTree" MaxCacheCount="0" IgnoreNameCase="False">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="Uuid" DataType="String" Length="200" UsingCache="False" ItemType="file" Category="扩展" Description="唯一标识" />
+        <Column Name="Remark" DataType="String" Lengt="100" Description="备注" />
+      </Columns>
+      <Indexes>
+        <Index Columns="Uuid" Unique="True" />
+        <Index Columns="Category,Length" />
+      </Indexes>
+    </Table>
+  </Tables>
+</EntityModel>"#;
+
+        let first = EntityModel::parse(xml).unwrap();
+        let out = first.to_xml();
+        let second = EntityModel::parse(&out).expect("写出的 XML 应能再次解析");
+
+        // 整体往返一致
+        assert_eq!(first, second, "解析 → 写出 → 解析 应完全一致");
+
+        let table = &second.tables[0];
+        assert_eq!(table.base_type.as_deref(), Some("EntityTree"));
+        assert_eq!(table.max_cache_count, 0);
+        assert!(
+            table.extra.iter().any(|(k, v)| k == "IgnoreNameCase" && v == "False"),
+            "未显式解析的表属性应进 extra 保真：{:?}",
+            table.extra
+        );
+
+        let uuid = table.column("Uuid").unwrap();
+        assert_eq!(uuid.using_cache, Some(false));
+        assert_eq!(uuid.item_type.as_deref(), Some("file"));
+        assert_eq!(uuid.category.as_deref(), Some("扩展"));
+
+        // 拼写错误的属性也必须原样保留（不擅自当作 Length）
+        let remark = table.column("Remark").unwrap();
+        assert_eq!(remark.length, 0, "`Lengt` 不是 Length，不应被当作长度");
+        assert!(
+            remark.extra.iter().any(|(k, v)| k == "Lengt" && v == "100"),
+            "未知/拼错属性应进 extra：{:?}",
+            remark.extra
+        );
+
+        // 索引（含唯一）
+        assert_eq!(table.indexes.len(), 2);
+        assert!(table.indexes[0].unique);
+        assert_eq!(table.indexes[0].columns, vec!["Uuid".to_string()]);
+        assert_eq!(table.indexes[1].columns, vec!["Category".to_string(), "Length".to_string()]);
     }
 
     #[test]

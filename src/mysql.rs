@@ -21,6 +21,8 @@
 //! - 客户端证书（`SslCert`/`SslKey`，PEM）需 rustls 后端：
 //!   `--no-default-features --features tls-rustls`；缺省 native-tls 后端仅支持 PKCS#12，会返回明确错误
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Datelike, Timelike};
@@ -34,11 +36,19 @@ use crate::error::{Error, Result};
 use crate::session::{RowSet, SqlSession};
 use crate::value::DbValue;
 
+/// 列名 + 列元信息的缓存条目（列名与元信息各自共享，命中时零分配克隆）。
+type ColumnCacheEntry = (Arc<Vec<String>>, Arc<Vec<ValueMeta>>);
+
 /// MySQL 会话。
 pub struct MysqlSession {
     /// mysql crate 连接（同步、内部带缓冲）
     conn: Conn,
+    /// 列名 + 列元信息缓存（SQL → 列信息；同构查询不再重建）
+    column_cache: HashMap<String, ColumnCacheEntry>,
 }
+
+/// 列名缓存容量（SQL → 列信息）：超出后整表清空，动态 SQL 不会无界增长。
+pub const COLUMN_CACHE_CAPACITY: usize = 128;
 
 impl MysqlSession {
     /// 根据 XCode 风格连接串打开连接。
@@ -64,7 +74,10 @@ impl MysqlSession {
             ))
         })?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            column_cache: HashMap::new(),
+        })
     }
 }
 
@@ -315,6 +328,7 @@ fn dbvalue_to_mysql(value: &DbValue) -> Value {
 }
 
 /// 列级元信息（读取转换用）。
+#[derive(Debug, Clone, Copy)]
 struct ValueMeta {
     /// 是否 BIT 类型（按大端字节解析为整数）
     is_bit: bool,
@@ -393,23 +407,39 @@ impl SqlSession for MysqlSession {
 
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
         let values: Vec<Value> = params.iter().map(dbvalue_to_mysql).collect();
-        let result = self.conn.exec_iter(sql, values).map_err(map_err)?;
+        let Self {
+            conn,
+            column_cache,
+        } = self;
+        let result = conn.exec_iter(sql, values).map_err(map_err)?;
 
-        // 先取列信息（迭代会消耗结果集）
-        let columns: Vec<String> = result
-            .columns()
-            .as_ref()
-            .iter()
-            .map(|c| c.name_str().to_string())
-            .collect();
-        let metas: Vec<ValueMeta> = result
-            .columns()
-            .as_ref()
-            .iter()
-            .map(ValueMeta::of)
-            .collect();
+        // 列名 + 列元信息按 SQL 缓存：分页/条件只有参数不同的同构查询不再每轮重建
+        // （宽表每轮省 N 次 String 分配 + 一次元信息 Vec）。
+        let (columns, metas) = match column_cache.get(sql) {
+            Some((columns, metas)) => (columns.clone(), metas.clone()),
+            None => {
+                let columns: Vec<String> = result
+                    .columns()
+                    .as_ref()
+                    .iter()
+                    .map(|c| c.name_str().to_string())
+                    .collect();
+                let metas: Vec<ValueMeta> = result
+                    .columns()
+                    .as_ref()
+                    .iter()
+                    .map(ValueMeta::of)
+                    .collect();
+                let entry = (Arc::new(columns), Arc::new(metas));
+                if column_cache.len() >= COLUMN_CACHE_CAPACITY {
+                    column_cache.clear();
+                }
+                column_cache.insert(sql.to_string(), entry.clone());
+                entry
+            }
+        };
 
-        let mut rows = RowSet::new(columns);
+        let mut rows = RowSet::with_columns(columns);
         for row in result {
             let row = row.map_err(map_err)?;
             let values = row.unwrap();

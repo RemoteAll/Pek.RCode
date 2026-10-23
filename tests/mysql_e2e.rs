@@ -247,12 +247,22 @@ fn run_roundtrip(dal: &Dal) {
     assert_eq!(item2.save(dal, session.as_mut()).unwrap(), 1);
     assert_eq!(i64::from(item2.id), id1 + 1, "自增应连续且 save 回写主键");
 
-    // 按主键查询：实体全字段往返（Decimal 精度 / 布尔 TINYINT / Int64 / 微秒时间 / 二进制）
+    // 按主键查询：实体全字段往返（Decimal 精度 / 布尔 TINYINT / Int64 / 二进制）
+    //
+    // 时间精度说明：MySQL/MariaDB 的 `DATETIME` 默认是 0 位小数秒（秒级），
+    // 与 C# DH.NCode 建表用的 `DATETIME` 完全一致（见 `dialect.rs` 的 MySQL 映射）。
+    // 因此这里按**秒**期望；要保毫秒/微秒需显式把列类型改成 `datetime(3)`/`datetime(6)`（会与 C# 生成表结构不同）。
+    let expected_seconds = chrono::NaiveDate::from_ymd_opt(2026, 9, 26)
+        .unwrap()
+        .and_hms_opt(18, 1, 2)
+        .unwrap();
     let found = RCodeTestItem::find(dal, session.as_mut(), &[id1.into()])
         .unwrap()
         .unwrap();
-    assert_eq!(found, item1, "实体全字段应原样往返");
-    assert_eq!(found.create_time, created, "时间应保持微秒精度");
+    let mut expected = item1.clone();
+    expected.create_time = expected_seconds;
+    assert_eq!(found, expected, "实体全字段应原样往返（时间为秒精度）");
+    assert_eq!(found.create_time, expected_seconds, "时间按 DATETIME 秒精度往返");
 
     // 未提供的可空列应为 NULL（Option 字段为 None）
     let found2 = RCodeTestItem::find(dal, session.as_mut(), &[item2.id.into()])

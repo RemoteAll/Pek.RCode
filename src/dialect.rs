@@ -1533,6 +1533,10 @@ mod tests {
             map: None,
             show_in: None,
             model: None,
+            category: None,
+            item_type: None,
+            using_cache: None,
+            extra: Vec::new(),
         };
 
         let sql = DatabaseKind::Sqlite.add_column_sql(&table, &col);

@@ -1786,6 +1786,7 @@ mod tests {
             table_name: String::new(),
             description: String::new(),
             conn_name: None,
+            base_type: None,
             migration: None,
             insert_only: false,
             is_view: false,
@@ -1793,6 +1794,7 @@ mod tests {
             columns: Vec::new(),
             indexes: Vec::new(),
             audit_columns: std::sync::OnceLock::new(),
+            extra: Vec::new(),
         };
 
         let asc = fix_shard_order(

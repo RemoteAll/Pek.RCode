@@ -1086,3 +1086,68 @@ fn bench_entity_read_paths() {
 
     println!("(sink={sink})");
 }
+
+// ---------------------------------------------------------------------------
+// 实体写队列基准（2026-10-23 第二十一轮）：入队列名 owned vs Cow 静态
+// ---------------------------------------------------------------------------
+
+/// 入队 + 自动 flush（20 列，1000/批）：`insert`（owned 列名）vs `insert_static`（Cow 零分配）。
+#[test]
+#[ignore]
+fn bench_entity_queue_insert() {
+    use pek_rcode::{DbValue, entity_queue::EntityQueue};
+    const ROWS: usize = 20_000;
+    const BATCH: usize = 1000;
+
+    fn run(tag: &str, use_static: bool) -> (Duration, usize) {
+        let dal = bench_dal(tag);
+        let mut session = dal.open_session().unwrap();
+        let columns: Vec<&'static str> = (1..=20)
+            .map(|i| match i {
+                1 => "C1", 2 => "C2", 3 => "C3", 4 => "C4", 5 => "C5",
+                6 => "C6", 7 => "C7", 8 => "C8", 9 => "C9", 10 => "C10",
+                11 => "C11", 12 => "C12", 13 => "C13", 14 => "C14", 15 => "C15",
+                16 => "C16", 17 => "C17", 18 => "C18", 19 => "C19", _ => "C20",
+            })
+            .collect();
+        let fields: Vec<(&'static str, DbValue)> = columns
+            .iter()
+            .map(|name| (*name, DbValue::Text("0123456789abcdef".into())))
+            .collect();
+
+        let mut queue = EntityQueue::new("Wide");
+        queue.set_batch_size(BATCH);
+        session.begin().unwrap();
+
+        let mark = ALLOCS.load(Ordering::Relaxed);
+        let t = Instant::now();
+        for _ in 0..ROWS {
+            if use_static {
+                queue.insert_static(&dal, session.as_mut(), &fields).unwrap();
+            } else {
+                queue.insert(&dal, session.as_mut(), &fields).unwrap();
+            }
+        }
+        let elapsed = t.elapsed();
+        let allocs = alloc_since(mark);
+        queue.flush(&dal, session.as_mut()).unwrap();
+        session.commit().unwrap();
+        let _ = dal;
+        (elapsed, allocs)
+    }
+
+    let (owned, owned_allocs) = run("queue-owned", false);
+    let (cow, cow_allocs) = run("queue-static", true);
+    report(
+        "EntityQueue::insert（owned 列名）",
+        ROWS,
+        owned,
+        owned_allocs,
+    );
+    report(
+        "EntityQueue::insert_static（Cow 列名）",
+        ROWS,
+        cow,
+        cow_allocs,
+    );
+}

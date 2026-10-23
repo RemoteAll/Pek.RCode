@@ -8,9 +8,12 @@
 //! 与 C# 版的差异：C# 由后台线程按周期（默认 1000ms）自动持久化；Rust 版由调用方驱动
 //! `flush()`（入队时达到批大小也会自动 flush），需要异步时可在 `LazyConsumer` 任务中调用。
 
+use std::borrow::Cow;
+
 use crate::dal::Dal;
 use crate::error::{Error, Result};
 use crate::session::SqlSession;
+use crate::sqlbuild::BatchWriteMode;
 use crate::value::DbValue;
 
 /// 默认批大小。
@@ -36,8 +39,8 @@ struct QueueItem {
     method: QueueMethod,
     /// 主键值（Update/Delete/Upsert 使用）
     pk: Vec<DbValue>,
-    /// 列与值
-    fields: Vec<(String, DbValue)>,
+    /// 列与值（列名用 `Cow`：生成实体传 `'static` 字面量时**零分配**）
+    fields: Vec<(Cow<'static, str>, DbValue)>,
     /// Upsert 的“存在即更新”分支只写这些列（`None` = 全列，向后兼容）
     update_columns: Option<Vec<String>>,
 }
@@ -169,6 +172,47 @@ impl EntityQueue {
         self.auto_flush(dal, session)
     }
 
+    /// 入队插入（列名为 `'static` 字面量：零列名分配；生成实体走这条）。
+    pub fn insert_static(
+        &mut self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        fields: &[(&'static str, DbValue)],
+    ) -> Result<()> {
+        self.push_static(QueueMethod::Insert, Vec::new(), fields, None);
+        self.auto_flush(dal, session)
+    }
+
+    /// 入队更新（`'static` 列名版本）。
+    pub fn update_static(
+        &mut self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        pk: &[DbValue],
+        fields: &[(&'static str, DbValue)],
+    ) -> Result<()> {
+        self.push_static(QueueMethod::Update, pk.to_vec(), fields, None);
+        self.auto_flush(dal, session)
+    }
+
+    /// 入队 Upsert（`'static` 列名 + 脏列集合版本；对应 `SaveAsync` 的脏追踪语义）。
+    pub fn upsert_tracked_static(
+        &mut self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        pk: &[DbValue],
+        fields: &[(&'static str, DbValue)],
+        update_columns: Option<&[String]>,
+    ) -> Result<()> {
+        self.push_static(
+            QueueMethod::Upsert,
+            pk.to_vec(),
+            fields,
+            update_columns.map(<[String]>::to_vec),
+        );
+        self.auto_flush(dal, session)
+    }
+
     /// 入队一项。
     fn push(
         &mut self,
@@ -177,13 +221,39 @@ impl EntityQueue {
         fields: &[(&str, DbValue)],
         update_columns: Option<Vec<String>>,
     ) {
+        let fields = fields
+            .iter()
+            .map(|(name, value)| (Cow::Owned(name.to_string()), value.clone()))
+            .collect();
+        self.push_fields(method, pk, fields, update_columns);
+    }
+
+    /// 入队一项（列名为 `'static` 字面量：**零列名分配**，对应生成实体的 `to_fields`）。
+    fn push_static(
+        &mut self,
+        method: QueueMethod,
+        pk: Vec<DbValue>,
+        fields: &[(&'static str, DbValue)],
+        update_columns: Option<Vec<String>>,
+    ) {
+        let fields = fields
+            .iter()
+            .map(|(name, value)| (Cow::Borrowed(*name), value.clone()))
+            .collect();
+        self.push_fields(method, pk, fields, update_columns);
+    }
+
+    fn push_fields(
+        &mut self,
+        method: QueueMethod,
+        pk: Vec<DbValue>,
+        fields: Vec<(Cow<'static, str>, DbValue)>,
+        update_columns: Option<Vec<String>>,
+    ) {
         self.items.push(QueueItem {
             method,
             pk,
-            fields: fields
-                .iter()
-                .map(|(name, value)| (name.to_string(), value.clone()))
-                .collect(),
+            fields,
             update_columns,
         });
     }
@@ -220,16 +290,20 @@ impl EntityQueue {
                     while index < items.len() && items[index].method == QueueMethod::Insert {
                         index += 1;
                     }
-                    let rows: Vec<Vec<(&str, DbValue)>> = items[start..index]
+                    // 借用行视图：只搬引用，**不再逐列克隆值**（参数在驱动内部才需要 owned）
+                    let rows: Vec<Vec<(&str, &DbValue)>> = items[start..index]
                         .iter()
+                        .filter(|item| !item.fields.is_empty())
                         .map(|item| {
                             item.fields
                                 .iter()
-                                .map(|(name, value)| (name.as_str(), value.clone()))
+                                .map(|(name, value)| (name.as_ref(), value))
                                 .collect()
                         })
                         .collect();
-                    stats.inserted += table.insert_batch(session, &rows, None)?;
+                    let refs: Vec<&Vec<(&str, &DbValue)>> = rows.iter().collect();
+                    stats.inserted +=
+                        table.write_batch_rows_core(session, &refs, BatchWriteMode::Insert, None)?;
                 }
                 QueueMethod::Delete => {
                     // 连续 Delete 段：单一主键时合并为主键 IN 批量删除
@@ -255,7 +329,7 @@ impl EntityQueue {
                     let fields: Vec<(&str, DbValue)> = item
                         .fields
                         .iter()
-                        .map(|(name, value)| (name.as_str(), value.clone()))
+                        .map(|(name, value)| (name.as_ref(), value.clone()))
                         .collect();
                     stats.updated += table.update_by_pk(session, &fields, &item.pk)?;
                     index += 1;
@@ -265,7 +339,7 @@ impl EntityQueue {
                     let fields: Vec<(&str, DbValue)> = item
                         .fields
                         .iter()
-                        .map(|(name, value)| (name.as_str(), value.clone()))
+                        .map(|(name, value)| (name.as_ref(), value.clone()))
                         .collect();
                     if table.find_by_pk(session, &item.pk)?.is_some() {
                         // 启用脏追踪的实体：存在即更新时只写变化列（排除主键/自增列）

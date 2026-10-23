@@ -309,6 +309,16 @@ impl BatchField for (&str, DbValue) {
     }
 }
 
+impl BatchField for (&str, &DbValue) {
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn value(&self) -> &DbValue {
+        self.1
+    }
+}
+
 /// 批量写入的行视图（`Vec<列项>`）：owned 与借用两种行共用。
 pub(crate) trait BatchRow {
     /// 按位置取 `(列名, 值)`。
@@ -3069,6 +3079,10 @@ mod tests {
             map: None,
             show_in: None,
             model: None,
+            category: None,
+            item_type: None,
+            using_cache: None,
+            extra: Vec::new(),
         });
         let dal2 = Dal::open_with_model(&conn, model).unwrap();
         let report = dal2.sync_schema().unwrap();
