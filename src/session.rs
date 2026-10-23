@@ -24,6 +24,35 @@ pub struct RowSet {
 }
 
 impl RowSet {
+    /// 按列下标投影：只保留 `indices` 指定的列（顺序与下标一致，越界自动忽略）。
+    ///
+    /// 供「字段级安全策略」类场景在返回前裁剪列——列名与每行的值同步裁剪，
+    /// 不改变行数与行序。
+    pub fn project(&self, indices: &[usize]) -> RowSet {
+        let columns: Vec<String> = indices
+            .iter()
+            .filter_map(|i| self.columns.get(*i).cloned())
+            .collect();
+        let shared = Arc::new(columns.clone());
+        let rows: Vec<DbRow> = self
+            .rows
+            .iter()
+            .map(|row| DbRow {
+                columns: Arc::clone(&shared),
+                values: indices
+                    .iter()
+                    .filter_map(|i| row.values.get(*i).cloned())
+                    .collect(),
+                index: Arc::new(OnceLock::new()),
+            })
+            .collect();
+        RowSet {
+            columns: shared,
+            rows,
+            index: Arc::new(OnceLock::new()),
+        }
+    }
+
     /// 创建空结果集。
     pub fn new(columns: Vec<String>) -> Self {
         Self {
