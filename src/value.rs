@@ -155,6 +155,24 @@ impl DbValue {
         }
     }
 
+    /// 消耗自身并转为文本（`Text` 直接返回内部 `String`，**零复制**）。
+    ///
+    /// 实体映射（`Entity::from_row_owned`）用：数据行已经独占，没必要再复制一份字符串。
+    pub fn into_text(self) -> String {
+        match self {
+            DbValue::Text(v) => v,
+            other => other.to_text(),
+        }
+    }
+
+    /// 消耗自身并取出二进制内容（`Blob` 直接返回内部缓冲，**零复制**）。
+    pub fn into_blob(self) -> Vec<u8> {
+        match self {
+            DbValue::Blob(v) => v,
+            other => other.as_blob().map(<[u8]>::to_vec).unwrap_or_default(),
+        }
+    }
+
     /// 渲染为 SQL 字面量（用于 `DEFAULT` 等无法参数化的场景）。
     ///
     /// 注意：字符串会做单引号转义；业务查询请始终使用参数绑定。

@@ -81,8 +81,32 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 获取读锁（被投毒时恢复内部数据）。
+fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 获取写锁（被投毒时恢复内部数据）。
+fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 主键缓存键：**单列整数主键零分配**（自增/雪花，物联网主键口径），其余走拼接字符串。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PkKey {
+    /// 单列整数主键
+    Int(i64),
+    /// 其它（文本/时间/多列）—— 按原规则拼接
+    Other(String),
+}
+
 /// 主键值 → 缓存键（多列主键按顺序拼接，分隔符为不可见字符）。
-fn pk_key(pk: &[DbValue]) -> String {
+fn pk_key(pk: &[DbValue]) -> PkKey {
+    if pk.len() == 1
+        && let DbValue::Int(value) = &pk[0]
+    {
+        return PkKey::Int(*value);
+    }
     let mut key = String::new();
     for (index, value) in pk.iter().enumerate() {
         if index > 0 {
@@ -90,7 +114,7 @@ fn pk_key(pk: &[DbValue]) -> String {
         }
         key.push_str(&value.to_text());
     }
-    key
+    PkKey::Other(key)
 }
 
 /// 实体缓存（整表缓存，对应 DH.NCode 的 `Meta.Cache`）。
@@ -310,7 +334,7 @@ pub struct SingleCache {
 #[derive(Default)]
 struct SingleCacheState {
     /// 主键 → (行数据, 写入时刻)
-    items: HashMap<String, (Arc<DbRow>, Instant)>,
+    items: HashMap<PkKey, (Arc<DbRow>, Instant)>,
 }
 
 impl SingleCache {
@@ -387,7 +411,7 @@ impl SingleCache {
     }
 
     /// 写入缓存项（超出最大实体数时先整体清空）。
-    fn store(&self, key: String, row: Arc<DbRow>) {
+    fn store(&self, key: PkKey, row: Arc<DbRow>) {
         let max = *lock(&self.max_entity);
         let mut state = lock(&self.state);
         if max > 0 && state.items.len() >= max {
@@ -594,19 +618,23 @@ impl Dal {
         self.has_caches
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let meta = self.table_meta(table)?;
-        let physical_table = meta.effective_table_name().to_string();
+        let physical_table = meta.effective_table_name();
         let col = meta
             .column(column)
             .ok_or_else(|| crate::error::Error::Model(format!("表 {} 不存在列 {column}", meta.name)))?;
-        let physical_column = meta.effective_column_name(col).to_string();
-        let table_key = physical_table.to_ascii_lowercase();
-        let column_key = physical_column.to_ascii_lowercase();
+        let physical_column = meta.effective_column_name(col);
 
-        let mut field_maps = lock(&self.field_caches);
-        let columns = field_maps.entry(table_key).or_default();
+        if let Some(cache) = read_lock(&self.field_caches)
+            .get(physical_table)
+            .and_then(|columns| columns.get(physical_column))
+        {
+            return Ok(cache.clone());
+        }
+        let mut field_maps = write_lock(&self.field_caches);
+        let columns = field_maps.entry(physical_table.to_string()).or_default();
         Ok(columns
-            .entry(column_key)
-            .or_insert_with(|| Arc::new(FieldCache::new(&physical_table, &physical_column)))
+            .entry(physical_column.to_string())
+            .or_insert_with(|| Arc::new(FieldCache::new(physical_table, physical_column)))
             .clone())
     }
 
@@ -614,26 +642,35 @@ impl Dal {
     pub fn entity_cache(&self, table: &str) -> Result<Arc<EntityCache>> {
         self.has_caches
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let name = self.table_meta(table)?.effective_table_name().to_string();
-        let key = name.to_ascii_lowercase();
-        let mut map = lock(&self.entity_caches);
-        Ok(map
-            .entry(key)
-            .or_insert_with(|| Arc::new(EntityCache::new(&name)))
-            .clone())
+        // 叫名归一（实体名/物理名、大小写均可）→ 注册键统一用物理表名原文
+        let name = self.table_meta(table)?.effective_table_name();
+        if let Some(cache) = read_lock(&self.entity_caches).get(name) {
+            return Ok(cache.clone());
+        }
+        let mut map = write_lock(&self.entity_caches);
+        if let Some(cache) = map.get(name) {
+            return Ok(cache.clone());
+        }
+        let cache = Arc::new(EntityCache::new(name));
+        map.insert(name.to_string(), cache.clone());
+        Ok(cache)
     }
 
     /// 获取单对象缓存（按表共享，惰性创建；对应 DH.NCode 的 `Meta.SingleCache`）。
     pub fn single_cache(&self, table: &str) -> Result<Arc<SingleCache>> {
         self.has_caches
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let name = self.table_meta(table)?.effective_table_name().to_string();
-        let key = name.to_ascii_lowercase();
-        let mut map = lock(&self.single_caches);
-        Ok(map
-            .entry(key)
-            .or_insert_with(|| Arc::new(SingleCache::new(&name)))
-            .clone())
+        let name = self.table_meta(table)?.effective_table_name();
+        if let Some(cache) = read_lock(&self.single_caches).get(name) {
+            return Ok(cache.clone());
+        }
+        let mut map = write_lock(&self.single_caches);
+        if let Some(cache) = map.get(name) {
+            return Ok(cache.clone());
+        }
+        let cache = Arc::new(SingleCache::new(name));
+        map.insert(name.to_string(), cache.clone());
+        Ok(cache)
     }
 
     /// 使指定表的两类缓存全部失效（写入路径自动调用，也可手动触发）。
@@ -641,36 +678,37 @@ impl Dal {
     /// 对应 DH.NCode：任何添删改操作都让缓存马上过期。
     /// `table` 可传实体名或实际表名（忽略大小写）。
     pub fn invalidate_cache(&self, table: &str) {
-        // 快路径：从未创建过任何缓存（写多读少的应用常见）→ 直接返回，不取锁、不做小写化
+        // 快路径：从未创建过任何缓存（写多读少的应用常见）→ 直接返回，不取锁、不分配
         if !self.has_caches.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
+        let owned;
         let key = match self.table_meta(table) {
-            Ok(meta) => meta.effective_table_name().to_ascii_lowercase(),
-            Err(_) => table.to_ascii_lowercase(),
+            Ok(meta) => meta.effective_table_name(),
+            Err(_) => {
+                owned = table.to_string();
+                owned.as_str()
+            }
         };
-        if let Some(cache) = lock(&self.entity_caches).get(&key) {
+        if let Some(cache) = read_lock(&self.entity_caches).get(key) {
             cache.invalidate();
         }
-        if let Some(cache) = lock(&self.single_caches).get(&key) {
+        if let Some(cache) = read_lock(&self.single_caches).get(key) {
             cache.clear();
         }
         // 字段缓存（先按表取一次，避免全注册表扫描）
         {
-            let mut field_maps = lock(&self.field_caches);
-            if let Some(columns) = field_maps.remove(&key) {
+            let mut field_maps = write_lock(&self.field_caches);
+            if let Some(columns) = field_maps.remove(key) {
                 for cache in columns.into_values() {
                     cache.invalidate();
                 }
                 // 保留注册项：清空数据但避免下次重新分配（重新插回空表）
-                field_maps.insert(key.clone(), HashMap::new());
+                field_maps.insert(key.to_string(), HashMap::new());
             }
         }
         // 行数缓存同步失效（下次按 MAX(id)/COUNT(*) 重新采样）
-        self.count_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&key);
+        write_lock(&self.count_cache).remove(key);
     }
 
     /// 表行数（带 60 秒缓存；对应 C# `EntitySession.Count` 的阀值判定用途）。
@@ -682,12 +720,12 @@ impl Dal {
     /// 其余数据库用 `COUNT(*)`；任何添删改都使缓存失效。
     pub fn cached_count(&self, table: &str, session: &mut dyn SqlSession) -> Result<i64> {
         let meta = self.table_meta(table)?;
-        let key = meta.effective_table_name().to_ascii_lowercase();
+        let key = meta.effective_table_name();
 
         const TTL: Duration = Duration::from_secs(60);
         {
-            let cache = self.count_cache.read().unwrap_or_else(|e| e.into_inner());
-            if let Some((count, at)) = cache.get(&key)
+            let cache = read_lock(&self.count_cache);
+            if let Some((count, at)) = cache.get(key)
                 && at.elapsed() < TTL
             {
                 return Ok(*count);
@@ -713,10 +751,7 @@ impl Dal {
             .and_then(|r| r.get_by_name("c"))
             .and_then(DbValue::as_i64)
             .unwrap_or(0);
-        self.count_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, (count, std::time::Instant::now()));
+        write_lock(&self.count_cache).insert(key.to_string(), (count, std::time::Instant::now()));
         Ok(count)
     }
 

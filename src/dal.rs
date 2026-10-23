@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt,
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -183,13 +183,13 @@ pub struct Dal {
     migration: Migration,
     /// 连接串显式指定的档位（用于与模型级配置的优先级判定）
     conn_migration: Option<Migration>,
-    /// 实体缓存注册表（按表共享，对应 DH.NCode 的 `Meta.Cache`）
-    pub(crate) entity_caches: Mutex<HashMap<String, Arc<EntityCache>>>,
+    /// 实体缓存注册表（按表共享，对应 DH.NCode 的 `Meta.Cache`；读多写少 → RwLock）
+    pub(crate) entity_caches: RwLock<HashMap<String, Arc<EntityCache>>>,
     /// 单对象缓存注册表（按表共享，对应 DH.NCode 的 `Meta.SingleCache`）
-    pub(crate) single_caches: Mutex<HashMap<String, Arc<SingleCache>>>,
+    pub(crate) single_caches: RwLock<HashMap<String, Arc<SingleCache>>>,
     /// 字段缓存注册表（表（小写）→ 列（小写）→ 共享实例；对应 DH.NCode 的 `FieldCache<T>`）
     pub(crate) field_caches:
-        Mutex<HashMap<String, HashMap<String, Arc<crate::cache::FieldCache>>>>,
+        RwLock<HashMap<String, HashMap<String, Arc<crate::cache::FieldCache>>>>,
     /// 是否注册过任一类缓存（写入路径快路：无缓存时零锁零分配）
     pub(crate) has_caches: AtomicBool,
     /// 表行数缓存（表名→（行数, 时刻）；对应 C# `EntitySession.Count` 的 60 秒缓存；读多写少用 RwLock）
@@ -527,10 +527,10 @@ impl Dal {
             show_sql,
             migration,
             conn_migration,
-            entity_caches: Mutex::new(HashMap::new()),
-            single_caches: Mutex::new(HashMap::new()),
+            entity_caches: RwLock::new(HashMap::new()),
+            single_caches: RwLock::new(HashMap::new()),
             has_caches: AtomicBool::new(false),
-            field_caches: Mutex::new(HashMap::new()),
+            field_caches: RwLock::new(HashMap::new()),
             count_cache: RwLock::new(HashMap::new()),
             table_index: OnceLock::new(),
             shard_specs: OnceLock::new(),

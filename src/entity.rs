@@ -108,6 +108,14 @@ pub trait Entity: Sized {
     /// 从查询行装载实体。
     fn from_row(row: &DbRow) -> Result<Self>;
 
+    /// 从**自有**数据行装载实体（默认借用 [`Entity::from_row`]）。
+    ///
+    /// `rcodegen` 生成的实体覆写本方法：用 [`DbRow::take_by_name`] 移动文本/二进制值，
+    /// 每列省一次复制 + 堆分配。批量读/宽表差异明显（例如 20 列文本表每行少 20 次分配）。
+    fn from_row_owned(row: DbRow) -> Result<Self> {
+        Self::from_row(&row)
+    }
+
     /// 本表是否「仅插入」（对应 DH.NCode 的 `InsertOnly`：日志表/记录表/事件表）。
     ///
     /// `rcodegen` 会为 `Model.xml` 中 `InsertOnly="true"` 的表生成 `true`；手写实体可自行覆盖。
@@ -964,14 +972,15 @@ pub trait Entity: Sized {
         let table = dal.table(Self::table())?;
         table
             .find_by_pk(session, pk)?
-            .map(|row| Self::from_row(&row))
+            .map(Self::from_row_owned)
             .transpose()
     }
 
     /// 本表的实体缓存阀值（`Model.xml` 的 `MaxCacheCount`，未加载模型时为 0 = 不缓存）。
     fn max_cache_count(dal: &Dal) -> i32 {
-        dal.model()
-            .and_then(|m| m.table(Self::table()))
+        // 走 `Dal` 的表名索引（O(1)）：`EntityModel::table` 是线性扫描，
+        // 176 表模型下每次读都要 148 ns（`bench_model_table_lookup`）。
+        dal.table_meta(Self::table())
             .map(|t| t.max_cache_count)
             .unwrap_or(0)
     }
@@ -1018,7 +1027,7 @@ pub trait Entity: Sized {
         let rows = table.query(session, query)?;
         rows.rows
             .into_iter()
-            .map(|row| Self::from_row(&row))
+            .map(Self::from_row_owned)
             .collect()
     }
 

@@ -877,3 +877,212 @@ fn bench_interceptor_write_paths() {
         interceptor::register(item);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 读路径基准（2026-10-23 第十七轮）：缓存注册 / 单对象缓存 / 整表缓存 / 实体映射
+// ---------------------------------------------------------------------------
+
+/// 与生成代码同构的实体（IoA 表：单主键 + 审计列）。
+#[derive(Debug, Clone)]
+struct IoA {
+    id: i32,
+    code: String,
+    amount: i32,
+    status: i32,
+    remark: String,
+}
+
+impl pek_rcode::Entity for IoA {
+    fn table() -> &'static str {
+        "IoA"
+    }
+
+    fn columns() -> &'static [&'static str] {
+        &[
+            "Id",
+            "Code",
+            "Amount",
+            "Status",
+            "Remark",
+            "CreateTime",
+            "UpdateTime",
+            "CreateUser",
+            "UpdateUser",
+            "TraceId",
+        ]
+    }
+
+    fn primary_keys() -> &'static [&'static str] {
+        &["Id"]
+    }
+
+    fn identity_column() -> Option<&'static str> {
+        Some("Id")
+    }
+
+    fn to_fields(&self) -> Vec<(&'static str, pek_rcode::DbValue)> {
+        use pek_rcode::DbValue;
+        vec![
+            ("Id", DbValue::Int(i64::from(self.id))),
+            ("Code", DbValue::Text(self.code.clone())),
+            ("Amount", DbValue::Int(i64::from(self.amount))),
+            ("Status", DbValue::Int(i64::from(self.status))),
+            ("Remark", DbValue::Text(self.remark.clone())),
+        ]
+    }
+
+    fn from_row(row: &pek_rcode::DbRow) -> pek_rcode::Result<Self> {
+        use pek_rcode::DbValue;
+        Ok(Self {
+            id: row
+                .get_by_name("Id")
+                .and_then(DbValue::as_i32)
+                .unwrap_or_default(),
+            code: row
+                .get_by_name("Code")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            amount: row
+                .get_by_name("Amount")
+                .and_then(DbValue::as_i32)
+                .unwrap_or_default(),
+            status: row
+                .get_by_name("Status")
+                .and_then(DbValue::as_i32)
+                .unwrap_or_default(),
+            remark: row
+                .get_by_name("Remark")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+        })
+    }
+
+    /// 与 `rcodegen` 生成代码同构：移动列值（文本列零复制）。
+    fn from_row_owned(mut row: pek_rcode::DbRow) -> pek_rcode::Result<Self> {
+        use pek_rcode::DbValue;
+        Ok(Self {
+            id: row
+                .take_by_name("Id")
+                .and_then(|v| DbValue::as_i32(&v))
+                .unwrap_or_default(),
+            code: row
+                .take_by_name("Code")
+                .map(DbValue::into_text)
+                .unwrap_or_default(),
+            amount: row
+                .take_by_name("Amount")
+                .and_then(|v| DbValue::as_i32(&v))
+                .unwrap_or_default(),
+            status: row
+                .take_by_name("Status")
+                .and_then(|v| DbValue::as_i32(&v))
+                .unwrap_or_default(),
+            remark: row
+                .take_by_name("Remark")
+                .map(DbValue::into_text)
+                .unwrap_or_default(),
+        })
+    }
+
+    fn set_identity(&mut self, value: i64) -> pek_rcode::Result<()> {
+        self.id = value as i32;
+        Ok(())
+    }
+}
+
+/// 读路径端到端：注册表获取 / 行数缓存 / 单对象缓存命中 / 整表缓存匹配 / SQL 查询+映射。
+#[test]
+#[ignore]
+fn bench_entity_read_paths() {
+    use pek_rcode::DbValue;
+    const N: usize = 20_000;
+    let dal = bench_audit_dal("read");
+    let table = dal.table("IoA").unwrap();
+    let mut session = dal.open_session().unwrap();
+    let id = table
+        .insert(
+            session.as_mut(),
+            &[
+                ("Code", DbValue::Text("A".into())),
+                ("Amount", DbValue::Int(1)),
+                ("Status", DbValue::Int(1)),
+                ("Remark", DbValue::Text("r".into())),
+            ],
+        )
+        .unwrap();
+
+    // 预热：单对象缓存 / 行数缓存 / 整表缓存
+    let _ = <IoA as pek_rcode::Entity>::find(&dal, session.as_mut(), &[DbValue::Int(id)]).unwrap();
+    let _ = <IoA as pek_rcode::Entity>::find_cached_by(
+        &dal,
+        session.as_mut(),
+        &[("Code", DbValue::Text("A".into()))],
+    )
+    .unwrap();
+
+    let mut sink = 0usize;
+
+    // ① 缓存注册表获取（每次读都要走一遍）
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        sink += dal.single_cache("IoA").unwrap().table().len();
+        sink += dal.entity_cache("IoA").unwrap().table().len();
+    }
+    report(
+        "缓存注册表获取（single + entity）",
+        N * 2,
+        t.elapsed(),
+        alloc_since(mark),
+    );
+
+    // ② 行数缓存命中（小表判定）
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        sink += dal.cached_count("IoA", session.as_mut()).unwrap() as usize;
+    }
+    report("行数缓存命中（cached_count）", N, t.elapsed(), alloc_since(mark));
+
+    // ③ find：单对象缓存命中 + from_row
+    let pk = [DbValue::Int(id)];
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        sink += <IoA as pek_rcode::Entity>::find(&dal, session.as_mut(), &pk)
+            .unwrap()
+            .map(|e| e.id as usize)
+            .unwrap_or(0);
+    }
+    report("Entity::find（单对象缓存命中）", N, t.elapsed(), alloc_since(mark));
+
+    // ④ find_cached_by：整表缓存内存匹配（零 SQL）
+    let key = [("Code", DbValue::Text("A".into()))];
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        sink += <IoA as pek_rcode::Entity>::find_cached_by(&dal, session.as_mut(), &key)
+            .unwrap()
+            .map(|e| e.id as usize)
+            .unwrap_or(0);
+    }
+    report(
+        "Entity::find_cached_by（整表缓存匹配）",
+        N,
+        t.elapsed(),
+        alloc_since(mark),
+    );
+
+    // ⑤ query 一行：SQL 构建 + 执行 + from_row（含数据库成本）
+    let query = pek_rcode::Query::new().take(1);
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        sink += <IoA as pek_rcode::Entity>::query(&dal, session.as_mut(), &query)
+            .unwrap()
+            .len();
+    }
+    report("Entity::query 一行（SQL + 映射）", N, t.elapsed(), alloc_since(mark));
+
+    println!("(sink={sink})");
+}

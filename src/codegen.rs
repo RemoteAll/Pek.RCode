@@ -237,13 +237,24 @@ pub fn generate(table: &TableMeta) -> String {
     ));
 
     let mut row_lines = String::new();
+    let mut owned_lines = String::new();
     for col in &table.columns {
         let field = safe_field_name(&to_snake_case(&col.name));
         let name = table.effective_column_name(col);
-        row_lines.push_str(&format!("            {field}: {},\n", from_row_expr(col, name)));
+        row_lines.push_str(&format!(
+            "            {field}: {},\n",
+            from_row_expr(col, name, false)
+        ));
+        owned_lines.push_str(&format!(
+            "            {field}: {},\n",
+            from_row_expr(col, name, true)
+        ));
     }
     methods.push(format!(
         "fn from_row(row: &DbRow) -> Result<Self> {{\n        Ok(Self {{\n{row_lines}            dirty: pek_rcode::dirty::DirtyState::new(),\n        }})\n    }}"
+    ));
+    methods.push(format!(
+        "fn from_row_owned(mut row: DbRow) -> Result<Self> {{\n        Ok(Self {{\n{owned_lines}            dirty: pek_rcode::dirty::DirtyState::new(),\n        }})\n    }}"
     ));
     methods.push(
         "fn dirty_state(&self) -> Option<&pek_rcode::dirty::DirtyState> {\n        Some(&self.dirty)\n    }"
@@ -505,47 +516,67 @@ fn default_expr(col: &ColumnMeta) -> String {
 }
 
 /// `from_row` 中每个字段的取值表达式（NULL/转换失败时使用列类型默认值）。
-fn from_row_expr(col: &ColumnMeta, name: &str) -> String {
+///
+/// `owned = true` 时生成 `from_row_owned` 用的表达式：用 `take_by_name` 移动值、
+/// 文本/二进制用 `into_text`/`into_blob` **零复制**（数据行已独占）。
+fn from_row_expr(col: &ColumnMeta, name: &str, owned: bool) -> String {
+    let accessor = if owned { "take_by_name" } else { "get_by_name" };
+    let text_of = if owned { "into_text" } else { "to_text" };
+    // 二进制取值的 Option 表达式（返回 `Option<Vec<u8>>`；owned 时直接移动内部缓冲）
+    let blob_opt = if owned {
+        "(!v.is_null()).then(|| v.into_blob())"
+    } else {
+        "v.as_blob().map(<[u8]>::to_vec)"
+    };
+    // 转换调用：owned 时值已移动，转换函数需按引用调用
+    let conv = |path: &str| -> String {
+        if owned {
+            format!("|v| {path}(&v)")
+        } else {
+            path.to_string()
+        }
+    };
+
     // 成员枚举：i32 → 枚举（未知值取默认成员）
     if let Some((path, default_member)) = col.enum_type.as_deref().and_then(known_enum) {
+        let as_i32 = conv("DbValue::as_i32");
         return if col.nullable {
-            format!(
-                "row.get_by_name(\"{name}\").and_then(DbValue::as_i32).and_then({path}::from_i32)"
-            )
+            format!("row.{accessor}(\"{name}\").and_then({as_i32}).and_then({path}::from_i32)")
         } else {
             format!(
-                "row.get_by_name(\"{name}\").and_then(DbValue::as_i32).and_then({path}::from_i32).unwrap_or({default_member})"
+                "row.{accessor}(\"{name}\").and_then({as_i32}).and_then({path}::from_i32).unwrap_or({default_member})"
             )
         };
     }
     if col.nullable {
         return match col.data_type {
-            DataType::String => {
-                format!("row.get_by_name(\"{name}\").and_then(|v| (!v.is_null()).then(|| v.to_text()))")
-            }
+            DataType::String => format!(
+                "row.{accessor}(\"{name}\").and_then(|v| (!v.is_null()).then(|| v.{text_of}()))"
+            ),
             DataType::Binary => {
-                format!("row.get_by_name(\"{name}\").and_then(|v| v.as_blob().map(<[u8]>::to_vec))")
+                format!("row.{accessor}(\"{name}\").and_then(|v| {blob_opt})")
             }
             other => format!(
-                "row.get_by_name(\"{name}\").and_then({})",
-                value_converter(other)
+                "row.{accessor}(\"{name}\").and_then({})",
+                conv(value_converter(other))
             ),
         };
     }
 
     match col.data_type {
-        DataType::String => {
-            format!("row.get_by_name(\"{name}\").map(DbValue::to_text).unwrap_or_default()")
-        }
+        DataType::String => format!(
+            "row.{accessor}(\"{name}\").map(DbValue::{text_of}).unwrap_or_default()"
+        ),
         DataType::Binary => format!(
-            "row.get_by_name(\"{name}\").and_then(|v| v.as_blob().map(<[u8]>::to_vec)).unwrap_or_default()"
+            "row.{accessor}(\"{name}\").and_then(|v| {blob_opt}).unwrap_or_default()"
         ),
         DataType::DateTime => format!(
-            "row.get_by_name(\"{name}\").and_then(DbValue::as_datetime).unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc())"
+            "row.{accessor}(\"{name}\").and_then({}).unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc())",
+            conv("DbValue::as_datetime")
         ),
         other => format!(
-            "row.get_by_name(\"{name}\").and_then({}).unwrap_or_default()",
-            value_converter(other)
+            "row.{accessor}(\"{name}\").and_then({}).unwrap_or_default()",
+            conv(value_converter(other))
         ),
     }
 }
@@ -1028,7 +1059,10 @@ pub fn generate_model(table: &TableMeta) -> String {
     for col in &columns {
         let field = safe_field_name(&to_snake_case(&col.name));
         let name = table.effective_column_name(col);
-        out.push_str(&format!("            {field}: {},\n", from_row_expr(col, name)));
+        out.push_str(&format!(
+            "            {field}: {},\n",
+            from_row_expr(col, name, false)
+        ));
     }
     out.push_str("        }\n    }\n}\n\n");
     out.push_str(&format!(

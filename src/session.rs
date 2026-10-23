@@ -181,15 +181,27 @@ impl DbRow {
 
     /// 按列名取值（忽略大小写；宽表列名索引缓存，小表直接线性比较）。
     pub fn get_by_name(&self, name: &str) -> Option<&DbValue> {
+        self.values.get(self.position_of(name)?)
+    }
+
+    /// 按列名取出**所有权**（取出后该位置变为 `Null`）。
+    ///
+    /// 实体映射用：已经把数据行拿到手（`Arc` 独占）时，移动文本/二进制值比再复制一份便宜得多
+    /// （每列省一次分配 + 复制）。列名规则与 [`DbRow::get_by_name`] 完全一致。
+    pub fn take_by_name(&mut self, name: &str) -> Option<DbValue> {
+        let position = self.position_of(name)?;
+        Some(std::mem::replace(
+            self.values.get_mut(position)?,
+            DbValue::Null,
+        ))
+    }
+
+    /// 列名 → 下标（小表线性比较，宽表走共享列名索引）。
+    fn position_of(&self, name: &str) -> Option<usize> {
         if self.columns.len() <= SMALL_COLUMN_COUNT {
-            let position = self
-                .columns
-                .iter()
-                .position(|c| c.eq_ignore_ascii_case(name))?;
-            return self.values.get(position);
+            return self.columns.iter().position(|c| c.eq_ignore_ascii_case(name));
         }
-        let position = lookup_column(self.name_index(), name)?;
-        self.values.get(position)
+        lookup_column(self.name_index(), name)
     }
 
     /// 组装为 `(列名, 值)` 列表，便于转换为业务结构。

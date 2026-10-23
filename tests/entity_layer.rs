@@ -84,6 +84,29 @@ impl Entity for Order {
         })
     }
 
+    /// 与 `rcodegen` 生成代码同构的移动式装载（文本/二进制零复制）——
+    /// 既有的 query/find 用例因此全部覆盖该路径。
+    fn from_row_owned(mut row: DbRow) -> Result<Self> {
+        Ok(Self {
+            id: row.take_by_name("Id").and_then(|v| DbValue::as_i32(&v)).unwrap_or_default(),
+            code: row
+                .take_by_name("Code")
+                .and_then(|v| (!v.is_null()).then(|| v.into_text())),
+            amount: row
+                .take_by_name("Amount")
+                .and_then(|v| DbValue::as_decimal(&v))
+                .unwrap_or_default(),
+            ok: row.take_by_name("Ok").and_then(|v| DbValue::as_bool(&v)).unwrap_or_default(),
+            create_time: row
+                .take_by_name("CreateTime")
+                .and_then(|v| DbValue::as_datetime(&v))
+                .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc()),
+            data: row
+                .take_by_name("Data")
+                .and_then(|v| (!v.is_null()).then(|| v.into_blob())),
+        })
+    }
+
     fn set_identity(&mut self, value: i64) -> Result<()> {
         self.id = value as i32;
         Ok(())
@@ -822,4 +845,20 @@ fn find_uses_single_cache_and_sees_new_value_after_update() {
     assert_eq!(again.code().as_deref(), Some("S2"), "写入后应读到新值");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+#[test]
+fn take_by_name_moves_value_and_clears_slot() {
+    use std::sync::Arc;
+    let columns: Arc<Vec<String>> = Arc::new(vec!["Id".into(), "Code".into()]);
+    let mut row = DbRow::new(columns, vec![DbValue::Int(7), DbValue::Text("A".into())]);
+
+    // 移动取值：拿到所有权，原位置置为 Null
+    assert_eq!(row.take_by_name("Code"), Some(DbValue::Text("A".into())));
+    assert!(
+        row.get_by_name("Code").map(DbValue::is_null).unwrap_or(false),
+        "取出后该列应为 Null"
+    );
+    // 大小写不敏感（与 get_by_name 一致）
+    assert_eq!(row.take_by_name("id"), Some(DbValue::Int(7)));
+    assert!(row.take_by_name("Missing").is_none());
 }
