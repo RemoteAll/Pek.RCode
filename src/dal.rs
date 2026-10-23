@@ -341,6 +341,33 @@ impl<F: BatchField> BatchRow for Vec<F> {
     }
 }
 
+/// 连接串 → 池配置（`PoolMinSize` / `PoolMaxSize` / `PoolIdleTime`，单位秒；缺省对齐 C#）。
+///
+/// 说明：`PoolMaxSize` 是**空闲上限**（不是并发上限）；`PoolIdleTime` 过小会让低频 IoT 服务
+/// 每次请求都重新建连（建连 ≈ 3~4 次往返），建议 300 秒以上。
+fn pool_options_from(conn: &ConnectionString) -> (PoolOptions, usize) {
+    let mut options = PoolOptions::default();
+    // 仅当连接串**显式**指定 `PoolMinSize` 时才预热（默认保持按需创建，不改变既有行为）
+    let mut prewarm = 0usize;
+    if let Some(value) = conn.get("poolmaxsize").or(conn.get("maxpoolsize"))
+        && let Ok(size) = value.trim().parse::<usize>()
+    {
+        options.max = size;
+    }
+    if let Some(value) = conn.get("poolminsize").or(conn.get("minpoolsize"))
+        && let Ok(size) = value.trim().parse::<usize>()
+    {
+        options.min = size;
+        prewarm = size;
+    }
+    if let Some(value) = conn.get("poolidletime").or(conn.get("idletimeout"))
+        && let Ok(seconds) = value.trim().parse::<u64>()
+    {
+        options.idle_time = Duration::from_secs(seconds);
+    }
+    (options, prewarm)
+}
+
 /// 直接创建会话（不走连接池；供 `Pooling=false` 与池工厂使用）。
 fn create_session(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
     // network：SQL 转发到远端 XCode/DbServer（远端类型由 `Dal::open` 登录探明）
@@ -838,9 +865,26 @@ impl Dal {
                 let conn_str = self.conn_str.clone();
                 let factory: crate::pool::SessionFactory =
                     Arc::new(move || create_session(kind, &conn_str));
-                Arc::new(SessionPool::new(PoolOptions::default(), factory))
+                let (options, prewarm) = pool_options_from(&self.conn_str);
+                let pool = Arc::new(SessionPool::new(options, factory));
+                // `PoolMinSize>0` 时在首次建池就预热（失败静默：连接不可用时不阻断 Dal 创建）
+                if prewarm > 0 {
+                    pool.prewarm(prewarm);
+                }
+                pool
             })
             .clone()
+    }
+
+    /// 预热连接池：预建 `count` 个连接放入空闲池，返回成功数。
+    ///
+    /// 建连要「TCP + 认证 + 会话初始化」约 3~4 次往返（MySQL 本地回环 ≈ 300~400 µs）；
+    /// 建议服务启动时调用，避免首批并发请求各自承担这笔成本。
+    pub fn warmup_pool(&self, count: usize) -> usize {
+        if !self.pooling_enabled() {
+            return 0;
+        }
+        self.session_pool().prewarm(count)
     }
 
     /// 连接池统计（未启用池时返回缺省值）。

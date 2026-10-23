@@ -205,6 +205,37 @@ impl SessionPool {
         }
     }
 
+    /// 预热：预建 `count` 个会话放入空闲分片（失败即停止，返回成功数）。
+    ///
+    /// **为什么值得预热**：建连不是免费的——MySQL 一次建连要「TCP 连接 + 认证握手 +
+    /// 会话初始化（`SET NAMES`）」，约 **3~4 次往返**（本地回环 ≈ 300~400 µs，远程按 RTT 放大）。
+    /// 冷启动时首批并发请求会各自承担这笔开销，预热把这笔成本前置到启动阶段。
+    ///
+    /// 一般经 [`crate::dal::Dal::warmup_pool`] 调用（连接串 `PoolMinSize=n` 也可自动预热）。
+    pub fn prewarm(&self, count: usize) -> usize {
+        if self.per_shard_cap == 0 || self.idle_time_ms == 0 {
+            return 0;
+        }
+        let mut created = 0usize;
+        for offset in 0..count {
+            let Ok(session) = (self.factory)() else {
+                break;
+            };
+            let index = offset % self.shards.len();
+            let mut idle = lock(&self.shards[index]);
+            if idle.len() >= self.per_shard_cap {
+                break;
+            }
+            idle.push_back(IdleSession {
+                session,
+                since_ms: coarse_now_ms(),
+            });
+            self.note_create(index);
+            created += 1;
+        }
+        created
+    }
+
     /// 记一次丢弃（写入本线程分片的计数）。
     fn note_discard(&self, index: usize) {
         self.discarded[index % self.discarded.len()].fetch_add(1, Ordering::Relaxed);

@@ -64,7 +64,24 @@
 
 ## 三、服务端参数（`my.cnf` / `my.ini`，**重启生效**）
 
-### 3.1 写入吞吐（IoT 最关键）
+### 3.0 无法修改 `my.cnf` 时（托管数据库 / 云数据库 / 运维冻结）
+
+很多环境拿不到 `my.cnf`。此时**服务端参数只能接受**，把优化全部放到客户端 —— 下面这些是仍然有效的手段：
+
+| 手段 | 效果 | 说明 |
+|------|------|------|
+| **批量写**（`insert_batch` / `upsert_batch` / `EntityQueue`） | 1,477 → **143,000~230,000 行/秒** | 把「每行一次 COMMIT 刷盘」变成「每 500 行一次」，是本场景**唯一的大杠杆** |
+| **连接串 `InitCommand=`** | 会话级参数可调 | `SET SESSION innodb_lock_wait_timeout=5`、`SET SESSION sql_mode=...`、`SET SESSION transaction_isolation='READ-COMMITTED'` 等**会话级**参数即便没有 my.cnf 权限也能改 |
+| **连接串 `PoolMaxSize`** | 避免打满数据库 | 按 `max_connections / 实例数 × 0.8` 设；默认 1000 极易撞上限 |
+| **连接串 `PoolIdleTime` / `PoolMinSize`** | 避免反复建连 | 空闲超时默认 30s 对低频 IoT 太短（每请求重建连 ≈ 3~4 次往返）；建议 300s + `PoolMinSize=n` 预热 |
+| **连接串 `StatementCacheSize`** | 避免多出 prepare 往返 | 默认 256；表多/SQL 形态多时调大 |
+| **`SslMode=None`（内网）** | 省 TLS 握手与加解密 | 公网必须保留 `Required`/`VerifyFull` |
+| **表设计**（见 §6） | 顺序主键、索引最小化 | 与 my.cnf 无关，始终有效 |
+| **大事务**：`begin` → 多批 → `commit` | 把 570 µs 的 fsync 摊到整批 | 但事务别跨网络调用、别超过几秒 |
+
+> 只有「一次 COMMIT 的 fsync 成本」无法在客户端消除 —— 它只能被**批量摊薄**（500 行/批时摊到 1.1 µs/行）。
+
+### 3.1 写入吞吐（IoT 最关键，**能改 my.cnf 时**）
 
 ```ini
 [mysqld]
