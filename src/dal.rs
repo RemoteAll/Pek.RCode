@@ -1884,7 +1884,7 @@ impl<'a> TableRef<'a> {
             sql.push_str(" RETURNING ");
             sql.push_str(&self.dal.kind.quote(self.table.effective_column_name(id_col)));
             self.dal.log_sql(&sql);
-            let set = session.query(&sql, &params)?;
+            let set = session.query_owned(&sql, params)?;
             // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
             self.dal.invalidate_cache(self.physical_name());
             return Ok(set
@@ -1896,9 +1896,9 @@ impl<'a> TableRef<'a> {
 
         self.dal.log_sql(&sql);
         let id = if identity.is_some() {
-            session.insert_and_get_identity(&sql, &params, Some(self.physical_name()))?
+            session.insert_and_get_identity_owned(&sql, params, Some(self.physical_name()))?
         } else {
-            session.execute(&sql, &params)?;
+            session.execute_owned(&sql, params)?;
             0
         };
         // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
@@ -1912,8 +1912,8 @@ impl<'a> TableRef<'a> {
     /// - 每行先执行拦截器补全（与单行 [`TableRef::insert`] 一致）；
     /// - **首行自增列为 0 或缺失 → 整批排除自增列**（由数据库生成；对齐 C# `BuildInsertColumns`，
     ///   需要显式指定自增值时请按"含/不含自增值"拆批调用）；
-    /// - 支持多行 `VALUES` 的数据库整批写入（`batch_size` 默认
-    ///   [`crate::batch::DEFAULT_INSERT_BATCH_SIZE`] = 5000，再按数据库单语句参数上限收紧）；
+    /// - 支持多行 `VALUES` 的数据库整批写入（`batch_size` 默认按方言：MySQL `500`、其余 `5000`，
+    ///   再按数据库单语句参数上限收紧）；
     ///   其余数据库回退逐行执行（语义一致，仅少一次往返的优化不生效）；
     /// - **不保证回写自增主键**（与 C# `BatchInsert` 一致）；无自增的雪花主键请先填值
     ///   （分表批量 [`crate::entity::Entity::insert_batch_sharded`] 会自动生成）；
@@ -2025,7 +2025,7 @@ impl<'a> TableRef<'a> {
             return Ok(0);
         };
         let batch = batch_size
-            .unwrap_or(crate::batch::DEFAULT_INSERT_BATCH_SIZE)
+            .unwrap_or_else(|| crate::batch::default_insert_batch_size(self.dal.kind))
             .max(1);
 
         // 列集 = 首行列集；首行自增列为 0/缺失 → 整批排除自增列（对齐 C# `BuildInsertColumns`）
@@ -2143,7 +2143,7 @@ impl<'a> TableRef<'a> {
                 }
             }
             self.dal.log_sql(&sql);
-            affected += session.execute(&sql, &params)?;
+            affected += session.execute_owned(&sql, params)?;
         }
         Ok(affected)
     }
@@ -2270,7 +2270,7 @@ impl<'a> TableRef<'a> {
                 return self.delete_where(session, filter);
             };
             self.dal.log_sql(&sql);
-            let rows = session.execute(&sql, &params)?;
+            let rows = session.execute_owned(&sql, params)?;
             total += rows;
             if rows < size as u64 {
                 break;
@@ -2314,7 +2314,7 @@ impl<'a> TableRef<'a> {
         let (sql, params) =
             sqlbuild::select_sql_named(self.dal.kind, self.table, self.physical_name(), &query);
         self.dal.log_sql(&sql);
-        let set = session.query(&sql, &params)?;
+        let set = session.query_owned(&sql, params)?;
         Ok(set.rows.into_iter().next())
     }
 
@@ -2379,7 +2379,7 @@ impl<'a> TableRef<'a> {
             )?
         };
         self.dal.log_sql(&sql);
-        let affected = session.execute(&sql, &params)?;
+        let affected = session.execute_owned(&sql, params)?;
         if affected > 0 {
             // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
             self.dal.invalidate_cache(self.physical_name());
@@ -2424,7 +2424,7 @@ impl<'a> TableRef<'a> {
             &[],
         )?;
         self.dal.log_sql(&sql);
-        let affected = session.execute(&sql, &params)?;
+        let affected = session.execute_owned(&sql, params)?;
         if affected > 0 {
             self.dal.invalidate_cache(self.physical_name());
         }
@@ -2476,7 +2476,7 @@ impl<'a> TableRef<'a> {
             expected,
         )?;
         self.dal.log_sql(&sql);
-        let affected = session.execute(&sql, &params)?;
+        let affected = session.execute_owned(&sql, params)?;
         // 冲突也要失效缓存（同 update_if，否则重试会一直读旧值）
         self.dal.invalidate_cache(self.physical_name());
         Ok(affected)
@@ -2537,7 +2537,7 @@ impl<'a> TableRef<'a> {
             filter,
         )?;
         self.dal.log_sql(&sql);
-        let affected = session.execute(&sql, &params)?;
+        let affected = session.execute_owned(&sql, params)?;
         if affected > 0 {
             self.dal.invalidate_cache(self.physical_name());
         }
@@ -2611,7 +2611,7 @@ impl<'a> TableRef<'a> {
             )?
         };
         self.dal.log_sql(&sql);
-        let affected = session.execute(&sql, &params)?;
+        let affected = session.execute_owned(&sql, params)?;
         // 成功 → 本进程缓存过期；冲突（0 行）→ 说明本进程读到的值已过期，同样必须失效，
         // 否则调用方重读会继续命中旧缓存、永远冲突。
         self.dal.invalidate_cache(self.physical_name());
@@ -2716,7 +2716,7 @@ impl<'a> TableRef<'a> {
             filter,
         )?;
         self.dal.log_sql(&sql);
-        let affected = session.execute(&sql, &params)?;
+        let affected = session.execute_owned(&sql, params)?;
         if affected > 0 {
             self.dal.invalidate_cache(self.physical_name());
         }
@@ -2825,7 +2825,7 @@ impl<'a> TableRef<'a> {
         let (sql, params) =
             sqlbuild::delete_sql_named(self.dal.kind, self.physical_name(), filter);
         self.dal.log_sql(&sql);
-        let affected = session.execute(&sql, &params)?;
+        let affected = session.execute_owned(&sql, params)?;
         if affected > 0 {
             // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
             self.dal.invalidate_cache(self.physical_name());
@@ -2940,7 +2940,7 @@ impl<'a> TableRef<'a> {
         let (sql, params) =
             sqlbuild::count_sql_named(self.dal.kind, self.physical_name(), filter);
         self.dal.log_sql(&sql);
-        let set = session.query(&sql, &params)?;
+        let set = session.query_owned(&sql, params)?;
         Ok(set
             .first()
             .and_then(|r| r.get(0))
@@ -2965,7 +2965,7 @@ impl<'a> TableRef<'a> {
         let (sql, params) =
             sqlbuild::select_sql_named(self.dal.kind, self.table, self.physical_name(), query);
         self.dal.log_sql(&sql);
-        session.query(&sql, &params)
+        session.query_owned(&sql, params)
     }
 
     /// 主键物理列名（按模型顺序；数量与值列表对齐）。

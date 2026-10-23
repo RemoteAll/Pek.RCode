@@ -25,7 +25,25 @@ pub const DEFAULT_BATCH_SIZE: usize = 500;
 ///
 /// 用于 [`crate::dal::TableRef::insert_batch`] / [`crate::entity::Entity::insert_batch`] 等
 /// 批量写操作的分块（实际分块还会按数据库单语句参数上限收紧）。
+/// **MySQL 默认不取该值**，而是 [`MYSQL_INSERT_BATCH_SIZE`]（实测更优，见下）。
 pub const DEFAULT_INSERT_BATCH_SIZE: usize = 5_000;
+
+/// MySQL/MariaDB 的**实测最优**批量写入批大小（2026-10-23 本机 MariaDB 11.8.9 实测）。
+///
+/// 10 列文本表、10000 行、事务内（`tests/mysql_perf.rs`）：
+///
+/// | 批大小 | ns/行 | 行/秒 |
+/// |-------:|------:|------:|
+/// | 100 | 5783 | 172,914 |
+/// | **200** | **4475** | **223,449** |
+/// | **500** | **4388** | **227,892** |
+/// | 1000 | 4731 | 211,367 |
+/// | 2000 | 5519 | 181,206 |
+/// | 5000 | 8591 | 116,402 |
+///
+/// 单语句过大时**SQL 文本序列化与服务端解析成本反超往返摊销**（5000 行/批比 500 慢一倍），
+/// 因此 MySQL 默认用 500（其它方言仍用 C# 同口径的 5000）。
+pub const MYSQL_INSERT_BATCH_SIZE: usize = 500;
 
 /// 默认批量删除批大小（对应 C# `EntityExtension.Delete(list)` 的 1000/批）。
 pub const DEFAULT_DELETE_BATCH_SIZE: usize = 1_000;
@@ -35,6 +53,17 @@ pub const DEFAULT_DELETE_WHERE_BATCH_SIZE: usize = 10_000;
 
 /// 分批删除的默认批间隔（毫秒；对齐 C# `XCodeSetting.BatchInterval` 默认 100ms，防一次性删除压垮数据库 IO）。
 pub const DEFAULT_BATCH_INTERVAL_MS: u64 = 100;
+
+/// 批量写入的默认批大小（按方言；显式传 `Some(n)` 时以调用方为准）。
+///
+/// - MySQL/MariaDB：`500`（实测最优，见 [`MYSQL_INSERT_BATCH_SIZE`]）；
+/// - 其余方言：`5000`（对齐 C# `DAL.GetBatchSize()`）。
+pub fn default_insert_batch_size(kind: crate::dialect::DatabaseKind) -> usize {
+    match kind {
+        crate::dialect::DatabaseKind::MySql => MYSQL_INSERT_BATCH_SIZE,
+        _ => DEFAULT_INSERT_BATCH_SIZE,
+    }
+}
 
 /// 批量写入模式（对应 C# `IDbSession.Insert / InsertIgnore / Replace / Upsert` 的多行实现；
 /// 定义在 [`crate::sqlbuild`]，由本模块再导出）。

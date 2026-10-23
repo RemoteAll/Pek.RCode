@@ -237,6 +237,23 @@ pub trait SqlSession: Send {
     /// 执行查询。
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet>;
 
+    /// 执行语句（**参数所有权移交**：驱动可零复制地取走文本/二进制缓冲）。
+    ///
+    /// 默认实现转调 [`SqlSession::execute`]（借用），语义完全一致；
+    /// MySQL 这类「参数值必须 owned」的驱动覆写本方法后，
+    /// `DbValue::Text(String)` → `Value::Bytes(Vec<u8>)` 是**所有权移动**（`String::into_bytes`），
+    /// 每次执行每列省一次复制 + 分配。
+    ///
+    /// 调用方在参数**用完后即弃**时（ORM 写路径都是）应优先用它。
+    fn execute_owned(&mut self, sql: &str, params: Vec<DbValue>) -> Result<u64> {
+        self.execute(sql, &params)
+    }
+
+    /// 执行查询（参数所有权移交；语义同 [`SqlSession::execute_owned`]）。
+    fn query_owned(&mut self, sql: &str, params: Vec<DbValue>) -> Result<RowSet> {
+        self.query(sql, &params)
+    }
+
     /// 开启事务。
     fn begin(&mut self) -> Result<()>;
 
@@ -276,6 +293,18 @@ pub trait SqlSession: Send {
             Some(table) => self.last_identity_of(table),
             None => self.last_identity(),
         }
+    }
+
+    /// 插入并返回自增主键（**参数所有权移交**；语义同 [`SqlSession::insert_and_get_identity`]）。
+    ///
+    /// 默认实现转调借用版；「参数必须 owned」的驱动（MySQL）覆写后插入路径也能零复制。
+    fn insert_and_get_identity_owned(
+        &mut self,
+        sql: &str,
+        params: Vec<DbValue>,
+        table: Option<&str>,
+    ) -> Result<i64> {
+        self.insert_and_get_identity(sql, &params, table)
     }
 
     /// 表是否存在。

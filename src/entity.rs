@@ -821,7 +821,7 @@ pub trait Entity: Sized {
         }
 
         let mut news: Vec<usize> = Vec::new();
-        let mut total = 0u64;
+        let mut exists: Vec<usize> = Vec::new();
         for (index, entity) in list.iter().enumerate() {
             let is_new = if batch_exists {
                 match entity.column_value(pks[0]) {
@@ -836,8 +836,17 @@ pub trait Entity: Sized {
             if is_new {
                 news.push(index);
             } else {
-                total += entity.update(dal, session)?;
+                exists.push(index);
             }
+        }
+        // 已存在的行：用**多行 Upsert**一次往返完成（等价于「按主键全列更新」，
+        // 相比逐条 update 把 N 次往返压到 N/批；自增表可能有自增间隙，结果行内容一致）
+        let mut total = 0u64;
+        if !exists.is_empty() {
+            let refs: Vec<&Self> = exists.iter().map(|&index| &list[index]).collect();
+            Self::ensure_identity_uniform(&refs)?;
+            total +=
+                Self::write_batch_refs(dal, session, &refs, BatchWriteMode::Upsert, batch_size)?;
         }
         if !news.is_empty() {
             let refs: Vec<&Self> = news.iter().map(|&index| &list[index]).collect();

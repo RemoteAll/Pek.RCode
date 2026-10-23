@@ -193,6 +193,27 @@ fn cleanup(dal: &Dal) {
 }
 
 #[test]
+fn mysql_init_command_and_stmt_cache_options() {
+    let Some(conn) = connection_string() else {
+        eprintln!("未设置 RCODE_MYSQL，跳过连接串调优参数用例");
+        return;
+    };
+    // 连接串新增两个 IoT 常用旋钮：`StatementCacheSize=`（预编译语句缓存）与
+    // `InitCommand=`（会话级 SET，分号分隔）。这里把会话超时改成 5 秒并回读验证。
+    let tuned = format!("{conn};StatementCacheSize=128;InitCommand=SET SESSION innodb_lock_wait_timeout=5");
+    let dal = Dal::open_with_model(&tuned, EntityModel::parse(MODEL).unwrap()).expect("连接");
+    let mut session = dal.open_session().unwrap();
+    let set = session
+        .query("SELECT @@session.innodb_lock_wait_timeout AS v", &[])
+        .unwrap();
+    let value = set
+        .first()
+        .and_then(|row| row.get_by_name("v"))
+        .and_then(DbValue::as_i64);
+    assert_eq!(value, Some(5), "InitCommand 应在连接建立后执行");
+}
+
+#[test]
 fn mysql_full_crud_roundtrip() {
     let Some(conn) = connection_string() else {
         eprintln!("未设置 RCODE_MYSQL，跳过 MySQL 端到端测试（示例见文件头注释）");

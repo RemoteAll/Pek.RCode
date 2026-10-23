@@ -50,6 +50,12 @@ pub struct MysqlSession {
 /// 列名缓存容量（SQL → 列信息）：超出后整表清空，动态 SQL 不会无界增长。
 pub const COLUMN_CACHE_CAPACITY: usize = 128;
 
+/// 预编译语句缓存默认容量（连接串 `StatementCacheSize=` 可覆盖）。
+///
+/// 物联网场景常见“几十张表 × 插入/查询/更新/删除”= 上百条同构 SQL，
+/// 默认 256 可覆盖；超出后 crate 按 LRU 淘汰（不影响正确性，仅多一次 prepare 往返）。
+pub const DEFAULT_STMT_CACHE_SIZE: usize = 256;
+
 impl MysqlSession {
     /// 根据 XCode 风格连接串打开连接。
     pub fn open(conn_str: &ConnectionString) -> Result<Self> {
@@ -78,6 +84,65 @@ impl MysqlSession {
             conn,
             column_cache: HashMap::new(),
         })
+    }
+
+    /// 执行查询并构建结果集（owned / borrowed 两条参数入口共用）。
+    fn query_with_values(&mut self, sql: &str, values: Vec<Value>) -> Result<RowSet> {
+        let Self {
+            conn,
+            column_cache,
+        } = self;
+        let result = conn.exec_iter(sql, values).map_err(map_err)?;
+
+        // 列名 + 列元信息按 SQL 缓存：分页/条件只有参数不同的同构查询不再每轮重建
+        // （宽表每轮省 N 次 String 分配 + 一次元信息 Vec）。
+        let (columns, metas) = match column_cache.get(sql) {
+            Some((columns, metas)) => (columns.clone(), metas.clone()),
+            None => {
+                let columns: Vec<String> = result
+                    .columns()
+                    .as_ref()
+                    .iter()
+                    .map(|c| c.name_str().to_string())
+                    .collect();
+                let metas: Vec<ValueMeta> = result
+                    .columns()
+                    .as_ref()
+                    .iter()
+                    .map(ValueMeta::of)
+                    .collect();
+                let entry = (Arc::new(columns), Arc::new(metas));
+                if column_cache.len() >= COLUMN_CACHE_CAPACITY {
+                    column_cache.clear();
+                }
+                column_cache.insert(sql.to_string(), entry.clone());
+                entry
+            }
+        };
+
+        let mut rows = RowSet::with_columns(columns);
+        for row in result {
+            let row = row.map_err(map_err)?;
+            let values = row.unwrap();
+            let mut line = Vec::with_capacity(values.len());
+            for (index, value) in values.into_iter().enumerate() {
+                let meta = metas.get(index);
+                line.push(match meta {
+                    Some(meta) => mysql_to_dbvalue(value, meta),
+                    // 理论上不会发生（值数量与列数量一致）
+                    None => mysql_to_dbvalue(
+                        value,
+                        &ValueMeta {
+                            is_bit: false,
+                            is_binary: false,
+                        },
+                    ),
+                });
+            }
+            rows.push(line);
+        }
+
+        Ok(rows)
     }
 }
 
@@ -120,6 +185,10 @@ struct MysqlSettings {
     ssl_mode: Option<MysqlSslMode>,
     /// 根证书路径（SslCa/CertificateFile，PEM/DER）
     ssl_root_cert: Option<String>,
+    /// 预编译语句缓存容量（`StatementCacheSize`，默认 256）
+    stmt_cache_size: usize,
+    /// 会话初始化命令（`InitCommand`，分号分隔；在 `SET NAMES` 之后按序执行）
+    init_commands: Vec<String>,
     /// 客户端证书链路径（PEM；仅 tls-rustls 后端，`SslCert`）
     #[cfg(feature = "tls-rustls")]
     ssl_client_cert: Option<String>,
@@ -217,6 +286,26 @@ fn parse_settings(cs: &ConnectionString) -> Result<MysqlSettings> {
         None => Some(Duration::from_secs(15)),
     };
 
+    // 预编译语句缓存容量（物联网多表场景默认 256，避免 LRU 淘汰导致额外 prepare 往返）
+    let stmt_cache_size = match cs.get("statementcachesize").or(cs.get("stmtcachesize")) {
+        Some(v) => v
+            .trim()
+            .parse::<usize>()
+            .map_err(|e| Error::Model(format!("无效的 StatementCacheSize \"{v}\"：{e}")))?,
+        None => DEFAULT_STMT_CACHE_SIZE,
+    };
+    // 会话初始化命令（连接串 `InitCommand=`，分号分隔；用于 `SET SESSION ...` 级调优）
+    let init_commands: Vec<String> = cs
+        .get("initcommand")
+        .map(|v| {
+            v.split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(MysqlSettings {
         host,
         port,
@@ -227,6 +316,8 @@ fn parse_settings(cs: &ConnectionString) -> Result<MysqlSettings> {
         connect_timeout,
         ssl_mode,
         ssl_root_cert,
+        stmt_cache_size,
+        init_commands,
         #[cfg(feature = "tls-rustls")]
         ssl_client_cert,
         #[cfg(feature = "tls-rustls")]
@@ -243,11 +334,15 @@ fn build_opts(settings: &MysqlSettings, tls: bool) -> Opts {
         .pass(Some(settings.password.clone()));
 
     // v28 无 charset 选项：通过会话初始化命令设置（字符集已严格校验）
-    builder = builder.init(vec![format!("SET NAMES {}", settings.charset)]);
+    // 连接串 `InitCommand=` 追加的会话级命令（如 `SET SESSION innodb_lock_wait_timeout=5`）在其后执行。
+    let mut init: Vec<String> = Vec::with_capacity(1 + settings.init_commands.len());
+    init.push(format!("SET NAMES {}", settings.charset));
+    init.extend(settings.init_commands.iter().cloned());
+    builder = builder.init(init);
 
-    // 预编译语句缓存：`mysql` crate 的 `exec`/`exec_iter` 按 SQL 文本复用已编译语句，
-    // 默认容量较小；ORM 生成的 SQL 高度同构（同表同列），调大后同构 SQL 只编译一次。
-    builder = builder.stmt_cache_size(64);
+    // 预编译语句缓存：`mysql` crate 的 `exec`/`exec_iter` 按 SQL 文本复用已编译语句；
+    // ORM 生成的 SQL 高度同构（同表同列），容量过小会因 LRU 淘汰多出 prepare 往返（每个 ~1 RTT）。
+    builder = builder.stmt_cache_size(settings.stmt_cache_size);
 
     if let Some(db) = &settings.database {
         builder = builder.db_name(Some(db.clone()));
@@ -315,6 +410,33 @@ fn dbvalue_to_mysql(value: &DbValue) -> Value {
         DbValue::Decimal(v) => Value::Bytes(v.to_string().into_bytes()),
         DbValue::Text(v) => Value::Bytes(v.as_bytes().to_vec()),
         DbValue::Blob(v) => Value::Bytes(v.clone()),
+        DbValue::DateTime(v) => Value::Date(
+            v.year() as u16,
+            v.month() as u8,
+            v.day() as u8,
+            v.hour() as u8,
+            v.minute() as u8,
+            v.second() as u8,
+            v.and_utc().timestamp_subsec_micros(),
+        ),
+    }
+}
+
+/// `DbValue` → MySQL 参数值（**消耗**：文本/二进制直接移交内部缓冲，**零复制**）。
+///
+/// 这是 MySQL 驱动的关键优化：`mysql::Value::Bytes` 要求 owned `Vec<u8>`，
+/// 借用版只能 `to_vec()` 复制；而 `String::into_bytes()` / 直接移交 `Vec<u8>` 是所有权移动，
+/// 每次执行每列省一次分配 + 复制（ORM 写路径的参数用完即弃，正好走这条）。
+fn dbvalue_to_mysql_owned(value: DbValue) -> Value {
+    match value {
+        DbValue::Null => Value::NULL,
+        DbValue::Bool(v) => Value::Int(i64::from(v)),
+        DbValue::Int(v) => Value::Int(v),
+        DbValue::Float(v) => Value::Double(v),
+        // DECIMAL 走文本传输（服务端解析，保持精度）
+        DbValue::Decimal(v) => Value::Bytes(v.to_string().into_bytes()),
+        DbValue::Text(v) => Value::Bytes(v.into_bytes()),
+        DbValue::Blob(v) => Value::Bytes(v),
         DbValue::DateTime(v) => Value::Date(
             v.year() as u16,
             v.month() as u8,
@@ -405,57 +527,33 @@ impl SqlSession for MysqlSession {
         Ok(self.conn.affected_rows())
     }
 
+    fn execute_owned(&mut self, sql: &str, params: Vec<DbValue>) -> Result<u64> {
+        // 所有权移交：`Text(String)` / `Blob(Vec<u8>)` 直接移交内部缓冲（零复制）
+        let values: Vec<Value> = params.into_iter().map(dbvalue_to_mysql_owned).collect();
+        self.conn.exec_drop(sql, values).map_err(map_err)?;
+        Ok(self.conn.affected_rows())
+    }
+
+    fn insert_and_get_identity_owned(
+        &mut self,
+        sql: &str,
+        params: Vec<DbValue>,
+        _table: Option<&str>,
+    ) -> Result<i64> {
+        let values: Vec<Value> = params.into_iter().map(dbvalue_to_mysql_owned).collect();
+        self.conn.exec_drop(sql, values).map_err(map_err)?;
+        // 驱动 OK 包已带自增主键：无需额外往返
+        Ok(self.conn.last_insert_id() as i64)
+    }
+
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
         let values: Vec<Value> = params.iter().map(dbvalue_to_mysql).collect();
-        let Self {
-            conn,
-            column_cache,
-        } = self;
-        let result = conn.exec_iter(sql, values).map_err(map_err)?;
+        self.query_with_values(sql, values)
+    }
 
-        // 列名 + 列元信息按 SQL 缓存：分页/条件只有参数不同的同构查询不再每轮重建
-        // （宽表每轮省 N 次 String 分配 + 一次元信息 Vec）。
-        let (columns, metas) = match column_cache.get(sql) {
-            Some((columns, metas)) => (columns.clone(), metas.clone()),
-            None => {
-                let columns: Vec<String> = result
-                    .columns()
-                    .as_ref()
-                    .iter()
-                    .map(|c| c.name_str().to_string())
-                    .collect();
-                let metas: Vec<ValueMeta> = result
-                    .columns()
-                    .as_ref()
-                    .iter()
-                    .map(ValueMeta::of)
-                    .collect();
-                let entry = (Arc::new(columns), Arc::new(metas));
-                if column_cache.len() >= COLUMN_CACHE_CAPACITY {
-                    column_cache.clear();
-                }
-                column_cache.insert(sql.to_string(), entry.clone());
-                entry
-            }
-        };
-
-        let mut rows = RowSet::with_columns(columns);
-        for row in result {
-            let row = row.map_err(map_err)?;
-            let values = row.unwrap();
-            let mut line = Vec::with_capacity(values.len());
-            for (index, value) in values.into_iter().enumerate() {
-                let meta = metas.get(index);
-                line.push(match meta {
-                    Some(meta) => mysql_to_dbvalue(value, meta),
-                    // 理论上不会发生（值数量与列数量一致）
-                    None => mysql_to_dbvalue(value, &ValueMeta { is_bit: false, is_binary: false }),
-                });
-            }
-            rows.push(line);
-        }
-
-        Ok(rows)
+    fn query_owned(&mut self, sql: &str, params: Vec<DbValue>) -> Result<RowSet> {
+        let values: Vec<Value> = params.into_iter().map(dbvalue_to_mysql_owned).collect();
+        self.query_with_values(sql, values)
     }
 
     fn begin(&mut self) -> Result<()> {
