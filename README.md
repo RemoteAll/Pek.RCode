@@ -662,7 +662,12 @@ println!("{report}");   // 新建 0 张，补充列 0 个，…；改列：DH_Or
   - `TableName` 缺省等于 `Name`；`ColumnName` 缺省等于 `Name`
   - SQLite 自增必须为主键：`INTEGER PRIMARY KEY AUTOINCREMENT`
   - SQLite 字符串列生成 `COLLATE NOCASE`（与 XCode 保持一致，保证大小写不敏感检索）
-  - 未知属性 / 未知元素一律忽略，向后兼容新版本 XSD
+  - **属性全保真**（2026-10-23）：表级 `ConnName`/`BaseType`/`IsView`/`InsertOnly`/`Migration`/`MaxCacheCount`，
+    列级 `Category`/`ItemType`/`UsingCache`/`RawType`/`ShowIn`/`Map`/`Model`/`Type`/`DataScale`/`DefaultValue` 等
+    全部解析并**原样写回**；未显式识别的属性（含 C# 里拼写错误的 `Lengt`）进 `extra` 保留，解析 → 写出 → 解析 **零丢失**
+  - **索引保真**：`<Indexes>`/`<Index Columns Unique>` 全量保留，`sync_schema` 自动 `CREATE INDEX`
+    （C# 权威模型 53 表共 162 个索引；`Device.Code` 等唯一索引直接影响百万设备按 Code 查询的性能）
+  - 未知属性 / 未知元素一律忽略**且写回保留**，向后兼容新版本 XSD
 - **可写出**：`EntityModel::to_xml()` 输出同规范 XML（解析 → 写出 → 解析 完全一致），可交回 C# 侧使用
 - **已回归验证**：本仓库真实 `Model.xml`（176 表、3088 列、8 种数据类型）解析、建表、写出全部通过；
   **历史库副本共库验证**（2026-09-27）：52 张既存表增量同步零破坏（新建 168 表 / 补 8 列），176/176 表就位，CRUD 往返通过
