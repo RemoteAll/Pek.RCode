@@ -102,11 +102,11 @@ pub fn insert_sql_named(
 }
 
 /// 组装 INSERT 语句（列集合已拥有：值直接移入参数，热路径少一次克隆）。
-pub fn insert_sql_owned_named(
+pub fn insert_sql_owned_named<S: AsRef<str>>(
     kind: DatabaseKind,
     table: &TableMeta,
     table_name: &str,
-    fields: Vec<(String, DbValue)>,
+    fields: Vec<(S, DbValue)>,
 ) -> Result<(String, Vec<DbValue>)> {
     if fields.is_empty() {
         return Err(Error::Model(format!(
@@ -119,7 +119,7 @@ pub fn insert_sql_owned_named(
     if kind == DatabaseKind::InfluxDb {
         let borrowed: Vec<(&str, DbValue)> = fields
             .iter()
-            .map(|(name, value)| (name.as_str(), value.clone()))
+            .map(|(name, value)| (name.as_ref(), value.clone()))
             .collect();
         return Ok((influx_line_protocol(table, table_name, &borrowed)?, Vec::new()));
     }
@@ -131,7 +131,7 @@ pub fn insert_sql_owned_named(
         DatabaseKind::Oracle | DatabaseKind::Db2 | DatabaseKind::Firebird
     ) && identity_name
         .as_ref()
-        .is_some_and(|name| !fields.iter().any(|(field, _)| field.eq_ignore_ascii_case(name)));
+        .is_some_and(|name| !fields.iter().any(|(field, _)| field.as_ref().eq_ignore_ascii_case(name)));
 
     let mut columns_sql = String::with_capacity(fields.len() * 16);
     let mut marks_sql = String::with_capacity(fields.len() * 4);
@@ -139,7 +139,7 @@ pub fn insert_sql_owned_named(
     let mut first = true;
 
     for (index, (field, value)) in fields.into_iter().enumerate() {
-        let name = column_name(table, &field)?;
+        let name = column_name(table, field.as_ref())?;
         if !first {
             columns_sql.push_str(", ");
             marks_sql.push_str(", ");
@@ -502,11 +502,11 @@ pub fn update_sql_named(
 }
 
 /// 组装 UPDATE 语句（列集合已拥有：值直接移入参数，热路径少一次克隆）。
-pub fn update_sql_owned_named(
+pub fn update_sql_owned_named<S: AsRef<str>>(
     kind: DatabaseKind,
     table: &TableMeta,
     table_name: &str,
-    sets: Vec<(String, DbValue)>,
+    sets: Vec<(S, DbValue)>,
     filter: &Where,
 ) -> Result<(String, Vec<DbValue>)> {
     if sets.is_empty() {
@@ -522,7 +522,7 @@ pub fn update_sql_owned_named(
     let mut first = true;
 
     for (field, value) in sets {
-        let name = column_name(table, &field)?;
+        let name = column_name(table, field.as_ref())?;
         if !first {
             set_sql.push_str(", ");
         }
@@ -554,11 +554,11 @@ pub fn update_sql_owned_named(
 /// - `pk_names` / `pk_values` 长度必须一致（由调用方按模型主键提供）；
 /// - `expected` 非空时追加 `AND 列 = 旧值`（CAS），列名经 [`column_name`] 校验并换成模型列名；
 /// - 主键/期望列固定时 SQL 文本稳定，可命中语句缓存。
-pub fn update_by_pk_sql_owned_named(
+pub fn update_by_pk_sql_owned_named<S: AsRef<str>>(
     kind: DatabaseKind,
     table: &TableMeta,
     table_name: &str,
-    sets: Vec<(String, DbValue)>,
+    sets: Vec<(S, DbValue)>,
     pk_names: &[&str],
     pk_values: &[DbValue],
     expected: &[(&str, DbValue)],
@@ -582,7 +582,7 @@ pub fn update_by_pk_sql_owned_named(
     let mut set_sql = String::with_capacity(sets.len() * 16);
     let mut first = true;
     for (field, value) in sets {
-        let name = column_name(table, &field)?;
+        let name = column_name(table, field.as_ref())?;
         if !first {
             set_sql.push_str(", ");
         }
@@ -944,12 +944,12 @@ fn default_order_columns(table: &TableMeta) -> Vec<String> {
 ///
 /// 与 [`update_sql_owned_named`] 的区别：累加写成 `列 = 列 + 增量`，
 /// 由数据库在**一条语句内**完成读-加-写，天然并发安全（不会丢更新）。
-pub fn increment_sql_owned_named(
+pub fn increment_sql_owned_named<S: AsRef<str>>(
     kind: DatabaseKind,
     table: &TableMeta,
     table_name: &str,
-    deltas: Vec<(String, DbValue)>,
-    assigns: Vec<(String, DbValue)>,
+    deltas: Vec<(S, DbValue)>,
+    assigns: Vec<(S, DbValue)>,
     filter: &Where,
 ) -> Result<(String, Vec<DbValue>)> {
     if deltas.is_empty() {
@@ -964,7 +964,7 @@ pub fn increment_sql_owned_named(
     let mut first = true;
 
     for (field, value) in deltas {
-        let name = column_name(table, &field)?;
+        let name = column_name(table, field.as_ref())?;
         if !first {
             set_sql.push_str(", ");
         }
@@ -977,7 +977,7 @@ pub fn increment_sql_owned_named(
         params.push(value);
     }
     for (field, value) in assigns {
-        let name = column_name(table, &field)?;
+        let name = column_name(table, field.as_ref())?;
         if !first {
             set_sql.push_str(", ");
         }

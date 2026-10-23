@@ -727,3 +727,153 @@ fn bench_prebuilt_update() {
     let framework = full.as_nanos().saturating_sub(exec_only.as_nanos()) as f64 / N as f64;
     println!("框架侧（SQL 构建+拦截器+缓存判定）≈ {framework:>7.1} ns/op");
 }
+
+// ---------------------------------------------------------------------------
+// 拦截器写入路径基准（2026-10-23 第十六轮新增）：owned 列名 vs Cow 静态列名
+// ---------------------------------------------------------------------------
+
+/// 带审计列的窄表模型（拦截器真正会写入 `CreateTime`/`UpdateTime` 等列）。
+const AUDIT_MODEL: &str = r#"<EntityModel><Tables><Table Name="IoA" TableName="DH_IoA">
+  <Columns>
+    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+    <Column Name="Code" DataType="String" Length="50" Nullable="True" />
+    <Column Name="Amount" DataType="Int32" Nullable="True" />
+    <Column Name="Status" DataType="Int32" Nullable="True" />
+    <Column Name="Remark" DataType="String" Length="100" Nullable="True" />
+    <Column Name="CreateTime" DataType="DateTime" Nullable="True" />
+    <Column Name="UpdateTime" DataType="DateTime" Nullable="True" />
+    <Column Name="CreateUser" DataType="String" Length="50" Nullable="True" />
+    <Column Name="UpdateUser" DataType="String" Length="50" Nullable="True" />
+    <Column Name="TraceId" DataType="String" Length="64" Nullable="True" />
+  </Columns>
+</Table></Tables></EntityModel>"#;
+
+fn bench_audit_dal(tag: &str) -> pek_rcode::Dal {
+    let dir = std::env::temp_dir().join(format!("pek-rcode-audit-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = format!("Data Source={};Provider=SQLite", dir.join("a.db").display());
+    let dal = pek_rcode::Dal::open_with_model(
+        &conn,
+        pek_rcode::model::EntityModel::parse(AUDIT_MODEL).unwrap(),
+    )
+    .unwrap();
+    dal.sync_schema().unwrap();
+    dal
+}
+
+/// 一次 `update_by_pk` / `update_by_pk_static` 对照测量（独立库，避免顺序偏差）。
+fn measure_updates(
+    dal: &pek_rcode::Dal,
+    n: usize,
+) -> ((Duration, usize), (Duration, usize)) {
+    use pek_rcode::DbValue;
+    let table = dal.table("IoA").unwrap();
+    let mut session = dal.open_session().unwrap();
+    let sets: Vec<(&'static str, DbValue)> = vec![
+        ("Code", DbValue::Text("A".into())),
+        ("Amount", DbValue::Int(1)),
+        ("Status", DbValue::Int(1)),
+        ("Remark", DbValue::Text(String::new())),
+    ];
+    let id = table.insert(session.as_mut(), &sets).unwrap();
+    let pk = [DbValue::Int(id)];
+
+    session.begin().unwrap();
+    for _ in 0..2_000 {
+        table.update_by_pk(session.as_mut(), &sets, &pk).unwrap();
+        table.update_by_pk_static(session.as_mut(), &sets, &pk).unwrap();
+    }
+
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..n {
+        table.update_by_pk(session.as_mut(), &sets, &pk).unwrap();
+    }
+    let owned = (t.elapsed(), alloc_since(mark));
+
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..n {
+        table.update_by_pk_static(session.as_mut(), &sets, &pk).unwrap();
+    }
+    let cow = (t.elapsed(), alloc_since(mark));
+    session.commit().unwrap();
+    (owned, cow)
+}
+
+/// 插入对照测量（每次用独立库，避开页增长/自增带来的顺序偏差）。
+fn measure_insert(dal: &pek_rcode::Dal, n: usize, use_static: bool) -> (Duration, usize) {
+    use pek_rcode::DbValue;
+    let table = dal.table("IoA").unwrap();
+    let mut session = dal.open_session().unwrap();
+    let sets: Vec<(&'static str, DbValue)> = vec![
+        ("Code", DbValue::Text("A".into())),
+        ("Amount", DbValue::Int(1)),
+        ("Status", DbValue::Int(1)),
+        ("Remark", DbValue::Text(String::new())),
+    ];
+    session.begin().unwrap();
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..n {
+        if use_static {
+            table.insert_static(session.as_mut(), &sets).unwrap();
+        } else {
+            table.insert(session.as_mut(), &sets).unwrap();
+        }
+    }
+    let elapsed = t.elapsed();
+    let allocs = alloc_since(mark);
+    session.commit().unwrap();
+    (elapsed, allocs)
+}
+
+/// 有拦截器（物联网常见配置）时，写入路径的列名开销：
+/// `update_by_pk` / `insert`（owned 列名，每列一次 `String` 分配）
+/// vs `update_by_pk_static` / `insert_static`（Cow 静态列名，零分配）。
+///
+/// 分三档注册（无 / 仅 Time / 三件套）以分离「拦截器自身开销」与「列名分配开销」。
+#[test]
+#[ignore]
+fn bench_interceptor_write_paths() {
+    use pek_rcode::interceptor;
+    const N: usize = 20_000;
+    let saved = interceptor::interceptors();
+
+    // ① 无拦截器（借用快路）
+    interceptor::clear();
+    let none_dal = bench_audit_dal("none");
+    let ((u1, a1), (u2, a2)) = measure_updates(&none_dal, N);
+    report("update_by_pk（无拦截器 · 借用快路）", N, u1, a1);
+    report("update_by_pk_static（无拦截器 · 委托借用）", N, u2, a2);
+
+    // ② 仅 TimeInterceptor（只补 UpdateTime）
+    interceptor::clear();
+    interceptor::register(std::sync::Arc::new(interceptor::TimeInterceptor));
+    let time_dal = bench_audit_dal("time");
+    let ((t1, ta1), (t2, ta2)) = measure_updates(&time_dal, N);
+    report("update_by_pk（仅 Time · owned 列名）", N, t1, ta1);
+    report("update_by_pk_static（仅 Time · Cow 列名）", N, t2, ta2);
+
+    // ③ 内置三件套（Time + User + Trace）
+    interceptor::clear();
+    interceptor::enable_defaults();
+    let all_dal = bench_audit_dal("all");
+    let ((w1, wa1), (w2, wa2)) = measure_updates(&all_dal, N);
+    report("update_by_pk（三件套 · owned 列名）", N, w1, wa1);
+    report("update_by_pk_static（三件套 · Cow 列名）", N, w2, wa2);
+
+    // ④ 插入（独立库各测一次）
+    let ins_owned_dal = bench_audit_dal("ins-owned");
+    let (i1, ia1) = measure_insert(&ins_owned_dal, N, false);
+    let ins_cow_dal = bench_audit_dal("ins-cow");
+    let (i2, ia2) = measure_insert(&ins_cow_dal, N, true);
+    report("insert（三件套 · owned 列名）", N, i1, ia1);
+    report("insert_static（三件套 · Cow 列名）", N, i2, ia2);
+
+    // 还原注册表（不影响同进程其它基准）
+    interceptor::clear();
+    for item in saved {
+        interceptor::register(item);
+    }
+}

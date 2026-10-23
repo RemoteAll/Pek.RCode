@@ -123,6 +123,7 @@ fn to_table_meta(info: catalog::TableInfo) -> TableMeta {
                 unique: idx.unique,
             })
             .collect(),
+        audit_columns: std::sync::OnceLock::new(),
     }
 }
 

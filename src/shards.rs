@@ -1792,6 +1792,7 @@ mod tests {
             max_cache_count: 1000,
             columns: Vec::new(),
             indexes: Vec::new(),
+            audit_columns: std::sync::OnceLock::new(),
         };
 
         let asc = fix_shard_order(

@@ -207,15 +207,14 @@ pub trait Entity: Sized {
     fn insert_with(&mut self, table: &TableRef<'_>, session: &mut dyn SqlSession) -> Result<i64> {
         let identity = table.meta().identity().map(|c| c.name.clone());
 
-        // 列集合转为 owned：值直接移入 SQL 参数（省一次克隆）
-        let fields: Vec<(String, DbValue)> = self
+        // 保留 `'static` 列名：有拦截器时走 Cow 快路（零列名分配）
+        let fields: Vec<(&'static str, DbValue)> = self
             .to_fields()
             .into_iter()
             .filter(|pair| !identity.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(pair.0)))
-            .map(|(name, value)| (name.to_string(), value))
             .collect();
 
-        let id = table.insert_owned(session, fields)?;
+        let id = table.insert_static(session, &fields)?;
         if id != 0 {
             self.set_identity(id)?;
         }
@@ -459,7 +458,7 @@ pub trait Entity: Sized {
                 return Ok(0);
             }
             let pk_values = pk_values(self, pks)?;
-            let affected = table.update_by_pk(session, &sets, &pk_values)?;
+            let affected = table.update_by_pk_static(session, &sets, &pk_values)?;
             self.clear_dirty();
             return Ok(affected);
         }
@@ -719,7 +718,7 @@ pub trait Entity: Sized {
             return Ok(0);
         }
         let pk_values = pk_values(self, pks)?;
-        let affected = table.update_if(session, &sets, &pk_values, expected)?;
+        let affected = table.update_if_static(session, &sets, &pk_values, expected)?;
         if affected == 0 {
             // 冲突：保留脏数据，便于调用方重读合并后再次提交
             return Err(Error::Conflict(format!(

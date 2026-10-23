@@ -2377,6 +2377,125 @@ impl<'a> TableRef<'a> {
         Ok(affected)
     }
 
+    /// 按主键更新（**静态列名**版本；有拦截器时用 Cow 列名，零列名分配）。
+    ///
+    /// 供实体层（列名来自 `rcodegen` 的 `'static` 字面量）使用；无拦截器时直接走借用快路。
+    pub fn update_by_pk_static(
+        &self,
+        session: &mut dyn SqlSession,
+        sets: &[(&'static str, DbValue)],
+        pk: &[DbValue],
+    ) -> Result<u64> {
+        if !crate::interceptor::has_registered() {
+            return self.update_by_pk_single(session, sets, pk);
+        }
+        self.ensure_writable()?;
+        let pk_names = self.pk_names();
+        if pk_names.len() != pk.len() {
+            return Err(Error::Model(format!(
+                "表 {} 主键需要 {} 个值，实际传入 {} 个",
+                self.table.name,
+                pk_names.len(),
+                pk.len()
+            )));
+        }
+        let values = crate::interceptor::prepare_static(
+            self.table,
+            crate::interceptor::DataMethod::Update,
+            sets,
+        );
+        let (sql, params) = sqlbuild::update_by_pk_sql_owned_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            values,
+            &pk_names,
+            pk,
+            &[],
+        )?;
+        self.dal.log_sql(&sql);
+        let affected = session.execute(&sql, &params)?;
+        if affected > 0 {
+            self.dal.invalidate_cache(self.physical_name());
+        }
+        Ok(affected)
+    }
+
+    /// 条件更新（静态列名版本；语义同 [`TableRef::update_if`]）。
+    pub fn update_if_static(
+        &self,
+        session: &mut dyn SqlSession,
+        sets: &[(&'static str, DbValue)],
+        pk: &[DbValue],
+        expected: &[(&str, DbValue)],
+    ) -> Result<u64> {
+        if !crate::interceptor::has_registered() {
+            return self.update_if(session, sets, pk, expected);
+        }
+        self.ensure_writable()?;
+        if sets.is_empty() {
+            return Err(Error::Argument("条件更新至少需要一个待更新字段".into()));
+        }
+        if self.shard_spec().is_some() {
+            return Err(Error::Unsupported(format!(
+                "表 {} 是分表，条件更新请用具体分表句柄",
+                self.table.name
+            )));
+        }
+        let pk_names = self.pk_names();
+        if pk_names.len() != pk.len() {
+            return Err(Error::Model(format!(
+                "表 {} 主键需要 {} 个值，实际传入 {} 个",
+                self.table.name,
+                pk_names.len(),
+                pk.len()
+            )));
+        }
+        let values = crate::interceptor::prepare_static(
+            self.table,
+            crate::interceptor::DataMethod::Update,
+            sets,
+        );
+        let (sql, params) = sqlbuild::update_by_pk_sql_owned_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            values,
+            &pk_names,
+            pk,
+            expected,
+        )?;
+        self.dal.log_sql(&sql);
+        let affected = session.execute(&sql, &params)?;
+        // 冲突也要失效缓存（同 update_if，否则重试会一直读旧值）
+        self.dal.invalidate_cache(self.physical_name());
+        Ok(affected)
+    }
+
+    /// 插入一行（静态列名版本；有拦截器时 Cow 零列名分配）。
+    pub fn insert_static(
+        &self,
+        session: &mut dyn SqlSession,
+        fields: &[(&'static str, DbValue)],
+    ) -> Result<i64> {
+        if !crate::interceptor::has_registered() || self.shard_spec().is_some() {
+            return self.insert(session, fields);
+        }
+        self.ensure_writable()?;
+        let values = crate::interceptor::prepare_static(
+            self.table,
+            crate::interceptor::DataMethod::Insert,
+            fields,
+        );
+        let (sql, params) = sqlbuild::insert_sql_owned_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            values,
+        )?;
+        self.execute_insert_sql(session, sql, params)
+    }
+
     /// 按条件更新（`UPDATE ... SET ... WHERE ...`，一条语句改多行），返回受影响行数。
     ///
     /// 对应 C# `EntityPersistence.Update` 的"按条件改同值"用法（批量改状态、批量打标等）：

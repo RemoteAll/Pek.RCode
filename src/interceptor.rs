@@ -13,6 +13,7 @@
 //! - 更新（`SetNoDirtyItem`）：调用方显式传入的列**不覆盖**；未传入的列补全
 //! - 与 C# 的差异：C# 用实体“脏标记”判断是否覆盖；Rust 以调用方显式传入的列集合近似（语义等价）
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -20,8 +21,37 @@ use chrono::{Datelike, Local};
 
 use crate::model::TableMeta;
 use crate::session::DbRow;
-use crate::types::DataType;
 use crate::value::DbValue;
+
+thread_local! {
+    /// 审计时间戳缓存（毫秒戳, 时间值）。
+    static AUDIT_NOW: std::cell::Cell<(u64, Option<chrono::NaiveDateTime>)> =
+        const { std::cell::Cell::new((u64::MAX, None)) };
+}
+
+/// 审计时间戳（毫秒级缓存）。
+///
+/// 每次写入都要补 `CreateTime` / `UpdateTime`；直接调 `chrono::Local::now()` 需要查时区
+/// （Windows 上走注册表 + 锁，~数百 ns）。数据库审计列精度到毫秒即可，因此**同一毫秒内的多次写入
+/// 复用同一时间戳**——既省时区查询，也让同一批写入的时间戳天然一致（对齐 C# `DateTime.Now`
+/// 的时钟粒度缓存行为）。
+fn audit_now() -> chrono::NaiveDateTime {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    AUDIT_NOW.with(|slot| {
+        let (cached_stamp, cached) = slot.get();
+        if cached_stamp == stamp
+            && let Some(value) = cached
+        {
+            return value;
+        }
+        let value = Local::now().naive_local();
+        slot.set((stamp, Some(value)));
+        value
+    })
+}
 
 /// 数据操作方法（对应 `DataMethod`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +75,26 @@ pub trait EntityInterceptor: Send + Sync {
     /// 数据验证/填充（对应 `OnValid`；写入前调用，可增改列值）。
     fn on_valid(&self, table: &TableMeta, method: DataMethod, values: &mut Vec<(String, DbValue)>) {
         let _ = (table, method, values);
+    }
+
+    /// Cow 列名版本（默认转 owned 调 [`EntityInterceptor::on_valid`]，旧实现无需改动）。
+    ///
+    /// 内置拦截器覆写本方法：列名用 `Cow::Borrowed`，避免每次写入为列名分配 `String`。
+    fn on_valid_cow<'a>(
+        &self,
+        table: &TableMeta,
+        method: DataMethod,
+        values: &mut Vec<(Cow<'a, str>, DbValue)>,
+    ) {
+        let mut owned: Vec<(String, DbValue)> = values
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect();
+        self.on_valid(table, method, &mut owned);
+        *values = owned
+            .into_iter()
+            .map(|(name, value)| (Cow::Owned(name), value))
+            .collect();
     }
 
     /// 是否允许访问该行（对应 `OnFilter`；默认允许）。
@@ -149,6 +199,50 @@ pub(crate) fn apply_registered(
     apply_to(interceptors.as_slice(), table, method, values);
 }
 
+/// 应用指定拦截器（Cow 列名版）。
+pub fn apply_to_cow<'a>(
+    interceptors: &[Arc<dyn EntityInterceptor>],
+    table: &TableMeta,
+    method: DataMethod,
+    values: &mut Vec<(Cow<'a, str>, DbValue)>,
+) {
+    for interceptor in interceptors {
+        if interceptor.on_init(table) {
+            interceptor.on_valid_cow(table, method, values);
+        }
+    }
+}
+
+/// 应用全局拦截器（Cow 列名版；未注册时零锁零分配）。
+pub(crate) fn apply_registered_cow<'a>(
+    table: &TableMeta,
+    method: DataMethod,
+    values: &mut Vec<(Cow<'a, str>, DbValue)>,
+) {
+    if !HAS_INTERCEPTORS.load(Ordering::Relaxed) {
+        return;
+    }
+    let interceptors = snapshot();
+    if interceptors.is_empty() {
+        return;
+    }
+    apply_to_cow(interceptors.as_slice(), table, method, values);
+}
+
+/// 借用列集 → Cow 列名（列名零拷贝）+ 全局拦截器（有拦截器时写入路径零列名分配）。
+pub(crate) fn prepare_static<'a>(
+    table: &TableMeta,
+    method: DataMethod,
+    fields: &[(&'a str, DbValue)],
+) -> Vec<(Cow<'a, str>, DbValue)> {
+    let mut values: Vec<(Cow<'a, str>, DbValue)> = fields
+        .iter()
+        .map(|(name, value)| (Cow::Borrowed(*name), value.clone()))
+        .collect();
+    apply_registered_cow(table, method, &mut values);
+    values
+}
+
 /// 把已 owned 的列集合就地应用全局拦截器（写入热路径使用，避免再次复制列名与值）。
 pub(crate) fn prepare_owned(
     table: &TableMeta,
@@ -207,6 +301,48 @@ fn set_no_dirty(table: &TableMeta, values: &mut Vec<(String, DbValue)>, name: &s
     }
 }
 
+/// 插入场景（Cow 列名版；`name` 为静态字面量 → `Cow::Borrowed` 零分配）。
+fn set_item_cow<'a>(
+    table: &TableMeta,
+    values: &mut Vec<(Cow<'a, str>, DbValue)>,
+    name: &'static str,
+    value: DbValue,
+) {
+    if table.column(name).is_none() {
+        return;
+    }
+    match values.iter_mut().find(|(key, _)| key.eq_ignore_ascii_case(name)) {
+        Some((_, existing)) => {
+            let is_default = match existing {
+                DbValue::Null => true,
+                DbValue::Int(v) => *v == 0,
+                DbValue::Text(v) => v.is_empty(),
+                DbValue::DateTime(v) => v.year() < 2000,
+                _ => false,
+            };
+            if is_default {
+                *existing = value;
+            }
+        }
+        None => values.push((Cow::Borrowed(name), value)),
+    }
+}
+
+/// 更新场景（Cow 列名版；列名静态字面量零分配）。
+fn set_no_dirty_cow<'a>(
+    table: &TableMeta,
+    values: &mut Vec<(Cow<'a, str>, DbValue)>,
+    name: &'static str,
+    value: DbValue,
+) {
+    if table.column(name).is_none() {
+        return;
+    }
+    if !values.iter().any(|(key, _)| key.eq_ignore_ascii_case(name)) {
+        values.push((Cow::Borrowed(name), value));
+    }
+}
+
 // ============================ 时间拦截器 ============================
 
 /// 时间拦截器（对应 `TimeInterceptor`）：插入填 `CreateTime`/`UpdateTime`，更新刷新 `UpdateTime`。
@@ -214,15 +350,12 @@ pub struct TimeInterceptor;
 
 impl EntityInterceptor for TimeInterceptor {
     fn on_init(&self, table: &TableMeta) -> bool {
-        table.columns.iter().any(|col| {
-            col.data_type == DataType::DateTime
-                && (col.name.eq_ignore_ascii_case("CreateTime")
-                    || col.name.eq_ignore_ascii_case("UpdateTime"))
-        })
+        use crate::model::audit_flags;
+        table.audit_flags() & (audit_flags::CREATE_TIME | audit_flags::UPDATE_TIME) != 0
     }
 
     fn on_valid(&self, table: &TableMeta, method: DataMethod, values: &mut Vec<(String, DbValue)>) {
-        let now = Local::now().naive_local();
+        let now = audit_now();
         match method {
             DataMethod::Insert => {
                 set_item(table, values, "CreateTime", DbValue::DateTime(now));
@@ -230,6 +363,25 @@ impl EntityInterceptor for TimeInterceptor {
             }
             DataMethod::Update => {
                 set_no_dirty(table, values, "UpdateTime", DbValue::DateTime(now));
+            }
+            DataMethod::Delete => {}
+        }
+    }
+
+    fn on_valid_cow<'a>(
+        &self,
+        table: &TableMeta,
+        method: DataMethod,
+        values: &mut Vec<(Cow<'a, str>, DbValue)>,
+    ) {
+        let now = audit_now();
+        match method {
+            DataMethod::Insert => {
+                set_item_cow(table, values, "CreateTime", DbValue::DateTime(now));
+                set_item_cow(table, values, "UpdateTime", DbValue::DateTime(now));
+            }
+            DataMethod::Update => {
+                set_no_dirty_cow(table, values, "UpdateTime", DbValue::DateTime(now));
             }
             DataMethod::Delete => {}
         }
@@ -312,15 +464,13 @@ impl Default for UserInterceptor {
 
 impl EntityInterceptor for UserInterceptor {
     fn on_init(&self, table: &TableMeta) -> bool {
-        table.columns.iter().any(|col| {
-            (col.data_type == DataType::Int32 || col.data_type == DataType::Int64)
-                && (col.name.eq_ignore_ascii_case("CreateUserID")
-                    || col.name.eq_ignore_ascii_case("UpdateUserID"))
-        }) || table.columns.iter().any(|col| {
-            col.data_type == DataType::String
-                && (col.name.eq_ignore_ascii_case("CreateUser")
-                    || col.name.eq_ignore_ascii_case("UpdateUser"))
-        })
+        use crate::model::audit_flags;
+        table.audit_flags()
+            & (audit_flags::CREATE_USER
+                | audit_flags::UPDATE_USER
+                | audit_flags::CREATE_USER_ID
+                | audit_flags::UPDATE_USER_ID)
+            != 0
     }
 
     fn on_valid(&self, table: &TableMeta, method: DataMethod, values: &mut Vec<(String, DbValue)>) {
@@ -346,6 +496,35 @@ impl EntityInterceptor for UserInterceptor {
             }
         }
     }
+
+    fn on_valid_cow<'a>(
+        &self,
+        table: &TableMeta,
+        method: DataMethod,
+        values: &mut Vec<(Cow<'a, str>, DbValue)>,
+    ) {
+        match self.resolve_user(method) {
+            Some((id, name)) => match method {
+                DataMethod::Insert => {
+                    set_item_cow(table, values, "CreateUserID", DbValue::Int(id));
+                    set_item_cow(table, values, "CreateUser", DbValue::Text(name.clone()));
+                    set_item_cow(table, values, "UpdateUserID", DbValue::Int(id));
+                    set_item_cow(table, values, "UpdateUser", DbValue::Text(name));
+                }
+                DataMethod::Update => {
+                    set_no_dirty_cow(table, values, "UpdateUserID", DbValue::Int(id));
+                    set_no_dirty_cow(table, values, "UpdateUser", DbValue::Text(name));
+                }
+                DataMethod::Delete => {}
+            },
+            None => {
+                if self.allow_empty && method == DataMethod::Update {
+                    set_no_dirty_cow(table, values, "UpdateUserID", DbValue::Int(0));
+                    set_no_dirty_cow(table, values, "UpdateUser", DbValue::Text(String::new()));
+                }
+            }
+        }
+    }
 }
 
 // ============================ 追踪拦截器 ============================
@@ -358,14 +537,23 @@ fn trace_slot() -> &'static Mutex<Option<String>> {
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
+/// 当前是否存在 TraceId（原子快路：无 trace 时写入路径零锁）。
+static HAS_TRACE: AtomicBool = AtomicBool::new(false);
+
 impl TraceContext {
     /// 设置当前 TraceId（None 表示清除）。
     pub fn set_current(trace_id: Option<String>) {
+        let active = trace_id.as_deref().is_some_and(|value| !value.is_empty());
         *lock(trace_slot()) = trace_id;
+        HAS_TRACE.store(active, Ordering::Relaxed);
     }
 
     /// 当前 TraceId。
     pub fn current() -> Option<String> {
+        // 绝大多数 IoT 写入没有链路追踪：一次原子读即可返回，不必抢全局锁
+        if !HAS_TRACE.load(Ordering::Relaxed) {
+            return None;
+        }
         lock(trace_slot()).clone()
     }
 }
@@ -396,9 +584,8 @@ impl Default for TraceInterceptor {
 
 impl EntityInterceptor for TraceInterceptor {
     fn on_init(&self, table: &TableMeta) -> bool {
-        table.columns.iter().any(|col| {
-            col.data_type == DataType::String && col.name.eq_ignore_ascii_case("TraceId")
-        })
+        use crate::model::audit_flags;
+        table.audit_flags() & audit_flags::TRACE_ID != 0
     }
 
     fn on_valid(&self, table: &TableMeta, method: DataMethod, values: &mut Vec<(String, DbValue)>) {
@@ -454,6 +641,65 @@ impl EntityInterceptor for TraceInterceptor {
             }
         } else {
             set_no_dirty(table, values, "TraceId", DbValue::Text(value));
+        }
+    }
+
+    fn on_valid_cow<'a>(
+        &self,
+        table: &TableMeta,
+        method: DataMethod,
+        values: &mut Vec<(Cow<'a, str>, DbValue)>,
+    ) {
+        if method == DataMethod::Delete {
+            return;
+        }
+        let Some(trace_id) = TraceContext::current() else {
+            return;
+        };
+        if trace_id.len() >= 50 || trace_id.is_empty() {
+            return;
+        }
+
+        let max_length = table
+            .column("TraceId")
+            .map(|col| if col.length > 0 { col.length as usize } else { 50 })
+            .unwrap_or(50);
+
+        let value = if self.allow_merge {
+            let existing = values
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("TraceId"))
+                .and_then(|(_, v)| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let mut parts: Vec<String> = existing
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if !parts.iter().any(|s| s == &trace_id) {
+                parts.push(trace_id.clone());
+            }
+            let mut joined = parts.join(",");
+            while joined.len() > max_length && parts.len() > 1 {
+                parts.remove(0);
+                joined = parts.join(",");
+            }
+            joined
+        } else {
+            trace_id
+        };
+
+        if self.allow_merge {
+            match values
+                .iter_mut()
+                .find(|(key, _)| key.eq_ignore_ascii_case("TraceId"))
+            {
+                Some((_, existing)) => *existing = DbValue::Text(value),
+                None => values.push((Cow::Borrowed("TraceId"), DbValue::Text(value))),
+            }
+        } else {
+            set_no_dirty_cow(table, values, "TraceId", DbValue::Text(value));
         }
     }
 }
@@ -696,5 +942,70 @@ mod tests {
         assert!(!TimeInterceptor.on_init(&empty));
         assert!(!UserInterceptor::new().on_init(&empty));
         assert!(!TraceInterceptor::new().on_init(&empty));
+    }
+
+    #[test]
+    fn audit_flags_cover_builtin_columns() {
+        use crate::model::audit_flags as flags;
+        let table = table();
+        let mask = table.audit_flags();
+        for (bit, name) in [
+            (flags::CREATE_TIME, "CreateTime"),
+            (flags::UPDATE_TIME, "UpdateTime"),
+            (flags::CREATE_USER, "CreateUser"),
+            (flags::UPDATE_USER, "UpdateUser"),
+            (flags::CREATE_USER_ID, "CreateUserID"),
+            (flags::UPDATE_USER_ID, "UpdateUserID"),
+            (flags::TRACE_ID, "TraceId"),
+        ] {
+            assert_ne!(mask & bit, 0, "位图缺少 {name}");
+        }
+        // 缓存幂等
+        assert_eq!(mask, table.audit_flags());
+    }
+
+    #[test]
+    fn cow_and_owned_paths_fill_same_columns() {
+        let table = table();
+        let interceptors: Vec<Arc<dyn EntityInterceptor>> = vec![
+            Arc::new(TimeInterceptor),
+            Arc::new(UserInterceptor::with_provider(Arc::new(FixedUser))),
+            Arc::new(TraceInterceptor::new()),
+        ];
+        let base: Vec<(&'static str, DbValue)> = vec![
+            ("Code", DbValue::Text("A".into())),
+            ("Remark", DbValue::Text(String::new())),
+        ];
+
+        let mut owned: Vec<(String, DbValue)> = base
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect();
+        apply_to(&interceptors, &table, DataMethod::Update, &mut owned);
+
+        let mut cow: Vec<(Cow<'_, str>, DbValue)> = base
+            .iter()
+            .map(|(name, value)| (Cow::Borrowed(*name), value.clone()))
+            .collect();
+        apply_to_cow(&interceptors, &table, DataMethod::Update, &mut cow);
+
+        let owned_flat: Vec<(String, DbValue)> = owned.into_iter().collect();
+        let cow_flat: Vec<(String, DbValue)> = cow
+            .into_iter()
+            .map(|(name, value)| (name.into_owned(), value))
+            .collect();
+
+        // 列集合与顺序一致；时间列是「当前时间」，只校验类型（两次调用可能跨毫秒）
+        let names = |items: &[(String, DbValue)]| -> Vec<String> {
+            items.iter().map(|(name, _)| name.clone()).collect()
+        };
+        assert_eq!(names(&owned_flat), names(&cow_flat));
+        for (name, value) in owned_flat.iter().chain(cow_flat.iter()) {
+            if name == "UpdateTime" {
+                assert!(matches!(value, DbValue::DateTime(_)), "{name} 应为时间");
+            }
+        }
+        assert!(owned_flat.iter().any(|(name, _)| name == "UpdateTime"));
+        assert!(owned_flat.iter().any(|(name, _)| name == "UpdateUser"));
     }
 }

@@ -28,6 +28,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use roxmltree::{Document, Node};
 
@@ -99,8 +100,26 @@ impl ModelOptions {
     }
 }
 
+/// 审计列位图（[`TableMeta::audit_flags`] 的位定义）。
+pub mod audit_flags {
+    /// `CreateTime`（DateTime）
+    pub const CREATE_TIME: u16 = 1 << 0;
+    /// `UpdateTime`（DateTime）
+    pub const UPDATE_TIME: u16 = 1 << 1;
+    /// `CreateUser`（String）
+    pub const CREATE_USER: u16 = 1 << 2;
+    /// `UpdateUser`（String）
+    pub const UPDATE_USER: u16 = 1 << 3;
+    /// `CreateUserID`（Int32/Int64）
+    pub const CREATE_USER_ID: u16 = 1 << 4;
+    /// `UpdateUserID`（Int32/Int64）
+    pub const UPDATE_USER_ID: u16 = 1 << 5;
+    /// `TraceId`（String）
+    pub const TRACE_ID: u16 = 1 << 6;
+}
+
 /// 数据表定义（`<Table>`）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TableMeta {
     /// 实体名（`Name`，如 `JiLiYu`）
     pub name: String,
@@ -139,6 +158,24 @@ pub struct TableMeta {
     pub columns: Vec<ColumnMeta>,
     /// 索引定义
     pub indexes: Vec<IndexMeta>,
+    /// 审计列位图缓存（惰性，首次 [`TableMeta::audit_flags`] 时填充；**不参与相等比较**）
+    pub audit_columns: OnceLock<u16>,
+}
+
+impl PartialEq for TableMeta {
+    fn eq(&self, other: &Self) -> bool {
+        // `audit_columns` 只是派生缓存，不参与比较（否则同一模型初始化前后会“不相等”）。
+        self.name == other.name
+            && self.table_name == other.table_name
+            && self.description == other.description
+            && self.conn_name == other.conn_name
+            && self.migration == other.migration
+            && self.insert_only == other.insert_only
+            && self.is_view == other.is_view
+            && self.max_cache_count == other.max_cache_count
+            && self.columns == other.columns
+            && self.indexes == other.indexes
+    }
 }
 
 impl TableMeta {
@@ -158,6 +195,40 @@ impl TableMeta {
                 || c.column_name
                     .as_deref()
                     .is_some_and(|cn| cn.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// 审计列位图（`CreateTime` / `UpdateTime` / `*User*` / `TraceId` 是否存在且类型匹配）。
+    ///
+    /// 拦截器每次写入都要判断「本表有没有这些列」。逐列线性扫描在宽表上是几十次字符串比较、
+    /// 而写入是物联网场景的热路径；首次使用时扫描一次并缓存，后续 O(1)。
+    /// 模型解析后列不再变化，缓存安全。
+    pub fn audit_flags(&self) -> u16 {
+        *self.audit_columns.get_or_init(|| {
+            let mut flags = 0u16;
+            for column in &self.columns {
+                let is_int =
+                    matches!(column.data_type, DataType::Int32 | DataType::Int64);
+                let is_string = column.data_type == DataType::String;
+                let is_datetime = column.data_type == DataType::DateTime;
+                let name = column.name.as_str();
+                if is_datetime && name.eq_ignore_ascii_case("CreateTime") {
+                    flags |= audit_flags::CREATE_TIME;
+                } else if is_datetime && name.eq_ignore_ascii_case("UpdateTime") {
+                    flags |= audit_flags::UPDATE_TIME;
+                } else if is_string && name.eq_ignore_ascii_case("CreateUser") {
+                    flags |= audit_flags::CREATE_USER;
+                } else if is_string && name.eq_ignore_ascii_case("UpdateUser") {
+                    flags |= audit_flags::UPDATE_USER;
+                } else if is_int && name.eq_ignore_ascii_case("CreateUserID") {
+                    flags |= audit_flags::CREATE_USER_ID;
+                } else if is_int && name.eq_ignore_ascii_case("UpdateUserID") {
+                    flags |= audit_flags::UPDATE_USER_ID;
+                } else if is_string && name.eq_ignore_ascii_case("TraceId") {
+                    flags |= audit_flags::TRACE_ID;
+                }
+            }
+            flags
         })
     }
 
@@ -470,6 +541,7 @@ fn parse_table(node: &Node) -> Result<TableMeta> {
             .unwrap_or(1000),
         columns: Vec::new(),
         indexes: Vec::new(),
+        audit_columns: OnceLock::new(),
     };
 
     for child in node.children().filter(Node::is_element) {
