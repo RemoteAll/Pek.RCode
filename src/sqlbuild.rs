@@ -209,6 +209,45 @@ pub fn multi_write_sql_named(
     rows: usize,
     mode: BatchWriteMode,
 ) -> Result<String> {
+    multi_write_impl(kind, table, table_name, columns, rows, mode, None)
+}
+
+/// 组装多行 Upsert 语句，并**指定冲突时只更新哪些列**（脏列追踪：只写变化列）。
+///
+/// `update_only` 为 `None` 等价于 [`multi_write_sql_named`] 的 `Upsert`（更新列 = 插入列排除主键与自增列）；
+/// 为 `Some([..])` 时只会更新其中**同时出现在插入列里且不是主键/自增列**的列
+/// （插入路径仍写全列，因为新行必须完整）。
+///
+/// 用途：`EntityQueue` 把「脏列集合相同的行」合并成一条多行 Upsert ——
+/// 既保留「只写变化列」的语义，又拿到批量的性能（逐条 `find + update` 每行要 2 次往返）。
+pub fn multi_write_sql_upsert_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    columns: &[&str],
+    rows: usize,
+    update_only: Option<&[&str]>,
+) -> Result<String> {
+    multi_write_impl(
+        kind,
+        table,
+        table_name,
+        columns,
+        rows,
+        BatchWriteMode::Upsert,
+        update_only,
+    )
+}
+
+fn multi_write_impl(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    columns: &[&str],
+    rows: usize,
+    mode: BatchWriteMode,
+    update_only: Option<&[&str]>,
+) -> Result<String> {
     if columns.is_empty() {
         return Err(Error::Model(format!(
             "表 {} 的批量写入语句至少需要一个字段",
@@ -260,7 +299,8 @@ pub fn multi_write_sql_named(
                     table.name
                 )));
             }
-            // 更新列 = 插入列中排除主键与自增列（对齐 C# `On Conflict Do Update` 的字段过滤）
+            // 更新列 = 插入列中排除主键与自增列（对齐 C# `On Conflict Do Update` 的字段过滤）；
+            // 脏列追踪时再收窄到「本批的更新列集合」（`update_only`）
             let update_fields: Vec<&str> = columns
                 .iter()
                 .copied()
@@ -269,6 +309,9 @@ pub fn multi_write_sql_named(
                         && !table
                             .identity()
                             .is_some_and(|id| id.name.eq_ignore_ascii_case(field))
+                        && update_only.is_none_or(|only| {
+                            only.iter().any(|col| col.eq_ignore_ascii_case(field))
+                        })
                 })
                 .collect();
 

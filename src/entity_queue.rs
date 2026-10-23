@@ -347,24 +347,47 @@ impl EntityQueue {
                     }
                     let run = &items[start..index];
 
-                    // 快速路径：未启用脏列约束，且行内已含全部主键列（生成实体的 `to_fields` 即如此）
+                    // 多行 Upsert 的前提：行内已含全部主键列（生成实体的 `to_fields` 即如此）
                     let pk_names: Vec<&str> = table
                         .meta()
                         .primary_keys()
                         .iter()
                         .map(|column| table.meta().effective_column_name(column))
                         .collect();
-                    let rows_carry_pk = !pk_names.is_empty()
-                        && run.iter().all(|item| {
-                            !item.fields.is_empty()
-                                && pk_names.iter().all(|pk| {
-                                    item.fields
-                                        .iter()
-                                        .any(|(name, _)| name.eq_ignore_ascii_case(pk))
-                                })
-                        });
-                    if run.iter().all(|item| item.update_columns.is_none()) && rows_carry_pk {
-                        let rows: Vec<Vec<(&str, &DbValue)>> = run
+                    let carries_pk = |item: &QueueItem| {
+                        !pk_names.is_empty()
+                            && !item.fields.is_empty()
+                            && pk_names.iter().all(|pk| {
+                                item.fields
+                                    .iter()
+                                    .any(|(name, _)| name.eq_ignore_ascii_case(pk))
+                            })
+                    };
+
+                    // 按「更新列集合」分组：脏列相同的行可**合并为一条多行 Upsert**，
+                    // 既保留「只写变化列」的语义，又避免逐条 `find + update`（2 次往返/行）。
+                    let mut full: Vec<&QueueItem> = Vec::new();
+                    let mut groups: Vec<(&[String], Vec<&QueueItem>)> = Vec::new();
+                    let mut slow: Vec<&QueueItem> = Vec::new();
+                    for item in run {
+                        if !carries_pk(item) {
+                            slow.push(item);
+                        } else if let Some(columns) = item.update_columns.as_deref() {
+                            match groups
+                                .iter_mut()
+                                .find(|(key, _)| same_column_set(key, columns))
+                            {
+                                Some((_, list)) => list.push(item),
+                                None => groups.push((columns, vec![item])),
+                            }
+                        } else {
+                            full.push(item);
+                        }
+                    }
+
+                    // ① 全列组：多行 Upsert（更新列 = 插入列排除主键/自增列）
+                    if !full.is_empty() {
+                        let rows: Vec<Vec<(&str, &DbValue)>> = full
                             .iter()
                             .map(|item| {
                                 item.fields
@@ -384,12 +407,28 @@ impl EntityQueue {
                             BatchWriteMode::Upsert,
                             None,
                         )?;
-                        stats.updated += run.len() as u64;
-                        continue;
+                        stats.updated += full.len() as u64;
                     }
 
-                    // 慢路径（脏列约束 / 行内缺主键）：逐条存在性判定
-                    for item in run {
+                    // ② 脏列组：多行 Upsert，冲突时只更新该组的列
+                    for (columns, list) in groups {
+                        let rows: Vec<Vec<(&str, &DbValue)>> = list
+                            .iter()
+                            .map(|item| {
+                                item.fields
+                                    .iter()
+                                    .map(|(name, value)| (name.as_ref(), value))
+                                    .collect()
+                            })
+                            .collect();
+                        let refs: Vec<&Vec<(&str, &DbValue)>> = rows.iter().collect();
+                        let only: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        table.write_batch_rows_upsert(session, &refs, Some(&only), None)?;
+                        stats.updated += list.len() as u64;
+                    }
+
+                    // ③ 行内缺主键：逐条存在性判定（无法用多行 Upsert）
+                    for item in slow {
                         let fields: Vec<(&str, DbValue)> = item
                             .fields
                             .iter()
@@ -451,6 +490,17 @@ impl EntityQueue {
         self.stats.deleted += stats.deleted;
         Ok(stats)
     }
+}
+
+/// 两个「更新列集合」是否等价（顺序无关、大小写不敏感）。
+///
+/// 脏列登记顺序取决于字段被赋值的先后，不同行可能不同；
+/// 只有集合相同才能合并成同一条多行 Upsert。
+fn same_column_set(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .all(|a| right.iter().any(|b| a.eq_ignore_ascii_case(b)))
 }
 
 #[cfg(test)]
@@ -544,5 +594,152 @@ mod tests {
         assert!(!table.exists_by_pk(session.as_mut(), &[DbValue::Int(id)]).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 脏列追踪（`upsert_tracked` + `update_columns`）也必须走**多行 Upsert**，
+    /// 且冲突时只写脏列 —— 此前这条路径会退化成逐条 `find + update`（2 次往返/行）。
+    const MODEL_DIRTY: &str = r#"<EntityModel><Tables><Table Name="ItemDirty" TableName="DH_ItemDirty">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        <Column Name="Code" DataType="String" Length="50" />
+        <Column Name="Remark" DataType="String" Length="50" />
+      </Columns>
+    </Table></Tables></EntityModel>"#;
+
+    fn dirty_dal(name: &str) -> (Dal, std::path::PathBuf) {
+        let stamp = chrono::Local::now()
+            .format("%H%M%S%.6f")
+            .to_string()
+            .replace('.', "");
+        let dir = std::env::temp_dir()
+            .join(format!("rcode-queue-dirty-{}-{stamp}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("queue.db");
+        let model = EntityModel::parse(MODEL_DIRTY).expect("测试模型应可解析");
+        let dal =
+            Dal::open_with_model(&format!("Data Source={};Provider=SQLite", db.display()), model)
+                .unwrap();
+        dal.sync_schema().unwrap();
+        (dal, dir)
+    }
+
+    #[test]
+    fn tracked_upsert_batches_and_only_writes_dirty_columns() {
+        let (dal, dir) = dirty_dal("tracked");
+        let mut session = dal.open_session().unwrap();
+        let table = dal.table("ItemDirty").unwrap();
+        let id1 = table
+            .insert(
+                session.as_mut(),
+                &[("Code", "A".into()), ("Remark", "keep1".into())],
+            )
+            .unwrap();
+        let id2 = table
+            .insert(
+                session.as_mut(),
+                &[("Code", "B".into()), ("Remark", "keep2".into())],
+            )
+            .unwrap();
+
+        let mut queue = EntityQueue::new("ItemDirty");
+        let dirty = vec!["Code".to_string()];
+        for (id, code) in [(id1, "A2"), (id2, "B2")] {
+            let fields = vec![
+                ("Id", DbValue::Int(id)),
+                ("Code", DbValue::Text(code.into())),
+                ("Remark", DbValue::Text("overwritten".into())),
+            ];
+            queue
+                .upsert_tracked(
+                    &dal,
+                    session.as_mut(),
+                    &[DbValue::Int(id)],
+                    &fields,
+                    Some(&dirty),
+                )
+                .unwrap();
+        }
+        let stats = queue.flush(&dal, session.as_mut()).unwrap();
+        assert_eq!(stats.updated, 2, "两行都应计入 updated");
+
+        for (id, code, remark) in [(id1, "A2", "keep1"), (id2, "B2", "keep2")] {
+            let row = table
+                .find_by_pk(session.as_mut(), &[DbValue::Int(id)])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.get_by_name("Code").unwrap().as_str(),
+                Some(code),
+                "脏列应被写入"
+            );
+            assert_eq!(
+                row.get_by_name("Remark").unwrap().as_str(),
+                Some(remark),
+                "非脏列必须保持原值（只写变化列）"
+            );
+        }
+
+        // 不同脏列集合 → 分组各走一条语句，仍然只写各自的脏列
+        let mut queue = EntityQueue::new("ItemDirty");
+        let only_code = vec!["Code".to_string()];
+        let both = vec!["Code".to_string(), "Remark".to_string()];
+        queue
+            .upsert_tracked(
+                &dal,
+                session.as_mut(),
+                &[DbValue::Int(id1)],
+                &[
+                    ("Id", DbValue::Int(id1)),
+                    ("Code", DbValue::Text("A3".into())),
+                    ("Remark", DbValue::Text("no".into())),
+                ],
+                Some(&only_code),
+            )
+            .unwrap();
+        queue
+            .upsert_tracked(
+                &dal,
+                session.as_mut(),
+                &[DbValue::Int(id2)],
+                &[
+                    ("Id", DbValue::Int(id2)),
+                    ("Code", DbValue::Text("B3".into())),
+                    ("Remark", DbValue::Text("yes".into())),
+                ],
+                Some(&both),
+            )
+            .unwrap();
+        queue.flush(&dal, session.as_mut()).unwrap();
+
+        let row1 = table
+            .find_by_pk(session.as_mut(), &[DbValue::Int(id1)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(row1.get_by_name("Code").unwrap().as_str(), Some("A3"));
+        assert_eq!(
+            row1.get_by_name("Remark").unwrap().as_str(),
+            Some("keep1"),
+            "只登记 Code 的行不应写 Remark"
+        );
+        let row2 = table
+            .find_by_pk(session.as_mut(), &[DbValue::Int(id2)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(row2.get_by_name("Code").unwrap().as_str(), Some("B3"));
+        assert_eq!(
+            row2.get_by_name("Remark").unwrap().as_str(),
+            Some("yes"),
+            "登记了 Remark 的行应写入"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_column_set_ignores_order_and_case() {
+        let left = vec!["Code".to_string(), "Remark".to_string()];
+        let right = vec!["remark".to_string(), "code".to_string()];
+        assert!(same_column_set(&left, &right));
+        assert!(!same_column_set(&left, &["Code".to_string()]));
     }
 }

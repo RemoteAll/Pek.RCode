@@ -2143,6 +2143,19 @@ impl<'a> TableRef<'a> {
         batch: usize,
         mode: BatchWriteMode,
     ) -> Result<u64> {
+        self.exec_multi_write_upsert(session, rows, columns, batch, mode, None)
+    }
+
+    /// 多行写入执行（可指定 Upsert 的「只更新列」）。
+    fn exec_multi_write_upsert<F: BatchField>(
+        &self,
+        session: &mut dyn SqlSession,
+        rows: &[&Vec<F>],
+        columns: &[&str],
+        batch: usize,
+        mode: BatchWriteMode,
+        update_only: Option<&[&str]>,
+    ) -> Result<u64> {
         let max_params = self.dal.kind.max_statement_params();
         let per_statement = if max_params == 0 {
             batch
@@ -2169,14 +2182,24 @@ impl<'a> TableRef<'a> {
             !row.is_empty() && positions.iter().all(|p| p.is_some_and(|i| i < row.len()))
         });
         for chunk in rows.chunks(per_statement) {
-            let sql = sqlbuild::multi_write_sql_named(
-                self.dal.kind,
-                self.table,
-                self.physical_name(),
-                columns,
-                chunk.len(),
-                mode,
-            )?;
+            let sql = match (mode, update_only) {
+                (BatchWriteMode::Upsert, Some(only)) => sqlbuild::multi_write_sql_upsert_named(
+                    self.dal.kind,
+                    self.table,
+                    self.physical_name(),
+                    columns,
+                    chunk.len(),
+                    Some(only),
+                )?,
+                _ => sqlbuild::multi_write_sql_named(
+                    self.dal.kind,
+                    self.table,
+                    self.physical_name(),
+                    columns,
+                    chunk.len(),
+                    mode,
+                )?,
+            };
             let mut params = Vec::with_capacity(chunk.len() * columns.len());
             if aligned {
                 for row in chunk {
@@ -2198,6 +2221,64 @@ impl<'a> TableRef<'a> {
             self.dal.log_sql(&sql);
             affected += session.execute_owned(&sql, params)?;
         }
+        Ok(affected)
+    }
+
+    /// 多行 Upsert（可指定「只更新哪些列」）：脏列追踪的批量路径。
+    ///
+    /// `update_only = Some([..])` 时，冲突只更新这些列（插入仍写全列），
+    /// 于是「脏列集合相同的行」可以合并成一条语句，而不用逐条 `find + update`。
+    /// 方言不支持多行 Upsert 时返回 [`Error::Unsupported`]（调用方回退逐条）。
+    pub(crate) fn write_batch_rows_upsert<F: BatchField>(
+        &self,
+        session: &mut dyn SqlSession,
+        rows: &[&Vec<F>],
+        update_only: Option<&[&str]>,
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        self.ensure_writable()?;
+        let Some(first) = rows.first() else {
+            return Ok(0);
+        };
+        if !self.dal.kind.supports_multi_upsert() {
+            return Err(Error::Unsupported(format!(
+                "{:?} 不支持多行 Upsert 批量写入",
+                self.dal.kind
+            )));
+        }
+        let batch = batch_size
+            .unwrap_or_else(|| crate::batch::default_insert_batch_size(self.dal.kind))
+            .max(1);
+        // 列集 = 首行列集；首行自增列为 0/缺失 → 整批排除自增列（对齐 C# `BuildInsertColumns`）
+        let identity = self.table.identity().map(|c| c.name.clone());
+        let drop_identity = identity.as_ref().is_some_and(|name| {
+            first.find_value(name).and_then(DbValue::as_i64).unwrap_or(0) == 0
+        });
+        let columns: Vec<&str> = (0..first.len())
+            .filter_map(|index| first.get(index))
+            .map(|(name, _)| name)
+            .filter(|name| {
+                !(drop_identity
+                    && identity
+                        .as_deref()
+                        .is_some_and(|id| name.eq_ignore_ascii_case(id)))
+            })
+            .collect();
+        if columns.is_empty() {
+            return Err(Error::Model(format!(
+                "表 {} 的批量写入没有可写字段",
+                self.table.name
+            )));
+        }
+        let affected = self.exec_multi_write_upsert(
+            session,
+            rows,
+            &columns,
+            batch,
+            BatchWriteMode::Upsert,
+            update_only,
+        )?;
+        self.dal.invalidate_cache(self.physical_name());
         Ok(affected)
     }
 
