@@ -338,7 +338,9 @@ pub trait Entity: Sized {
     /// - SQLite/DuckDB/PostgreSQL 生成 `On Conflict(pk) Do Update`、MySQL 生成 `On Duplicate Key Update`，
     ///   多行一条语句；其余方言回退逐行（查主键后更新/插入，同队列 Upsert）；
     /// - 存在自增列时**不允许部分指定主键、部分不指定**（对齐 C# `Save(list)` 的 `NotSupportedException`）；
-    /// - 无自增的雪花主键请先填值，分表场景用 [`Entity::upsert_batch_sharded`]（自动生成并路由）。
+    /// - 无自增的雪花主键请先填值，分表场景用 [`Entity::upsert_batch_sharded`]（自动生成并路由）；
+    /// - **返回逻辑行数**：MySQL 的 `ON DUPLICATE KEY UPDATE` 对更新行返回 2，
+    ///   这里已归一化为「本批行数」（全部无变化时为 0），可直接用于统计上报量。
     fn upsert_batch(
         dal: &Dal,
         session: &mut dyn SqlSession,

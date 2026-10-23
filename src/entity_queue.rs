@@ -270,7 +270,10 @@ impl EntityQueue {
     ///
     /// - **连续 Insert 段**合并为多行批量插入（对应 C# `batch.Insert` → `EntityExtension.Insert(list)`）；
     /// - **连续 Delete 段**（单一主键）合并为主键 `IN` 分批删除（对应 C# `batch.Delete`）；
-    /// - Update / Upsert 逐条执行（Upsert 需逐条存在性判定，与 C# `BatchSave` 拆分前的语义一致）；
+    /// - **连续 Upsert 段**合并为多行 `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO UPDATE`
+    ///   （无脏列约束且行内含全部主键列时；否则逐条存在性判定）；
+    /// - Update 逐条按主键更新（SQL 无通用多行 `UPDATE`）；
+    /// - 返回与累计的统计均按**提交行数**计（不受驱动「更新行计 2」的差异影响）；
     /// - 段内成批执行 = 单条语句原子（与逐条相比不产生更多锁冲突）；事务仍由调用方按需包裹
     ///   （与 C# 一致，SQLite 下不要在外层无条件包事务）。
     pub fn flush(
@@ -371,14 +374,17 @@ impl EntityQueue {
                             })
                             .collect();
                         let refs: Vec<&Vec<(&str, &DbValue)>> = rows.iter().collect();
-                        // 多行 Upsert 的受影响行数含「插入=1 / 更新=2」两种，无法逐行区分，
-                        // 统计统一计入 updated（行数统计口径见方法文档）。
-                        stats.updated += table.write_batch_rows_core(
+                        // 统计按「本次提交的行数」计（不取驱动返回值）：
+                        // MySQL 的 `ON DUPLICATE KEY UPDATE` 对更新行返回 2，直接累加会让
+                        // 重复上报的计数翻倍（实测 20 万行记成 40 万）；
+                        // 且多行语句无法逐行区分「插入 / 更新」，统一计入 updated。
+                        table.write_batch_rows_core(
                             session,
                             &refs,
                             BatchWriteMode::Upsert,
                             None,
                         )?;
+                        stats.updated += run.len() as u64;
                         continue;
                     }
 

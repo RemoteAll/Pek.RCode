@@ -357,6 +357,38 @@ fn run_roundtrip(dal: &Dal) {
             .is_none()
     );
 
+    // 批量 Upsert 的返回值按**逻辑行数**计。
+    // MySQL 的 `ON DUPLICATE KEY UPDATE` 对「更新」行返回 2、对「插入」行返回 1，
+    // 若直接把驱动返回值透传给调用方，重复上报的数据量会被统计成两倍
+    // （实测 20 万行 Upsert 记成 40 万）。
+    let mut upserts = Vec::new();
+    for index in 0..4 {
+        let mut entity = RCodeTestKey::new();
+        entity.key = format!("k-up-{index}");
+        entity.value = Some("v1".into());
+        upserts.push(entity);
+    }
+    assert_eq!(
+        RCodeTestKey::upsert_batch(dal, session.as_mut(), &upserts, None).unwrap(),
+        4,
+        "首次 Upsert 全部走插入，应返回 4 行"
+    );
+    for entity in &mut upserts {
+        entity.value = Some("v2".into());
+    }
+    assert_eq!(
+        RCodeTestKey::upsert_batch(dal, session.as_mut(), &upserts, None).unwrap(),
+        4,
+        "已存在行全部走更新，仍应返回 4 行（不是 MySQL affected_rows 的 8）"
+    );
+    let reloaded_up = RCodeTestKey::find(dal, session.as_mut(), &["k-up-0".into()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded_up.value.as_deref(), Some("v2"), "Upsert 应真正更新");
+    for entity in &upserts {
+        assert_eq!(entity.delete(dal, session.as_mut()).unwrap(), 1);
+    }
+
     // 事务：回滚后实体插入的数据不应保留
     session.begin().unwrap();
     let mut tx = RCodeTestItem::new();

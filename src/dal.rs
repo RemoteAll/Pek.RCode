@@ -2121,6 +2121,15 @@ impl<'a> TableRef<'a> {
                 }
             }
         }
+        // MySQL 的 `ON DUPLICATE KEY UPDATE` 对「插入」行返回 1、对「更新」行返回 **2**，
+        // 把驱动返回值直接当行数用会让重复上报的统计翻倍（实测 20 万行 Upsert 记成 40 万）。
+        // 只要本批有任意行发生变化，其逻辑行数就是行数本身；全部无变化时才是 0。
+        if mode == BatchWriteMode::Upsert
+            && self.dal.kind == DatabaseKind::MySql
+            && affected > 0
+        {
+            affected = rows.len() as u64;
+        }
         self.dal.invalidate_cache(self.physical_name());
         Ok(affected)
     }

@@ -43,15 +43,19 @@ const TOTAL: i64 = 200_000;
 const DEVICES: i64 = 1_000;
 
 fn main() -> pek_rcode::Result<()> {
-    // ① 打开连接：有 RCODE_MYSQL 用 MySQL，否则落到本地 SQLite（同一套代码）
-    let conn = std::env::var("RCODE_MYSQL").unwrap_or_else(|_| {
-        let dir = std::env::temp_dir().join("pek-rcode-iot");
-        let _ = std::fs::create_dir_all(&dir);
-        format!(
-            "Data Source={};Provider=SQLite",
-            dir.join("telemetry.db").display()
-        )
-    });
+    // ① 打开连接：`RCODE_IOT_CONN` 显式指定 > `RCODE_MYSQL` > 本地 SQLite（同一套代码）
+    let conn = std::env::var("RCODE_IOT_CONN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("RCODE_MYSQL").ok())
+        .unwrap_or_else(|| {
+            let dir = std::env::temp_dir().join("pek-rcode-iot");
+            let _ = std::fs::create_dir_all(&dir);
+            format!(
+                "Data Source={};Provider=SQLite",
+                dir.join("telemetry.db").display()
+            )
+        });
     let is_mysql = conn.contains("mysql");
     let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL)?)?;
     dal.sync_schema()?;
