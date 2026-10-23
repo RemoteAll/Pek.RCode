@@ -2314,28 +2314,22 @@ impl<'a> TableRef<'a> {
                 self.table.name
             )));
         }
-        let mut filter = self.pk_filter(pk)?;
-        for (column, value) in expected {
-            if self.table.column(column).is_none() {
-                return Err(Error::Model(format!(
-                    "表 {} 不存在列 {column}",
-                    self.table.name
-                )));
-            }
-            filter = filter.eq(*column, value.clone());
-        }
+        let filter = self.pk_filter(pk)?;
         // 拦截器刷新审计字段（对应实体拦截器 OnValid）
         let values = crate::interceptor::prepare(
             self.table,
             crate::interceptor::DataMethod::Update,
             sets,
         );
-        let (sql, params) = sqlbuild::update_sql_owned_named(
+        // 期望列直接拼进 WHERE（不构造 Where 条件：每列省 3~5 次堆分配，
+        // 且列名经模型校验/换成物理列名，PG/Oracle 大小写安全）
+        let (sql, params) = sqlbuild::update_if_sql_owned_named(
             self.dal.kind,
             self.table,
             self.physical_name(),
             values,
             &filter,
+            expected,
         )?;
         self.dal.log_sql(&sql);
         let affected = session.execute(&sql, &params)?;

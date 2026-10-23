@@ -13,7 +13,8 @@
 //! - 更新（`SetNoDirtyItem`）：调用方显式传入的列**不覆盖**；未传入的列补全
 //! - 与 C# 的差异：C# 用实体“脏标记”判断是否覆盖；Rust 以调用方显式传入的列集合近似（语义等价）
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use chrono::{Datelike, Local};
 
@@ -55,20 +56,36 @@ pub trait EntityInterceptor: Send + Sync {
 
 // ============================ 全局注册表 ============================
 
-/// 全局拦截器注册表。
-fn registry() -> &'static Mutex<Vec<Arc<dyn EntityInterceptor>>> {
-    static REGISTRY: OnceLock<Mutex<Vec<Arc<dyn EntityInterceptor>>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+/// 拦截器列表快照类型（`Arc` 共享：写入路径取快照只做一次 `Arc::clone`，不复制元素）。
+type InterceptorList = Arc<Vec<Arc<dyn EntityInterceptor>>>;
+
+/// 全局拦截器注册表（`Arc` 快照）。
+fn registry() -> &'static RwLock<InterceptorList> {
+    static REGISTRY: OnceLock<RwLock<InterceptorList>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(Arc::new(Vec::new())))
 }
+
+/// 是否注册过拦截器（**无锁快路**：未启用时写入路径零锁、零分配）。
+static HAS_INTERCEPTORS: AtomicBool = AtomicBool::new(false);
 
 /// 获取互斥锁（被投毒时恢复内部数据）。
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 获取写锁（注册表变更用；被投毒时恢复内部数据）。
+fn write_lock<T>(rw: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    rw.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 注册拦截器（写入路径自动应用）。
 pub fn register(interceptor: Arc<dyn EntityInterceptor>) {
-    lock(registry()).push(interceptor);
+    let mut guard = write_lock(registry());
+    let mut list = Vec::with_capacity(guard.len() + 1);
+    list.extend(guard.iter().cloned());
+    list.push(interceptor);
+    *guard = Arc::new(list);
+    HAS_INTERCEPTORS.store(true, Ordering::Relaxed);
 }
 
 /// 注册默认拦截器三件套（Time + User + Trace，与 C# 实体工厂的默认装配一致）。
@@ -80,12 +97,21 @@ pub fn enable_defaults() {
 
 /// 清空注册（测试与动态装配场景使用）。
 pub fn clear() {
-    lock(registry()).clear();
+    *write_lock(registry()) = Arc::new(Vec::new());
+    HAS_INTERCEPTORS.store(false, Ordering::Relaxed);
 }
 
-/// 注册表快照。
-fn snapshot() -> Vec<Arc<dyn EntityInterceptor>> {
-    lock(registry()).clone()
+/// 注册表快照（`Arc::clone`，不复制元素）。
+fn snapshot() -> Arc<Vec<Arc<dyn EntityInterceptor>>> {
+    registry()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 当前注册的拦截器（公开查询；返回克隆列表）。
+pub fn interceptors() -> Vec<Arc<dyn EntityInterceptor>> {
+    snapshot().as_ref().clone()
 }
 
 /// 应用指定拦截器（公开以便组合/测试，不依赖全局注册表）。
@@ -102,17 +128,20 @@ pub fn apply_to(
     }
 }
 
-/// 应用全局注册的拦截器（写入路径调用；注册表为空时零开销）。
+/// 应用全局注册的拦截器（写入路径调用；未注册时是**无锁原子读**快路）。
 pub(crate) fn apply_registered(
     table: &TableMeta,
     method: DataMethod,
     values: &mut Vec<(String, DbValue)>,
 ) {
+    if !HAS_INTERCEPTORS.load(Ordering::Relaxed) {
+        return;
+    }
     let interceptors = snapshot();
     if interceptors.is_empty() {
         return;
     }
-    apply_to(&interceptors, table, method, values);
+    apply_to(interceptors.as_slice(), table, method, values);
 }
 
 /// 把已 owned 的列集合就地应用全局拦截器（写入热路径使用，避免再次复制列名与值）。

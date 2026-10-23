@@ -306,6 +306,47 @@ impl DatabaseKind {
         }
     }
 
+    /// 把标识符按方言引用后**追加**到 `out`（与 [`DatabaseKind::quote`] 完全等价，但不分配中间 String）。
+    ///
+    /// 供 SQL 拼接热路径使用（如 CAS 的 `expected` 条件）：每列省一次堆分配。
+    pub(crate) fn push_quoted(&self, out: &mut String, ident: &str) {
+        let (open, close, escape) = match self {
+            DatabaseKind::MySql | DatabaseKind::ClickHouse | DatabaseKind::TDengine => {
+                ('`', '`', '`')
+            }
+            DatabaseKind::SqlServer | DatabaseKind::Access => ('[', ']', ']'),
+            _ => ('"', '"', '"'),
+        };
+        out.push(open);
+        for ch in ident.chars() {
+            if ch == escape {
+                out.push(escape);
+            }
+            out.push(ch);
+        }
+        out.push(close);
+    }
+
+    /// 把参数占位符**追加**到 `out`（与 [`DatabaseKind::placeholder`] 完全等价，不分配中间 String）。
+    pub(crate) fn push_placeholder(&self, out: &mut String, index: usize) {
+        use std::fmt::Write as _;
+        match self {
+            DatabaseKind::SqlServer => {
+                out.push_str("@p");
+                let _ = write!(out, "{index}");
+            }
+            DatabaseKind::PostgreSql => {
+                out.push('$');
+                let _ = write!(out, "{}", index + 1);
+            }
+            DatabaseKind::Oracle => {
+                out.push(':');
+                let _ = write!(out, "{}", index + 1);
+            }
+            _ => out.push('?'),
+        }
+    }
+
     /// 自增列的列内联修饰（`None` 表示该方言不用内联写法，由类型改写/序列/特殊规则处理）。
     fn identity_clause(&self, _col: &ColumnMeta) -> Option<String> {
         match self {
@@ -1234,6 +1275,34 @@ fn render_default(kind: &DatabaseKind, default: &str, col: &ColumnMeta) -> Strin
 mod tests {
     use super::*;
     use crate::model::{EntityModel, TableMeta};
+
+    /// 追加式拼接必须与原 `quote` / `placeholder` 逐字节一致（热路径零分配优化的等价性护栏）。
+    #[test]
+    fn push_helpers_match_string_helpers() {
+        let idents = ["Id", "a\"b", "a`b", "a]b", ""];
+        for kind in [
+            DatabaseKind::Sqlite,
+            DatabaseKind::MySql,
+            DatabaseKind::SqlServer,
+            DatabaseKind::PostgreSql,
+            DatabaseKind::Oracle,
+        ] {
+            for ident in idents {
+                let mut out = String::new();
+                kind.push_quoted(&mut out, ident);
+                assert_eq!(out, kind.quote(ident), "{kind:?} 标识符引用不一致：{ident}");
+            }
+            for index in [0usize, 1, 9, 42] {
+                let mut out = String::new();
+                kind.push_placeholder(&mut out, index);
+                assert_eq!(
+                    out,
+                    kind.placeholder(index),
+                    "{kind:?} 占位符不一致：{index}"
+                );
+            }
+        }
+    }
 
     fn sample_table() -> TableMeta {
         let xml = r#"<EntityModel><Tables><Table Name="Order" TableName="DH_Order">

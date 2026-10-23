@@ -119,13 +119,20 @@ pub fn insert_sql_owned_named(
         .as_ref()
         .is_some_and(|name| !fields.iter().any(|(field, _)| field.eq_ignore_ascii_case(name)));
 
-    let mut columns = Vec::with_capacity(fields.len() + 1);
-    let mut marks = Vec::with_capacity(fields.len() + 1);
+    let mut columns_sql = String::with_capacity(fields.len() * 16);
+    let mut marks_sql = String::with_capacity(fields.len() * 4);
     let mut params = Vec::with_capacity(fields.len());
+    let mut first = true;
 
     for (index, (field, value)) in fields.into_iter().enumerate() {
-        columns.push(kind.quote(column_name(table, &field)?));
-        marks.push(kind.placeholder(index));
+        let name = column_name(table, &field)?;
+        if !first {
+            columns_sql.push_str(", ");
+            marks_sql.push_str(", ");
+        }
+        first = false;
+        kind.push_quoted(&mut columns_sql, name);
+        kind.push_placeholder(&mut marks_sql, index);
         params.push(value);
     }
 
@@ -139,16 +146,23 @@ pub fn insert_sql_owned_named(
             // Firebird：next value for "SEQ_x"
             _ => format!("next value for {}", kind.quote(&sequence)),
         };
-        columns.push(kind.quote(table.effective_column_name(identity)));
-        marks.push(expression);
+        if !first {
+            columns_sql.push_str(", ");
+            marks_sql.push_str(", ");
+        }
+        kind.push_quoted(&mut columns_sql, table.effective_column_name(identity));
+        marks_sql.push_str(&expression);
     }
 
-    let sql = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        kind.quote(table_name),
-        columns.join(", "),
-        marks.join(", ")
-    );
+    let mut sql =
+        String::with_capacity(20 + table_name.len() + columns_sql.len() + marks_sql.len());
+    sql.push_str("INSERT INTO ");
+    kind.push_quoted(&mut sql, table_name);
+    sql.push_str(" (");
+    sql.push_str(&columns_sql);
+    sql.push_str(") VALUES (");
+    sql.push_str(&marks_sql);
+    sql.push(')');
     Ok((sql, params))
 }
 
@@ -489,23 +503,97 @@ pub fn update_sql_owned_named(
     }
 
     let mut params = Vec::with_capacity(sets.len() + 4);
-    let mut parts = Vec::with_capacity(sets.len());
+    // 直接拼接 SET（不建 String 列表、不 format!）：每列 0 次中间分配
+    let mut set_sql = String::with_capacity(sets.len() * 16);
+    let mut first = true;
 
     for (field, value) in sets {
-        let mark = kind.placeholder(params.len());
-        parts.push(format!(
-            "{} = {mark}",
-            kind.quote(column_name(table, &field)?)
-        ));
+        let name = column_name(table, &field)?;
+        if !first {
+            set_sql.push_str(", ");
+        }
+        first = false;
+        kind.push_quoted(&mut set_sql, name);
+        set_sql.push_str(" = ");
+        kind.push_placeholder(&mut set_sql, params.len());
         params.push(value);
     }
 
     let where_sql = filter.render(kind, &mut params);
-    let mut sql = format!(
-        "UPDATE {} SET {}",
-        kind.quote(table_name),
-        parts.join(", ")
-    );
+    let mut sql =
+        String::with_capacity(16 + table_name.len() + set_sql.len() + where_sql.len());
+    sql.push_str("UPDATE ");
+    kind.push_quoted(&mut sql, table_name);
+    sql.push_str(" SET ");
+    sql.push_str(&set_sql);
+    if !where_sql.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_sql);
+    }
+
+    Ok((sql, params))
+}
+
+/// 组装**条件更新（CAS）**语句：`filter` 为主键条件，`expected` 追加为 `AND 列 = ?`。
+///
+/// 与 [`update_sql_owned_named`] 的唯一差别是 `WHERE` 多出 `expected` 条件；
+/// 这里直接把条件拼到 `filter` 的渲染结果上，**不为期望列构造 `Where::Cond`**
+/// （每列省 3~5 次堆分配）。`expected` 列名经 [`column_name`] 校验并换成模型列名
+/// （PG/Oracle 大小写安全）。
+pub fn update_if_sql_owned_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    sets: Vec<(String, DbValue)>,
+    filter: &Where,
+    expected: &[(&str, DbValue)],
+) -> Result<(String, Vec<DbValue>)> {
+    if sets.is_empty() {
+        return Err(Error::Model(format!(
+            "表 {} 的更新语句至少需要一个待更新字段",
+            table.name
+        )));
+    }
+    // 没有期望条件：退回普通 UPDATE（零额外开销）
+    if expected.is_empty() {
+        return update_sql_owned_named(kind, table, table_name, sets, filter);
+    }
+
+    let mut params = Vec::with_capacity(sets.len() + expected.len() + 4);
+    let mut set_sql = String::with_capacity(sets.len() * 16);
+    let mut first = true;
+    for (field, value) in sets {
+        let name = column_name(table, &field)?;
+        if !first {
+            set_sql.push_str(", ");
+        }
+        first = false;
+        kind.push_quoted(&mut set_sql, name);
+        set_sql.push_str(" = ");
+        kind.push_placeholder(&mut set_sql, params.len());
+        params.push(value);
+    }
+
+    let mut where_sql = filter.render(kind, &mut params);
+    where_sql.reserve(expected.len() * 18);
+    for (column, value) in expected {
+        let name = column_name(table, column)?;
+        if where_sql.is_empty() {
+            kind.push_quoted(&mut where_sql, name);
+        } else {
+            where_sql.push_str(" AND ");
+            kind.push_quoted(&mut where_sql, name);
+        }
+        where_sql.push_str(" = ");
+        kind.push_placeholder(&mut where_sql, params.len());
+        params.push(value.clone());
+    }
+
+    let mut sql = String::with_capacity(16 + table_name.len() + set_sql.len() + where_sql.len());
+    sql.push_str("UPDATE ");
+    kind.push_quoted(&mut sql, table_name);
+    sql.push_str(" SET ");
+    sql.push_str(&set_sql);
     if !where_sql.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&where_sql);
@@ -778,26 +866,41 @@ pub fn increment_sql_owned_named(
     }
 
     let mut params = Vec::with_capacity(deltas.len() + assigns.len() + 4);
-    let mut parts = Vec::with_capacity(deltas.len() + assigns.len());
+    let mut set_sql = String::with_capacity((deltas.len() + assigns.len()) * 20);
+    let mut first = true;
 
     for (field, value) in deltas {
-        let column = kind.quote(column_name(table, &field)?);
-        let mark = kind.placeholder(params.len());
-        parts.push(format!("{column} = {column} + {mark}"));
+        let name = column_name(table, &field)?;
+        if !first {
+            set_sql.push_str(", ");
+        }
+        first = false;
+        kind.push_quoted(&mut set_sql, name);
+        set_sql.push_str(" = ");
+        kind.push_quoted(&mut set_sql, name);
+        set_sql.push_str(" + ");
+        kind.push_placeholder(&mut set_sql, params.len());
         params.push(value);
     }
     for (field, value) in assigns {
-        let mark = kind.placeholder(params.len());
-        parts.push(format!("{} = {mark}", kind.quote(column_name(table, &field)?)));
+        let name = column_name(table, &field)?;
+        if !first {
+            set_sql.push_str(", ");
+        }
+        first = false;
+        kind.push_quoted(&mut set_sql, name);
+        set_sql.push_str(" = ");
+        kind.push_placeholder(&mut set_sql, params.len());
         params.push(value);
     }
 
     let where_sql = filter.render(kind, &mut params);
-    let mut sql = format!(
-        "UPDATE {} SET {}",
-        kind.quote(table_name),
-        parts.join(", ")
-    );
+    let mut sql =
+        String::with_capacity(16 + table_name.len() + set_sql.len() + where_sql.len());
+    sql.push_str("UPDATE ");
+    kind.push_quoted(&mut sql, table_name);
+    sql.push_str(" SET ");
+    sql.push_str(&set_sql);
     if !where_sql.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&where_sql);

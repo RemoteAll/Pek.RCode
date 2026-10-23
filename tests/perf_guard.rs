@@ -580,6 +580,21 @@ fn bench_update_if() {
 
     session.begin().unwrap();
 
+    // 预热：让语句缓存与页缓存进入稳态（避免首个阶段独自承担编译成本）
+    for _ in 0..2_000 {
+        table
+            .update_by_pk(session.as_mut(), &[("Amount", DbValue::Int(1))], &[DbValue::Int(id)])
+            .unwrap();
+        table
+            .update_if(
+                session.as_mut(),
+                &[("Amount", DbValue::Int(1))],
+                &[DbValue::Int(id)],
+                &[("Version", DbValue::Int(1))],
+            )
+            .unwrap();
+    }
+
     let mark = ALLOCS.load(Ordering::Relaxed);
     let t = Instant::now();
     for _ in 0..N {
@@ -632,4 +647,83 @@ fn bench_update_if() {
         cas_conflict,
         cas_conflict_allocs,
     );
+}
+
+/// 拆解成本：框架 SQL 构建/拦截器 vs 数据库执行（同一 SQL 预构建后直接 execute）。
+///
+/// 高并发评估用：框架侧是每次调用的**固定成本**，与并发数无关；
+/// 真正的放大项是数据库往返 / 锁 / WAL 提交，它们远大于框架拼接开销。
+#[test]
+#[ignore]
+fn bench_prebuilt_update() {
+    use pek_rcode::DbValue;
+    const N: usize = 20_000;
+    let dal = bench_cas_dal("prebuilt");
+    let table = dal.table("Cas").unwrap();
+    let mut session = dal.open_session().unwrap();
+    let id = table
+        .insert(
+            session.as_mut(),
+            &[
+                ("Code", DbValue::Text("A".into())),
+                ("Amount", DbValue::Int(1)),
+                ("Version", DbValue::Int(1)),
+            ],
+        )
+        .unwrap();
+
+    let filter = pek_rcode::query::Where::new().eq("Id", DbValue::Int(id));
+    let (sql, params) = pek_rcode::sqlbuild::update_sql_owned_named(
+        dal.kind(),
+        table.meta(),
+        table.physical_name(),
+        vec![("Amount".to_string(), DbValue::Int(1))],
+        &filter,
+    )
+    .unwrap();
+
+    session.begin().unwrap();
+    for _ in 0..2_000 {
+        table
+            .update_by_pk(
+                session.as_mut(),
+                &[("Amount", DbValue::Int(1))],
+                &[DbValue::Int(id)],
+            )
+            .unwrap();
+        session.execute(&sql, &params).unwrap();
+    }
+
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        session.execute(&sql, &params).unwrap();
+    }
+    let exec_only = t.elapsed();
+    let exec_allocs = alloc_since(mark);
+
+    let mark = ALLOCS.load(Ordering::Relaxed);
+    let t = Instant::now();
+    for _ in 0..N {
+        table
+            .update_by_pk(
+                session.as_mut(),
+                &[("Amount", DbValue::Int(1))],
+                &[DbValue::Int(id)],
+            )
+            .unwrap();
+    }
+    let full = t.elapsed();
+    let full_allocs = alloc_since(mark);
+    session.commit().unwrap();
+
+    report(
+        "预构建 UPDATE 直接执行（数据库+参数绑定）",
+        N,
+        exec_only,
+        exec_allocs,
+    );
+    report("update_by_pk 端到端（框架+数据库）", N, full, full_allocs);
+    let framework = full.as_nanos().saturating_sub(exec_only.as_nanos()) as f64 / N as f64;
+    println!("框架侧（SQL 构建+拦截器+缓存判定）≈ {framework:>7.1} ns/op");
 }
