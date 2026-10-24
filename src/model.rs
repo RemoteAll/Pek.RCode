@@ -39,6 +39,17 @@ use crate::types::DataType;
 /// 默认的模型命名空间（与当前 XCode 版本一致）。
 pub const MODEL_NAMESPACE: &str = "https://newlifex.com/Model202509.xsd";
 
+/// MySQL/InnoDB 服务器层单行大小上限（字节；TEXT/BLOB 只计 20 字节指针）。
+///
+/// utf8mb4 下 `varchar(n)` 按 `4n` 字节计入该预算：`varchar(16000)` ≈ 64000 字节，
+/// 叠加同表其它列极容易触发 `ERROR 1118 Row size too large`（实际事故见使用规范 §2.1）。
+pub const MYSQL_MAX_ROW_BYTES: usize = 65_535;
+
+/// 规范阈值：`String` 列长度超过它就必须用 `Text`（MySQL→`LONGTEXT`）。
+///
+/// 取 2000（约 8000 字节）而非方言上限 16383，是为了给同表其它列留出足够行内预算。
+pub const MYSQL_SAFE_VARCHAR_CHARS: i32 = 2_000;
+
 /// 实体模型（一个 Model.xml 的完整内容）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityModel {
@@ -195,6 +206,39 @@ impl TableMeta {
         } else {
             &self.table_name
         }
+    }
+
+    /// 整表在 MySQL 行内的估算字节数（varchar 按 `4×长度+2`，Text/BLOB 只计指针）。
+    ///
+    /// 背景：MySQL 服务器层单行上限 **65535 字节**（不含 TEXT/BLOB 内容），
+    /// utf8mb4 下 `varchar(n)` 占 `4n` 字节。曾发生 `varchar(16000)`（≈64000 字节）
+    /// 叠加已有列导致 `ERROR 1118 Row size too large`、启动建表/加列失败的事故。
+    pub fn mysql_row_bytes(&self) -> usize {
+        self.columns.iter().map(|c| c.mysql_row_bytes()).sum()
+    }
+
+    /// 超过 MySQL 单行上限时的可读说明（含建议改 `Text` 的列；未超限返回 `None`）。
+    pub fn mysql_row_size_issue(&self) -> Option<String> {
+        let bytes = self.mysql_row_bytes();
+        if bytes <= MYSQL_MAX_ROW_BYTES {
+            return None;
+        }
+        let mut candidates: Vec<String> = self
+            .columns
+            .iter()
+            .filter(|c| c.data_type == DataType::String && c.length > 0)
+            .map(|c| format!("{}({})", c.name, c.length))
+            .collect();
+        candidates.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        candidates.truncate(5);
+        Some(format!(
+            "表 {} 按 MySQL utf8mb4 估算行内占用 {} 字节，超过上限 {} 字节（varchar 按 4 字节/字符计）；\
+             请把最长文本列改用 DataType=\"Text\"（MySQL→LONGTEXT）：{}",
+            self.effective_table_name(),
+            bytes,
+            MYSQL_MAX_ROW_BYTES,
+            candidates.join(", ")
+        ))
     }
 
     /// 按列名查找（忽略大小写；`Name` 或 `ColumnName` 均匹配）。
@@ -360,6 +404,39 @@ pub struct ColumnMeta {
     pub extra: Vec<(String, String)>,
 }
 
+impl ColumnMeta {
+    /// 该列在 MySQL 行内的估算字节数。
+    ///
+    /// - `varchar(n)`：`4n + 2`（utf8mb4 + 长度前缀）
+    /// - `Text`（无长度 String）：20（行内只存指针）
+    /// - `Binary`：有长度按长度、无长度按 20
+    /// - 其它固定宽度类型：按 8 字节粗略计（datetime/decimal 实际更小，留余量）
+    pub fn mysql_row_bytes(&self) -> usize {
+        match self.data_type {
+            DataType::String => {
+                if self.length > 0 {
+                    (self.length as usize) * 4 + 2
+                } else {
+                    20
+                }
+            }
+            DataType::Binary => {
+                if self.length > 0 {
+                    self.length as usize
+                } else {
+                    20
+                }
+            }
+            _ => 8,
+        }
+    }
+
+    /// 是否“超宽 varchar”（规范要求改用 `Text`，避免整行超 MySQL 65535 字节）。
+    pub fn is_wide_varchar(&self) -> bool {
+        self.data_type == DataType::String && self.length > MYSQL_SAFE_VARCHAR_CHARS
+    }
+}
+
 /// 索引定义（`<Index>`）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexMeta {
@@ -372,6 +449,15 @@ pub struct IndexMeta {
 }
 
 impl EntityModel {
+    /// 全部表的 MySQL 行大小问题（空 = 通过）；视图不参与。
+    pub fn mysql_row_size_issues(&self) -> Vec<String> {
+        self.tables
+            .iter()
+            .filter(|t| !t.is_view)
+            .filter_map(|t| t.mysql_row_size_issue())
+            .collect()
+    }
+
     /// 从文件路径加载。
     pub fn load(path: &Path) -> Result<Self> {
         let text = dhrust::io::read_all_text(path)?;
@@ -803,6 +889,50 @@ fn escape_text(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MySQL utf8mb4 下 `varchar(n)` 占 4n 字节；整表超过 65535 字节会在建表/加列时报
+    /// `ERROR 1118 Row size too large`（实际事故：varchar(16000) 叠加已有列）。
+    #[test]
+    fn mysql_row_size_guard_blocks_wide_varchar() {
+        // 单列 varchar(16000)=64002 尚不超限；与已有 varchar(1000) 叠加即 68032 > 65535
+        let wide = r#"<EntityModel><Tables><Table Name="T" TableName="T_Wide">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            <Column Name="Big" DataType="String" Length="16000" Nullable="True" />
+            <Column Name="Extra" DataType="String" Length="1000" Nullable="True" />
+            <Column Name="Note" DataType="String" Nullable="True" />
+          </Columns></Table></Tables></EntityModel>"#;
+        let model = EntityModel::parse(wide).unwrap();
+        let issues = model.mysql_row_size_issues();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("Big(16000)"), "应点名超宽列：{}", issues[0]);
+        assert!(issues[0].contains("65535"), "应说明上限：{}", issues[0]);
+
+        // 改成 Text（不写 Length → MySQL LONGTEXT，行内只占指针）后通过
+        let fixed = wide.replace(" Length=\"16000\"", "");
+        let model = EntityModel::parse(&fixed).unwrap();
+        assert!(model.mysql_row_size_issues().is_empty());
+        let big = model.tables[0].column("Big").unwrap();
+        assert_eq!(big.mysql_row_bytes(), 20, "Text 只计指针");
+        assert!(!big.is_wide_varchar());
+    }
+
+    #[test]
+    fn wide_varchar_threshold_is_2000_chars() {
+        let xml = |len: i32| {
+            format!(
+                r#"<EntityModel><Tables><Table Name="T" TableName="T_x"><Columns>
+                   <Column Name="A" DataType="String" Length="{len}" Nullable="True" />
+                 </Columns></Table></Tables></EntityModel>"#
+            )
+        };
+        let model = EntityModel::parse(&xml(MYSQL_SAFE_VARCHAR_CHARS)).unwrap();
+        assert!(!model.tables[0].column("A").unwrap().is_wide_varchar());
+        let model = EntityModel::parse(&xml(MYSQL_SAFE_VARCHAR_CHARS + 1)).unwrap();
+        assert!(model.tables[0].column("A").unwrap().is_wide_varchar());
+        // 单列 2000 字符 ≈ 8002 字节，远低于整行上限
+        assert!(model.tables[0].mysql_row_size_issue().is_none());
+    }
 
     const SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <EntityModel xmlns="https://newlifex.com/Model202509.xsd" Version="1.0" ModelVersion="2.0">

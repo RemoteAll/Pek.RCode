@@ -1138,6 +1138,13 @@ impl Dal {
             let table_name = table.effective_table_name();
 
             if !session.table_exists(table_name)? {
+                // MySQL 单行 65535 字节预算：建表前先做可读校验（否则会得到难懂的 ERROR 1118）
+                if self.kind == DatabaseKind::MySql
+                    && !mode.is_readonly()
+                    && let Some(issue) = table.mysql_row_size_issue()
+                {
+                    return Err(Error::Model(issue));
+                }
                 for stmt in self.kind.create_table_sql(table) {
                     self.exec_ddl(&mut *session, mode, &mut report, &stmt)?;
                 }
@@ -1150,6 +1157,21 @@ impl Dal {
             for col in &table.columns {
                 let col_name = table.effective_column_name(col);
                 if !existing.iter().any(|c| c.eq_ignore_ascii_case(col_name)) {
+                    // 给已有表加“超宽 varchar”极易把整行推过 MySQL 65535 字节（实际事故：
+                    // 16000 字符的 SiteSummary 叠加大表原有列 → ERROR 1118）。提前拒绝并给出改法。
+                    if self.kind == DatabaseKind::MySql
+                        && !mode.is_readonly()
+                        && col.is_wide_varchar()
+                    {
+                        return Err(Error::Model(format!(
+                            "新增列 {table_name}.{col_name} 的长度 {} 超过安全阈值 {} 字符：\
+                             请改用 DataType=\"Text\"（MySQL→LONGTEXT）。\
+                             MySQL 单行上限 65535 字节，utf8mb4 下 varchar(n) 占 4n 字节，\
+                             叠加已有列会报 ERROR 1118 Row size too large。",
+                            col.length,
+                            crate::model::MYSQL_SAFE_VARCHAR_CHARS
+                        )));
+                    }
                     let sql = self.kind.add_column_sql(table, col);
                     self.exec_ddl(&mut *session, mode, &mut report, &sql)?;
                     report
