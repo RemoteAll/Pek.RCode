@@ -631,8 +631,14 @@ let user = DhUser::find_by_code(&dal, s.as_mut(), "U001".into())?;
 |------|------|
 | `Off` | 完全跳过（`SetTables` 直接返回） |
 | `ReadOnly` | 只检查、不执行；将 DDL 收集到 `SchemaReport.pending_sql` 供人工执行 |
-| `On`（默认） | 只做创建类：建表 / 补列 / 补索引（`onlyCreate`，不修改、不删除） |
-| `Full` | 新建 + **修改**（列类型）+ **删除**（多余列 / 多余索引）——删除类动作仅此档允许 |
+| `On`（默认） | 创建类：建表 / 补列 / 补索引；**外加字符串列长度放宽**（不缩窄、不改类型、不删除） |
+| `Full` | 新建 + **修改**（列类型 / 长度任意方向）+ **删除**（多余列 / 多余索引）——删除类动作仅此档允许 |
+
+> 长度放宽在 `On` 档即生效，是与 C# 的细节对齐：`CheckColumnsChange` 里
+> `IsColumnLengthChanged`（仅“模型长度 > 库长度”的字符串列）传的是 `@readonly`，
+> 而类型变化 `IsColumnTypeChanged` / 任意长度差异 `IsColumnChanged` / 删列才带 `onlyCreate`。
+> 不支持 `ALTER COLUMN` 的库（SQLite/Firebird/Access）只记 `notes` 提示人工（C# 走重建表，
+> 本库暂不自动重建以免动数据）。
 
 配置来源（优先级从高到低）：
 
@@ -694,7 +700,7 @@ println!("{report}");   // 新建 0 张，补充列 0 个，…；改列：DH_Or
 
 - **全参数绑定**：查询与写入不拼接字面量；`Where` 支持 `In/Between/Like/IsNull` 等，空 `IN` 集合会降级为恒真/恒假而非非法 SQL
 - **标识符转义**：表名/列名按方言引用（内部引号双写），阻断标识符注入
-- **迁移只增量**：`sync_schema` 仅建表与补列；补列时若为 `NOT NULL` 且无默认值会自动降级为可空，避免存量数据违约
+- **迁移只增量**：`sync_schema` 仅建表、补列与字符串长度放宽；缩窄/改类型/删列需 `Migration=Full`；补列时若为 `NOT NULL` 且无默认值会自动降级为可空，避免存量数据违约
 - **与 C# 共存**：SQLite 打开时启用 WAL + 忙等待（5s），多进程读写与 C# 端互不阻塞
 
 ---

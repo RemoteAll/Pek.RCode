@@ -6,8 +6,8 @@
 //! |------|------|
 //! | `Off` | 完全跳过结构检查与迁移（`SetTables` 直接返回） |
 //! | `ReadOnly` | 只读检查：收集将执行的 DDL（[`SchemaReport::pending_sql`](crate::dal::SchemaReport::pending_sql)），不执行 |
-//! | `On`（默认） | 只做创建类：建表、加列、建索引（不修改、不删除；对应 `onlyCreate = mode < Full`） |
-//! | `Full` | 新建 + 修改（列类型）+ 删除（多余列/索引；删除类动作仅此档允许） |
+//! | `On`（默认） | 创建类：建表、加列、建索引；**外加字符串列长度放宽**（不缩窄、不改类型、不删除；对应 `onlyCreate = mode < Full`，但长度扩大走 `@readonly` 分支） |
+//! | `Full` | 新建 + 修改（列类型、长度任意方向）+ 删除（多余列/索引；删除类动作仅此档允许） |
 //!
 //! 配置来源（优先级从高到低）：
 //! 1. 连接串：`...;Migration=Full`（与 XCode 的 `DbBase` 从连接串解析一致）

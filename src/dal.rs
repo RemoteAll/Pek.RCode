@@ -16,10 +16,11 @@ use std::{
 };
 
 use crate::cache::{EntityCache, SingleCache};
+use crate::catalog::ColumnInfo;
 use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
 use crate::migration::Migration;
-use crate::model::{EntityModel, TableMeta};
+use crate::model::{ColumnMeta, EntityModel, TableMeta};
 use crate::pool::{PoolOptions, PoolStats, SessionPool};
 use crate::query::{Query, Where};
 use crate::readwrite::ReadWriteStrategy;
@@ -1069,13 +1070,13 @@ impl Dal {
         Ok(true)
     }
 
-    /// 按模型同步数据库结构（建表 / 补列 / 补索引；`Full` 档含修改与删除），返回本次变更清单。
+    /// 按模型同步数据库结构（建表 / 补列 / 补索引 / 放宽字符串长度；`Full` 档含修改与删除），返回本次变更清单。
     ///
     /// 档位语义（与 DH.NCode 的 [`Migration`] 一致）：
     /// - `Off`：跳过（返回空报告）
     /// - `ReadOnly`：只检查、不执行；将 DDL 收集到 [`SchemaReport::pending_sql`] 供人工执行
-    /// - `On`（缺省）：只做创建类（建表 / 补列 / 补索引），不修改、不删除
-    /// - `Full`：在 `On` 基础上允许修改列类型与删除多余列/索引（**删除类动作仅此档允许**）
+    /// - `On`（缺省）：创建类（建表 / 补列 / 补索引）+ **字符串列长度放宽**（不缩窄、不改类型、不删除）
+    /// - `Full`：在 `On` 基础上允许修改列类型与长度（含缩窄）、删除多余列/索引（**删除类动作仅此档允许**）
     ///
     /// 表级档位（`<Table Migration="...">`）只能收紧、不能放大：生效档 = `min(表级, 全局)`。
     ///
@@ -1221,9 +1222,20 @@ impl Dal {
             }
         }
 
-        // Full 档：修改列类型 + 删除多余列/索引（删除类动作仅此档允许；对应 C# 的 onlyCreate=false 分支）
-        if self.migration == Migration::Full {
-            self.apply_full_changes(&mut report)?;
+        // 先归还本轮的会话，后面的比对/对齐会各开一次（顺序执行，连接池可复用同一物理连接）
+        drop(session);
+
+        // 列长度对齐（字符串列）：**`On` 档即允许放宽**——对齐 C# `CheckColumnsChange` 里
+        // `IsColumnLengthChanged` 传的是 `@readonly`，只有类型变化/删除才带 `onlyCreate`。
+        // 缩窄（含“明确长度 → 不限/大文本”）仍需 `Full` 档。
+        if self.migration != Migration::Off {
+            let diff = self.diff_schema()?;
+            self.apply_length_changes(&mut report, &diff)?;
+
+            // Full 档：修改列类型 + 删除多余列/索引（删除类动作仅此档允许；对应 C# 的 onlyCreate=false 分支）
+            if self.migration == Migration::Full {
+                self.apply_full_changes(&mut report, &diff)?;
+            }
         }
 
         Ok(report)
@@ -1251,6 +1263,71 @@ impl Dal {
         Ok(())
     }
 
+    /// 字符串列长度对齐（**`On` 档可放宽、`Full` 档可缩窄**）。
+    ///
+    /// 与 DH.NCode 对齐：C# `CheckColumnsChange` 里长度扩大走 `PerformSchema(sb, @readonly, …)`，
+    /// 不带 `onlyCreate`，即**默认 `On` 档也会执行**；缩窄/任意差异（`IsColumnChanged`）只在 `Full`。
+    ///
+    /// 不支持 `ALTER COLUMN` 的数据库（SQLite/Firebird/Access 等）只记 `notes` 留给人工——
+    /// C# 对这些库走 `ReBuildTable` 重建表，本库暂不自动重建（避免动数据）。
+    fn apply_length_changes(&self, report: &mut SchemaReport, diff: &SchemaDiff) -> Result<()> {
+        if diff.length_mismatches.is_empty() {
+            return Ok(());
+        }
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| Error::Model("尚未加载数据模型，无法同步结构".into()))?;
+        let mut session = self.open_session()?;
+
+        for m in &diff.length_mismatches {
+            let Some(table) = model.table(&m.table) else {
+                continue;
+            };
+            // 表级档位只能收紧：Off 的表不动
+            let mode = self.migration.tighten(table.migration);
+            if mode == Migration::Off {
+                continue;
+            }
+            // 缩窄（含“明确长度 → 不限”）仅 Full 档允许（对齐 C# `IsColumnChanged` 的 onlyCreate 闸门）
+            if !m.widening && mode != Migration::Full {
+                continue;
+            }
+            let Some(col) = table.column(&m.column) else {
+                continue;
+            };
+            // MySQL 单行 65535 字节预算：放宽到超宽 varchar 与补列同样会炸行（ERROR 1118）
+            if self.kind == DatabaseKind::MySql && !mode.is_readonly() && col.is_wide_varchar() {
+                report.notes.push(format!(
+                    "{}.{}：长度 {} → {} 超过 MySQL 安全阈值 {} 字符，请改用 DataType=\"Text\" 或人工调整",
+                    m.table,
+                    m.column,
+                    m.actual,
+                    m.expected,
+                    crate::model::MYSQL_SAFE_VARCHAR_CHARS
+                ));
+                continue;
+            }
+            let Some(sql) = self.kind.alter_column_sql(table, col) else {
+                report.notes.push(format!(
+                    "{}.{}：长度 {} → {} 需人工处理（该数据库不支持直接改列，如 SQLite 需重建表）",
+                    m.table, m.column, m.actual, m.expected
+                ));
+                continue;
+            };
+            match self.exec_ddl(&mut *session, mode, report, &sql) {
+                Ok(()) => report
+                    .altered_columns
+                    .push((m.table.clone(), m.column.clone())),
+                Err(e) => report.notes.push(format!(
+                    "{}.{}：调整列长度失败（{e}）",
+                    m.table, m.column
+                )),
+            }
+        }
+        Ok(())
+    }
+
     /// `Full` 档的修改/删除执行：基于 [`Dal::diff_schema`] 的预检结果。
     ///
     /// 顺序与 XCode 一致：**先删多余索引，再删多余列**（否则索引引用会阻止删列），最后修改列类型。
@@ -1258,12 +1335,11 @@ impl Dal {
     /// - 表级档位收紧到 `Full` 以下的表不动（只能收紧、不能放大）
     /// - 模型外的多余表**从不自动删除**（与 XCode 相同：迁移只处理模型中声明的表）
     /// - 单条失败不中断整体（记入 [`SchemaReport::notes`]，对齐 C# `CheckAllTables` 的逐表容错）
-    fn apply_full_changes(&self, report: &mut SchemaReport) -> Result<()> {
+    fn apply_full_changes(&self, report: &mut SchemaReport, diff: &SchemaDiff) -> Result<()> {
         let model = self
             .model
             .as_ref()
             .ok_or_else(|| Error::Model("尚未加载数据模型，无法同步结构".into()))?;
-        let diff = self.diff_schema()?;
         if diff.extra_indexes.is_empty()
             && diff.extra_columns.is_empty()
             && diff.type_mismatches.is_empty()
@@ -1351,6 +1427,46 @@ impl Dal {
         Ok(())
     }
 
+    /// 字符串列长度差异判定（对齐 C# `IsColumnLengthChanged` / `IsColumnChanged`）。
+    ///
+    /// 返回 `(模型长度, 库长度, 是否放宽)`；无差异或无需处理时返回 `None`。
+    /// - 只比较字符串列（其余类型交给 `type_mismatches`）；
+    /// - 两侧都是大文本（长度 `0`/超 `LongTextLength`）→ 长度无意义，忽略；
+    /// - 库侧原始类型为 `text`/`ntext`/`sysname` → 忽略（C# 同款白名单）；
+    /// - `0`（不限）视为最大长度，参与比较方向判定。
+    fn string_length_change(
+        &self,
+        col: &ColumnMeta,
+        db_col: &ColumnInfo,
+    ) -> Option<(i32, i32, bool)> {
+        if col.data_type != crate::types::DataType::String
+            || db_col.data_type != crate::types::DataType::String
+        {
+            return None;
+        }
+        if col.length == db_col.length {
+            return None;
+        }
+        let limit = self.kind.long_text_length();
+        let model_big = col.length <= 0 || col.length > limit;
+        let db_big = db_col.length <= 0 || db_col.length > limit;
+        let db_base = db_col
+            .raw_type
+            .trim()
+            .to_ascii_lowercase()
+            .split(['(', ' '])
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if (model_big && db_big) || matches!(db_base.as_str(), "ntext" | "text" | "sysname") {
+            return None;
+        }
+        // 放宽判定与 C# 一致：仅“模型明确长度 > 库明确长度”算放宽（`On` 档就会执行）；
+        // 其余（含 `0` = 不限的任一方向）归 `Full` 档，避免默认档误缩窄。
+        let widening = col.length > 0 && db_col.length > 0 && col.length > db_col.length;
+        Some((col.length, db_col.length, widening))
+    }
+
     /// 结构比对：模型 vs 数据库（只读），并生成可直接执行的 ALTER 脚本（dry-run 输出）。
     ///
     /// 对应 DH.NCode 的迁移预检：缺失的表/列/索引会生成 `CREATE TABLE`/`ADD COLUMN`/
@@ -1402,6 +1518,25 @@ impl Dal {
                                                 column: cname.to_string(),
                                                 expected,
                                                 actual: db_col.raw_type.clone(),
+                                            });
+                                        } else if let Some((model_len, db_len, widening)) =
+                                            self.string_length_change(col, db_col)
+                                        {
+                                            // 长度差异：**扩大在 `On` 档即执行**（对齐 C# `IsColumnLengthChanged`），
+                                            // 缩窄只在 `Full` 档（`IsColumnChanged`）
+                                            if let Some(sql) = self.kind.alter_column_sql(table, col) {
+                                                if widening {
+                                                    diff.alter_sql.push(sql);
+                                                } else {
+                                                    diff.full_sql.push(sql);
+                                                }
+                                            }
+                                            diff.length_mismatches.push(ColumnLengthMismatch {
+                                                table: tname.to_string(),
+                                                column: cname.to_string(),
+                                                expected: model_len,
+                                                actual: db_len,
+                                                widening,
                                             });
                                         }
                                     }
@@ -1689,6 +1824,8 @@ pub struct SchemaDiff {
     pub extra_indexes: Vec<(String, String)>,
     /// 类型差异（只报告，不生成 DDL）
     pub type_mismatches: Vec<ColumnTypeMismatch>,
+    /// 字符串列长度差异（扩大可由 `On` 档直接执行，缩窄仅 `Full` 档）
+    pub length_mismatches: Vec<ColumnLengthMismatch>,
     /// 可直接执行的补齐类脚本（建表 / 加列 / 建索引；任何非 `Off` 档均可用）
     pub alter_sql: Vec<String>,
     /// 修改/删除类脚本（**仅 `Full` 档可执行**：改列类型、删多余列/索引；dry-run 预览用，执行前请确认数据影响）
@@ -1705,7 +1842,23 @@ impl SchemaDiff {
             && self.missing_indexes.is_empty()
             && self.extra_indexes.is_empty()
             && self.type_mismatches.is_empty()
+            && self.length_mismatches.is_empty()
     }
+}
+
+/// 字符串列长度差异（模型预期 vs 数据库实际；`0` 表示不限长度/大文本）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnLengthMismatch {
+    /// 表名
+    pub table: String,
+    /// 列名
+    pub column: String,
+    /// 模型预期长度（`0` 均为不限）
+    pub expected: i32,
+    /// 数据库实际长度（`0` 均为不限）
+    pub actual: i32,
+    /// 是否为放宽（模型长度 > 库长度；`true` 时 `On` 档即会执行，`false` 需 `Full`）
+    pub widening: bool,
 }
 
 /// 列类型差异（模型预期 vs 数据库实际）。
@@ -3476,6 +3629,192 @@ mod tests {
 
         dal.clear_pool();
         drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试用列定义（只关心类型与长度）。
+    fn col_meta(data_type: crate::types::DataType, length: i32) -> ColumnMeta {
+        ColumnMeta {
+            name: "Code".into(),
+            column_name: None,
+            data_type,
+            raw_type: None,
+            length,
+            precision: 0,
+            scale: 0,
+            identity: false,
+            primary_key: false,
+            master: false,
+            nullable: true,
+            default_value: None,
+            description: String::new(),
+            enum_type: None,
+            data_scale: None,
+            map: None,
+            show_in: None,
+            model: None,
+            category: None,
+            item_type: None,
+            using_cache: None,
+            extra: Vec::new(),
+        }
+    }
+
+    /// 测试用列目录信息。
+    fn col_info(raw_type: &str, data_type: crate::types::DataType, length: i32) -> ColumnInfo {
+        ColumnInfo {
+            name: "Code".into(),
+            raw_type: raw_type.into(),
+            data_type,
+            length,
+            precision: 0,
+            scale: 0,
+            identity: false,
+            primary_key: false,
+            nullable: true,
+            default_value: None,
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn string_length_change_rules() {
+        let dir = temp_dir("len-rules");
+        let db = dir.join("test.db");
+        let dal = Dal::open(&format!("Data Source={};Provider=SQLite", db.display())).unwrap();
+        let s = crate::types::DataType::String;
+
+        // 扩大：On 档即可执行
+        assert_eq!(
+            dal.string_length_change(&col_meta(s, 100), &col_info("nvarchar(20)", s, 20)),
+            Some((100, 20, true))
+        );
+        // 缩窄：仅 Full 档
+        assert_eq!(
+            dal.string_length_change(&col_meta(s, 20), &col_info("nvarchar(100)", s, 100)),
+            Some((20, 100, false))
+        );
+        // 模型不限长度（0）→ 缩窄
+        assert_eq!(
+            dal.string_length_change(&col_meta(s, 0), &col_info("nvarchar(100)", s, 100)),
+            Some((0, 100, false))
+        );
+        // 两侧都是大文本 → 长度无意义，忽略
+        assert_eq!(
+            dal.string_length_change(&col_meta(s, 0), &col_info("text", s, 0)),
+            None
+        );
+        // 库侧 text/ntext/sysname 白名单 → 忽略
+        assert_eq!(
+            dal.string_length_change(&col_meta(s, 5000), &col_info("text", s, 0)),
+            None
+        );
+        assert_eq!(
+            dal.string_length_change(&col_meta(s, 50), &col_info("ntext", s, 0)),
+            None
+        );
+        // 长度相同 / 非字符串列不参与
+        assert_eq!(
+            dal.string_length_change(&col_meta(s, 50), &col_info("nvarchar(50)", s, 50)),
+            None
+        );
+        assert_eq!(
+            dal.string_length_change(
+                &col_meta(crate::types::DataType::Int32, 0),
+                &col_info("int", crate::types::DataType::Int32, 0)
+            ),
+            None
+        );
+
+        dal.clear_pool();
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_schema_aligns_string_length_by_mode() {
+        const M3: &str = r#"<EntityModel><Tables><Table Name="T3" TableName="DH_T3">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            <Column Name="Code" DataType="String" Length="100" />
+          </Columns>
+        </Table></Tables></EntityModel>"#;
+
+        let dir = temp_dir("len-sync");
+
+        // ① 库中 Code 为 nvarchar(20)，模型要求 100 → 放宽：On 档即尝试（SQLite 不支持 ALTER COLUMN，落 notes）
+        let db = dir.join("widen.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+        {
+            let setup = Dal::open(&conn).unwrap();
+            let mut session = setup.open_session().unwrap();
+            session
+                .execute(
+                    "CREATE TABLE \"DH_T3\" (\"Id\" integer PRIMARY KEY AUTOINCREMENT, \"Code\" nvarchar(20))",
+                    &[],
+                )
+                .unwrap();
+            drop(session);
+            setup.clear_pool();
+            drop(setup);
+        }
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(M3).unwrap()).unwrap();
+        let diff = dal.diff_schema().unwrap();
+        assert_eq!(diff.length_mismatches.len(), 1, "{diff:?}");
+        let m = &diff.length_mismatches[0];
+        assert_eq!((m.expected, m.actual, m.widening), (100, 20, true), "{diff:?}");
+        let report = dal.sync_schema().unwrap();
+        assert!(
+            report.notes.iter().any(|n| n.contains("长度 20 → 100")),
+            "On 档应尝试放宽长度：{report:?}"
+        );
+        dal.clear_pool();
+        drop(dal);
+
+        // ② 反方向（库 300、模型 100）= 缩窄：On 档跳过（无 note），Full 档才处理
+        let db = dir.join("narrow.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+        {
+            let setup = Dal::open(&conn).unwrap();
+            let mut session = setup.open_session().unwrap();
+            session
+                .execute(
+                    "CREATE TABLE \"DH_T3\" (\"Id\" integer PRIMARY KEY AUTOINCREMENT, \"Code\" nvarchar(300))",
+                    &[],
+                )
+                .unwrap();
+            drop(session);
+            setup.clear_pool();
+            drop(setup);
+        }
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(M3).unwrap()).unwrap();
+        let diff = dal.diff_schema().unwrap();
+        assert_eq!(diff.length_mismatches.len(), 1, "{diff:?}");
+        assert!(!diff.length_mismatches[0].widening, "{diff:?}");
+        let report = dal.sync_schema().unwrap();
+        assert!(
+            report.notes.is_empty(),
+            "On 档不应缩窄列长度：{report:?}"
+        );
+        assert!(report.is_empty(), "{report:?}");
+        dal.clear_pool();
+        drop(dal);
+
+        // ③ Full 档：缩窄会尝试执行（SQLite 不支持 ALTER COLUMN → 落 notes 提示人工处理）
+        let conn = format!(
+            "Data Source={};Provider=SQLite;Migration=Full",
+            dir.join("narrow.db").display()
+        );
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(M3).unwrap()).unwrap();
+        assert_eq!(dal.migration(), Migration::Full);
+        let report = dal.sync_schema().unwrap();
+        assert!(
+            report.notes.iter().any(|n| n.contains("长度 300 → 100")),
+            "Full 档应处理缩窄：{report:?}"
+        );
+        dal.clear_pool();
+        drop(dal);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

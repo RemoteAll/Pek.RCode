@@ -79,8 +79,9 @@
 //! ## 安全说明
 //!
 //! - 所有查询/写入均使用参数绑定；列名、表名经方言引用转义
-//! - `sync_schema` 默认（`On`）只做增量补齐（建表/加列/补索引）；修改列类型与删除多余列/索引
-//!   仅 [`Migration::Full`] 档允许，且模型外的表从不自动删除（档位语义与 DH.NCode 一致）
+//! - `sync_schema` 默认（`On`）只做增量补齐（建表/加列/补索引）与**字符串列长度放宽**；
+//!   缩窄/修改列类型与删除多余列/索引仅 [`Migration::Full`] 档允许，且模型外的表从不自动删除
+//!   （档位语义与 DH.NCode 一致）
 
 #[cfg(all(feature = "tls-native", feature = "tls-rustls"))]
 compile_error!(

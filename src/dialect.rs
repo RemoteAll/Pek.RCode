@@ -113,6 +113,20 @@ impl DatabaseKind {
         !matches!(self, DatabaseKind::InfluxDb | DatabaseKind::MongoDb)
     }
 
+    /// 大文本阈值：字符串列长度超过该值即视为“无长度意义的大文本”。
+    ///
+    /// 对应 C# `IDatabase.LongTextLength`（默认 4000；Access 255、Firebird 32767、
+    /// InfluxDB 65535）。结构比对时两侧都是大文本则忽略长度差异（对齐 `IsColumnLengthChanged`）。
+    /// <returns>阈值字符数</returns>
+    pub fn long_text_length(&self) -> i32 {
+        match self {
+            DatabaseKind::Access => 255,
+            DatabaseKind::Firebird => 32_767,
+            DatabaseKind::InfluxDb => 65_535,
+            _ => 4_000,
+        }
+    }
+
     /// 是否支持标准多行 `VALUES (..),(..)` 批量插入语法。
     ///
     /// 对齐 C# 各数据库会话的 `BatchCapability.Insert`（`IDbSession.Insert(table, columns, list)` 覆写）；
