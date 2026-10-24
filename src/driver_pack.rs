@@ -289,6 +289,34 @@ impl DriverManager {
         Ok((component, version, dir))
     }
 
+    /// 组件源目录的**全部条目**（只保留当前平台 target；一次网络请求）。
+    ///
+    /// 面板「驱动组件检测」这类需要「列出全部组件 + 各自最新版本」的场景用它，
+    /// **不要**按组件逐个调 [`Self::latest_version`]——那会重复拉取目录。
+    /// 未配置组件源（仅本地缓存模式）→ `Ok(Vec::new())`。
+    pub fn catalog(&self) -> Result<Vec<ComponentEntry>> {
+        if self.catalog_url.is_empty() {
+            return Ok(Vec::new());
+        }
+        let target = current_target();
+        Ok(self
+            .load_catalog()?
+            .into_iter()
+            .filter(|e| target.map_or(true, |t| e.target == t))
+            .collect())
+    }
+
+    /// 下载/升级指定组件到本地缓存（**不拉起宿主**）。
+    ///
+    /// 联网查最新版本 → 本地已有该版本则直接返回 → 否则下载、SHA-256 校验、
+    /// 解压到 `{cache}/{组件}/{版本}/`。组件源不可用时回退本地缓存（有则返回，无则报错）。
+    /// 返回 `(版本, 缓存目录)`。
+    pub fn install_component(&self, component: &str) -> Result<(String, PathBuf)> {
+        dhrust::plugin::validate_id(component)
+            .map_err(|e| Error::Argument(format!("驱动组件 id 非法：{e}")))?;
+        self.resolve_driver(component, true)
+    }
+
     /// 组件源中该组件的**最新版本**（只读目录，**不下载**）。
     ///
     /// - 未配置组件源（`store_url` 为空 = 仅本地缓存模式）→ `Ok(None)`；
