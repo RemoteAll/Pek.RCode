@@ -52,6 +52,30 @@ impl SharedStore {
     pub fn lock(&self) -> MutexGuard<'_, ()> {
         self.lock.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// 并发执行一次会话操作（**不取进程内串行锁**，每次从连接池独立取会话）。
+    ///
+    /// 适用：MySQL / PostgreSQL / SQL Server 等支持多写者的网络数据库——
+    /// 它们由服务端保证并发安全，进程内再串行化只会把吞吐压成单线程。
+    ///
+    /// **不适用**：SQLite / DuckDB 等进程内单写者数据库，并发写会撞 `database is locked`，
+    /// 这类驱动请继续用 [`SharedStore::with_session`]。
+    ///
+    /// # 参数
+    /// - `f`：会话回调。
+    ///
+    /// # 返回值
+    /// 回调结果（错误转字符串）。
+    pub fn with_session_concurrent<F, R>(&self, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&Dal, &mut dyn SqlSession) -> crate::Result<R>,
+    {
+        let mut session = self
+            .dal
+            .open_session()
+            .map_err(|e| format!("数据会话创建失败：{e}"))?;
+        f(&self.dal, session.as_mut()).map_err(|e| e.to_string())
+    }
 }
 
 /// 注册表：（数据目录 + 作用域名）→ 共享存储（同一目录可承载多个逻辑库，如多数据源连接的多个文件）。

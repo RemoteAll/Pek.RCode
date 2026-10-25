@@ -3043,6 +3043,65 @@ impl<'a> TableRef<'a> {
         self.increment(session, deltas, &filter)
     }
 
+    /// **原子累加 + 普通赋值混合更新**：`SET 累加列 = 累加列 + n, 赋值列 = ?`（一条语句）。
+    ///
+    /// 用于「计数与快照一起写」的场景（例如心跳：`Pings = Pings + 1` 与内存/CPU 指标同句写入），
+    /// 相比先 [`TableRef::update_where`] 再 [`TableRef::increment`] **少一次数据库往返**——
+    /// 在 MySQL/PostgreSQL 这类网络库上，一次往返通常就是整次写入的主要成本。
+    ///
+    /// 语义说明：
+    /// - 数据库在一条语句内完成「读-加-写」，并发安全、不会丢计数；
+    /// - 因累加列必然改变取值，**受影响行数 > 0 即代表目标行存在**（MySQL 默认只回报"实际改变"的行），
+    ///   调用方可用它替代"先查是否存在"；
+    /// - 拦截器补的 `UpdateTime` 仍按普通赋值处理。
+    ///
+    /// # 参数
+    /// - `session`：会话。
+    /// - `deltas`：累加列与增量（不能为空）。
+    /// - `assigns`：普通赋值列（可为空）。
+    /// - `filter`：条件（通常传主键或索引列）。
+    ///
+    /// # 返回值
+    /// 受影响行数。
+    pub fn increment_with(
+        &self,
+        session: &mut dyn SqlSession,
+        deltas: &[(&str, DbValue)],
+        assigns: &[(&str, DbValue)],
+        filter: &Where,
+    ) -> Result<u64> {
+        self.ensure_writable()?;
+        if deltas.is_empty() {
+            return Err(Error::Argument("原子累加至少需要一个累加字段".into()));
+        }
+        let mut fields: Vec<(&str, DbValue)> = Vec::with_capacity(deltas.len() + assigns.len());
+        fields.extend_from_slice(deltas);
+        fields.extend_from_slice(assigns);
+        let prepared = crate::interceptor::prepare(
+            self.table,
+            crate::interceptor::DataMethod::Update,
+            &fields,
+        );
+        let names: Vec<String> = deltas.iter().map(|(n, _)| n.to_string()).collect();
+        let (delta_values, assign_values): (Vec<_>, Vec<_>) = prepared
+            .into_iter()
+            .partition(|(name, _)| names.iter().any(|n| n.eq_ignore_ascii_case(name)));
+        let (sql, params) = sqlbuild::increment_sql_owned_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            delta_values,
+            assign_values,
+            filter,
+        )?;
+        self.dal.log_sql(&sql);
+        let affected = session.execute_owned(&sql, params)?;
+        if affected > 0 {
+            self.dal.invalidate_cache(self.physical_name());
+        }
+        Ok(affected)
+    }
+
     /// 自然键 upsert：按 `keys` 查行（取主键），命中则 `update_by_pk` 更新 `values`，
     /// 未命中则插入 `keys + values + insert_extra`（`insert_extra` 为“仅插入”初值列，
     /// 如统计计数置零；更新路径不碰这些列）；返回是否为插入（true = 新增）。

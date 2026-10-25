@@ -193,6 +193,66 @@ fn table_increment_is_atomic_and_accumulates() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 累加 + 赋值混合：一条语句同时写计数与快照列；主键不存在返回 0（调用方据此转插入）。
+#[test]
+fn table_increment_with_assigns_snapshot_in_one_statement() {
+    let (dir, dal) = setup("increment-with");
+    let table = dal.table("DeviceStat").unwrap();
+    let mut session = dal.open_session().unwrap();
+
+    table
+        .insert(
+            session.as_mut(),
+            &[
+                ("Name", DbValue::Text("dev-1".into())),
+                ("Count", DbValue::Int(0)),
+                ("Flow", DbValue::Int(5)),
+            ],
+        )
+        .unwrap();
+
+    let filter = Where::new().eq("Id", 1);
+    assert_eq!(
+        table
+            .increment_with(
+                session.as_mut(),
+                &[("Count", DbValue::Int(1))],
+                &[
+                    ("Name", DbValue::Text("dev-2".into())),
+                    ("Flow", DbValue::Int(9)),
+                ],
+                &filter,
+            )
+            .unwrap(),
+        1
+    );
+    let row = table
+        .query(session.as_mut(), &Query::new().filter(filter.clone()).take(1))
+        .unwrap();
+    let row = row.first().unwrap();
+    assert_eq!(row.get_by_name("Count").and_then(DbValue::as_i64), Some(1));
+    assert_eq!(row.get_by_name("Flow").and_then(DbValue::as_i64), Some(9));
+    assert_eq!(
+        row.get_by_name("Name").and_then(|v| v.as_str()),
+        Some("dev-2")
+    );
+
+    // 主键不存在 → 0 行（累加必然改变取值，0 行即"行不存在"）
+    assert_eq!(
+        table
+            .increment_with(
+                session.as_mut(),
+                &[("Count", DbValue::Int(1))],
+                &[("Name", DbValue::Text("ghost".into()))],
+                &Where::new().eq("Id", 999),
+            )
+            .unwrap(),
+        0
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 实体级累加：一条语句累加并同步回对象。
 #[test]
 fn entity_increment_updates_object_and_database() {
