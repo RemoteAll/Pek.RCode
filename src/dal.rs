@@ -3234,7 +3234,7 @@ impl<'a> TableRef<'a> {
         Ok(affected)
     }
 
-    /// 按主键原子累加（[`TableRef::increment`] 的便捷版）。
+    /// **按主键原子累加**（[`TableRef::increment`] 的便捷版）。
     pub fn increment_by_pk(
         &self,
         session: &mut dyn SqlSession,
@@ -3243,6 +3243,72 @@ impl<'a> TableRef<'a> {
     ) -> Result<u64> {
         let filter = self.pk_filter(pk)?;
         self.increment(session, deltas, &filter)
+    }
+
+    /// **按业务唯一键批量 Upsert**：一条语句写入多行，冲突时更新（外部唯一键不是自增主键）。
+    ///
+    /// 典型场景：设备在线表「一台设备一行」——表主键是自增 `Id`，业务唯一键是 `DeviceId`
+    /// （模型里已声明唯一索引）。心跳聚合后按 `DeviceId` 批量写入即可，无需先查再插/改。
+    ///
+    /// 方言差异：
+    /// - SQLite / DuckDB / PostgreSQL：`INSERT ... ON CONFLICT (指定列) DO UPDATE SET 列=excluded.列`；
+    /// - MySQL：`INSERT ... ON DUPLICATE KEY UPDATE 列=VALUES(列)`（命中外键的任意唯一键）。
+    ///
+    /// # 参数
+    /// - `session`：会话。
+    /// - `columns`：插入列（所有行共用）；自增列应放在列集里并传 `DbValue::Null` 或 0，
+    ///   或干脆不包含（推荐，让数据库生成）。
+    /// - `conflict_columns`：冲突判定列（通常是唯一索引列，如 `DeviceId`）。
+    /// - `rows`：每行的值，顺序与 `columns` 一致。
+    /// - `batch_size`：单条语句的最大行数（`None` = 500）。
+    ///
+    /// # 返回值
+    /// 受影响行数合计。
+    pub fn upsert_batch_by_unique(
+        &self,
+        session: &mut dyn SqlSession,
+        columns: &[&str],
+        conflict_columns: &[&str],
+        rows: &[Vec<DbValue>],
+        batch_size: Option<usize>,
+    ) -> Result<u64> {
+        self.ensure_writable()?;
+        if columns.is_empty() || rows.is_empty() {
+            return Err(Error::Argument("批量 Upsert 至少需要一个列与一行".into()));
+        }
+        if conflict_columns.is_empty() {
+            return Err(Error::Argument("批量 Upsert 必须指定冲突列".into()));
+        }
+        let batch = batch_size.unwrap_or(500).max(1);
+        let mut affected = 0u64;
+        for chunk in rows.chunks(batch) {
+            if let Some(bad) = chunk.iter().find(|row| row.len() != columns.len()) {
+                return Err(Error::Argument(format!(
+                    "批量 Upsert 行值个数 {} 与列数 {} 不一致",
+                    bad.len(),
+                    columns.len()
+                )));
+            }
+            let sql = sqlbuild::multi_write_sql_upsert_by_named(
+                self.dal.kind,
+                self.table,
+                self.physical_name(),
+                columns,
+                conflict_columns,
+                chunk.len(),
+                None,
+            )?;
+            let mut params: Vec<DbValue> = Vec::with_capacity(chunk.len() * columns.len());
+            for row in chunk {
+                params.extend(row.iter().cloned());
+            }
+            self.dal.log_sql(&sql);
+            affected += session.execute_owned(&sql, params)?;
+        }
+        if affected > 0 {
+            self.dal.invalidate_cache(self.physical_name());
+        }
+        Ok(affected)
     }
 
     /// **批量按主键更新**：一条 `UPDATE` 更新多行（`SET 列 = CASE 主键 WHEN ? THEN ? ... END`）。

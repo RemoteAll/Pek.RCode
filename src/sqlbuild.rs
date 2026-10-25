@@ -209,7 +209,42 @@ pub fn multi_write_sql_named(
     rows: usize,
     mode: BatchWriteMode,
 ) -> Result<String> {
-    multi_write_impl(kind, table, table_name, columns, rows, mode, None)
+    multi_write_impl(kind, table, table_name, columns, rows, mode, None, None)
+}
+
+/// 组装多行 Upsert，并**指定冲突列**（通常是某个唯一索引列，如业务主键 `DeviceId`）。
+///
+/// 与 [`multi_write_sql_named`] 的 `Upsert` 区别：
+/// - SQLite / DuckDB / PostgreSQL：`ON CONFLICT (指定列) DO UPDATE`（不看表主键）；
+/// - MySQL：仍为 `ON DUPLICATE KEY UPDATE`（会命中外键的任意唯一键，包括指定列）；
+/// - 用途：心跳/状态表的「一台设备一行」批量 upsert（外部唯一键不是自增主键）。
+///
+/// `update_only` 同 [`multi_write_sql_upsert_named`]；传 `None` = 更新除主键/自增列外的全部插入列。
+pub fn multi_write_sql_upsert_by_named(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    columns: &[&str],
+    conflict_columns: &[&str],
+    rows: usize,
+    update_only: Option<&[&str]>,
+) -> Result<String> {
+    if conflict_columns.is_empty() {
+        return Err(Error::Model(format!(
+            "表 {} 的 Upsert 必须指定冲突列",
+            table.name
+        )));
+    }
+    multi_write_impl(
+        kind,
+        table,
+        table_name,
+        columns,
+        rows,
+        BatchWriteMode::Upsert,
+        update_only,
+        Some(conflict_columns),
+    )
 }
 
 /// 组装多行 Upsert 语句，并**指定冲突时只更新哪些列**（脏列追踪：只写变化列）。
@@ -236,6 +271,7 @@ pub fn multi_write_sql_upsert_named(
         rows,
         BatchWriteMode::Upsert,
         update_only,
+        None,
     )
 }
 
@@ -247,6 +283,7 @@ fn multi_write_impl(
     rows: usize,
     mode: BatchWriteMode,
     update_only: Option<&[&str]>,
+    conflict_columns: Option<&[&str]>,
 ) -> Result<String> {
     if columns.is_empty() {
         return Err(Error::Model(format!(
@@ -317,10 +354,17 @@ fn multi_write_impl(
 
             match kind {
                 DatabaseKind::Sqlite | DatabaseKind::DuckDb | DatabaseKind::PostgreSql => {
-                    let target: Vec<String> = pks
-                        .iter()
-                        .map(|pk| kind.quote(table.effective_column_name(pk)))
-                        .collect();
+                    // 冲突列：显式指定优先（外部唯一键 upsert），否则用模型主键
+                    let target: Vec<String> = match conflict_columns {
+                        Some(cols) if !cols.is_empty() => cols
+                            .iter()
+                            .map(|c| Ok(kind.quote(column_name(table, c)?)))
+                            .collect::<Result<_>>()?,
+                        _ => pks
+                            .iter()
+                            .map(|pk| kind.quote(table.effective_column_name(pk)))
+                            .collect(),
+                    };
                     let tail = if update_fields.is_empty() {
                         format!(" ON CONFLICT ({}) DO NOTHING", target.join(", "))
                     } else {
