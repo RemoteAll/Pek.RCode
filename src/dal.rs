@@ -3043,6 +3043,58 @@ impl<'a> TableRef<'a> {
         self.increment(session, deltas, &filter)
     }
 
+    /// **批量按主键更新**：一条 `UPDATE` 更新多行（`SET 列 = CASE 主键 WHEN ? THEN ? ... END`）。
+    ///
+    /// 用途：把 N 条 `UPDATE` 合成 1 条语句——在 MySQL/PostgreSQL 等网络库上，
+    /// 往返次数从 N 降到 1（往返是这类库的主要成本）；心跳/状态类高频写入的批量落库入口。
+    ///
+    /// 约束：
+    /// - 表必须有**单列主键**（复合主键请逐行调用 [`TableRef::update_by_pk`]）；
+    /// - `columns` 是所有行共用的列集，`rows` 每行为 `(主键值, 各列值)`，值顺序与 `columns` 一致；
+    /// - 不经过拦截器（调用方需要的话自行把 `UpdateTime` 放进 `columns`）。
+    ///
+    /// # 参数
+    /// - `session`：会话。
+    /// - `columns`：待更新列（所有行共用）。
+    /// - `rows`：`(主键值, 各列值)` 列表（不能为空）。
+    ///
+    /// # 返回值
+    /// 受影响行数。
+    pub fn update_batch_by_pk(
+        &self,
+        session: &mut dyn SqlSession,
+        columns: &[&str],
+        rows: &[(DbValue, Vec<DbValue>)],
+    ) -> Result<u64> {
+        self.ensure_writable()?;
+        if columns.is_empty() || rows.is_empty() {
+            return Err(Error::Argument("批量更新至少需要一个列与一行".into()));
+        }
+        let pks = self.table.primary_keys();
+        if pks.len() != 1 {
+            return Err(Error::Model(format!(
+                "表 {} 批量按主键更新要求单列主键（当前 {} 列）",
+                self.table.name,
+                pks.len()
+            )));
+        }
+        let pk_name = self.table.effective_column_name(pks[0]);
+        let (sql, params) = sqlbuild::update_batch_by_pk_sql_named(
+            self.dal.kind,
+            self.table,
+            self.physical_name(),
+            columns,
+            pk_name,
+            rows,
+        )?;
+        self.dal.log_sql(&sql);
+        let affected = session.execute_owned(&sql, params)?;
+        if affected > 0 {
+            self.dal.invalidate_cache(self.physical_name());
+        }
+        Ok(affected)
+    }
+
     /// **原子累加 + 普通赋值混合更新**：`SET 累加列 = 累加列 + n, 赋值列 = ?`（一条语句）。
     ///
     /// 用于「计数与快照一起写」的场景（例如心跳：`Pings = Pings + 1` 与内存/CPU 指标同句写入），

@@ -602,6 +602,87 @@ pub fn update_sql_owned_named<S: AsRef<str>>(
     Ok((sql, params))
 }
 
+/// 组装**批量按主键更新**语句：一条 `UPDATE` 更新多行。
+///
+/// 形态：`UPDATE t SET c1 = CASE pk WHEN ? THEN ? ... END, ... WHERE pk IN (?, ? ...)`。
+///
+/// 用途：心跳/状态类高频写入的批量落库——把 N 条 `UPDATE` 合成 1 条语句，
+/// 在 MySQL/PostgreSQL 这类网络库上把往返次数从 N 降到 1（往返是主要成本）。
+///
+/// 约束：
+/// - 只支持**单列主键**（复合主键请改用逐行版本）；
+/// - `columns` 为共用列集，`rows` 每行的值个数必须等于 `columns.len()`；
+/// - 不经过拦截器（批量路径由调用方给全列，例如 `UpdateTime`）。
+pub fn update_batch_by_pk_sql_named<S: AsRef<str>>(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    columns: &[S],
+    pk_name: &str,
+    rows: &[(DbValue, Vec<DbValue>)],
+) -> Result<(String, Vec<DbValue>)> {
+    if columns.is_empty() || rows.is_empty() {
+        return Err(Error::Model(format!(
+            "表 {} 的批量更新至少需要一个列与一行",
+            table.name
+        )));
+    }
+    let pk = column_name(table, pk_name)?;
+    // 列名先全部校验，避免拼到一半才发现列不存在
+    let mut names: Vec<&str> = Vec::with_capacity(columns.len());
+    for field in columns {
+        names.push(column_name(table, field.as_ref())?);
+    }
+    for (index, (_, values)) in rows.iter().enumerate() {
+        if values.len() != names.len() {
+            return Err(Error::Model(format!(
+                "表 {} 批量更新第 {} 行的值个数 {} 与列数 {} 不一致",
+                table.name,
+                index + 1,
+                values.len(),
+                names.len()
+            )));
+        }
+    }
+
+    // 参数：每列每行 2 个（pk、值）+ WHERE IN 的 pk
+    let mut params: Vec<DbValue> = Vec::with_capacity(rows.len() * names.len() * 2 + rows.len());
+    let mut sql = String::with_capacity(32 + table_name.len() + names.len() * rows.len() * 24);
+    sql.push_str("UPDATE ");
+    kind.push_quoted(&mut sql, table_name);
+    sql.push_str(" SET ");
+    for (col_index, name) in names.iter().enumerate() {
+        if col_index > 0 {
+            sql.push_str(", ");
+        }
+        kind.push_quoted(&mut sql, name);
+        sql.push_str(" = CASE ");
+        kind.push_quoted(&mut sql, pk);
+        for (pk_value, values) in rows {
+            sql.push_str(" WHEN ");
+            kind.push_placeholder(&mut sql, params.len());
+            params.push(pk_value.clone());
+            sql.push_str(" THEN ");
+            kind.push_placeholder(&mut sql, params.len());
+            params.push(values[col_index].clone());
+        }
+        sql.push_str(" END");
+    }
+    sql.push_str(" WHERE ");
+    kind.push_quoted(&mut sql, pk);
+    sql.push_str(" IN (");
+    for (index, (pk_value, _)) in rows.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        kind.push_placeholder(&mut sql, params.len());
+        params.push(pk_value.clone());
+    }
+    sql.push(')');
+
+    Ok((sql, params))
+}
+
 /// 组装**按主键 UPDATE**（可选 CAS 期望条件）：主键条件直接拼接，**不构造 `Where`**。
 ///
 /// - 比 [`update_sql_owned_named`] 少 3~4 次分配（`pk_filter` 的 `Cond` / 列名 `String` / 值 `Vec`）；
