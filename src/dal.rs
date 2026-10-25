@@ -1095,6 +1095,133 @@ impl Dal {
         self.sync_schema_inner(true)
     }
 
+    /// **只同步索引**（不改表、不改列，只按模型补/升级索引）。
+    ///
+    /// 设计目的：索引变更属于**低风险、可自动**的结构项（不改数据、不动列），
+    /// 不应要求上线时关掉整个 `sync_schema` 再手工执行 DDL。消费方可以在
+    /// `sync_schema = false` 的常规部署里单独调用它，让「新增索引 / 普通索引→唯一索引」
+    /// 随服务启动自动生效。
+    ///
+    /// 行为（对齐 [`Dal::sync_schema`] 的 `On` 档语义）：
+    /// - 表不存在 → **跳过**（交给 `sync_schema` 建表，避免这里误建空表）；
+    /// - 索引缺失 → `CREATE INDEX`；
+    /// - 模型要唯一、库里同列只有普通索引 → 先 `DROP` 同名索引再 `CREATE UNIQUE INDEX`；
+    /// - 库里唯一、模型写普通 → **不降级**（避免悄悄丢约束）；
+    /// - 多余索引 → **不删除**（删除属 `Full` 档，且可能影响其它查询）。
+    ///
+    /// # 返回值
+    /// 结构报告（`added_indexes` / `dropped_indexes` 为本轮变更项；`pending_sql` 在只读档下给出脚本）。
+    pub fn sync_indexes(&self) -> Result<SchemaReport> {
+        let mut report = SchemaReport {
+            mode: Migration::On,
+            ..Default::default()
+        };
+        let Some(model) = self.model.as_ref() else {
+            report.notes.push("尚未加载数据模型，跳过索引同步".into());
+            return Ok(report);
+        };
+        if !self.kind.supports_ddl() || !crate::catalog::supports_index_catalog(self.kind) {
+            report
+                .notes
+                .push(format!("{:?} 不支持索引目录，跳过索引同步", self.kind));
+            return Ok(report);
+        }
+        let mut session = self.open_session()?;
+        let db_tables = match crate::catalog::read_tables(session.as_mut(), self.kind, None) {
+            Ok(tables) => tables,
+            Err(Error::Unsupported(_)) => {
+                report.notes.push("索引目录不可用，跳过索引同步".into());
+                return Ok(report);
+            }
+            Err(e) => return Err(e),
+        };
+
+        for table in &model.tables {
+            let table_name = table.effective_table_name();
+            // 表还不存在：由 sync_schema 建表时一并建索引
+            if !db_tables
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case(table_name))
+            {
+                continue;
+            }
+            let existing = match crate::catalog::read_indexes(
+                session.as_mut(),
+                self.kind,
+                table_name,
+            ) {
+                Ok(indexes) => indexes,
+                Err(Error::Unsupported(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            for idx in &table.indexes {
+                if idx.columns.is_empty() {
+                    continue;
+                }
+                let unique_exists = existing
+                    .iter()
+                    .any(|e| e.unique && same_index(&e.columns, &idx.columns));
+                if unique_exists
+                    || (!idx.unique
+                        && existing
+                            .iter()
+                            .any(|e| same_index(&e.columns, &idx.columns)))
+                {
+                    continue;
+                }
+                let want_name = self.kind.index_name(table, idx);
+                if idx.unique
+                    && let Some(plain) = existing.iter().find(|e| {
+                        !e.unique
+                            && same_index(&e.columns, &idx.columns)
+                            && e.name.eq_ignore_ascii_case(&want_name)
+                    })
+                    && let Some(drop_sql) =
+                        self.kind.drop_index_sql(&plain.name, Some(table_name))
+                {
+                    self.exec_ddl(session.as_mut(), Migration::On, &mut report, &drop_sql)?;
+                    report
+                        .dropped_indexes
+                        .push((table_name.to_string(), plain.name.clone()));
+                }
+                if let Some(sql) = self.kind.create_index_sql(table, idx) {
+                    self.exec_ddl(session.as_mut(), Migration::On, &mut report, &sql)?;
+                    report
+                        .added_indexes
+                        .push((table_name.to_string(), want_name));
+                }
+            }
+            // 清理多余索引：**按模型为准，该清的清**
+            // - 模型里没有该列组合的索引 → 删除；
+            // - 同列已有唯一索引时，残留的普通同列索引属于冗余 → 删除；
+            // - 主键/系统索引（`sqlite_autoindex*`、`*_pkey` 等）跳过。
+            // 索引增删不改变数据，放在默认档（`On`）执行。
+            for e in &existing {
+                if is_primary_index_name(&e.name) {
+                    continue;
+                }
+                let in_model = table
+                    .indexes
+                    .iter()
+                    .any(|idx| same_index(&idx.columns, &e.columns));
+                let redundant = !e.unique
+                    && existing
+                        .iter()
+                        .any(|o| o.unique && same_index(&o.columns, &e.columns));
+                if in_model && !redundant {
+                    continue;
+                }
+                if let Some(sql) = self.kind.drop_index_sql(&e.name, Some(table_name)) {
+                    self.exec_ddl(session.as_mut(), Migration::On, &mut report, &sql)?;
+                    report
+                        .dropped_indexes
+                        .push((table_name.to_string(), e.name.clone()));
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// 结构同步实现：`include_network = false` 时保持 C# 对齐的网络空实现。
     fn sync_schema_inner(&self, include_network: bool) -> Result<SchemaReport> {
         let model = self
@@ -1182,23 +1309,78 @@ impl Dal {
             }
 
             // 既存表：补齐模型定义中缺失的索引（同列且同序即视为已存在，避免与其它工具命名差异重复建）
+            //
+            // **唯一性升级**：模型要求唯一、库里同列只有普通索引时，同列判断会误以为"已存在"
+            // 而永远不建唯一约束（历史坑：改模型 Unique=True 后 `sync_schema` 静默跳过）。
+            // 这里额外比较 `unique`：不一致则先删同名索引再建唯一索引；反向（库里唯一、模型普通）不降级。
             if crate::catalog::supports_index_catalog(self.kind) {
                 match crate::catalog::read_indexes(session.as_mut(), self.kind, table_name) {
                     Ok(existing_indexes) => {
                         for idx in &table.indexes {
-                            if idx.columns.is_empty()
-                                || existing_indexes
-                                    .iter()
-                                    .any(|e| same_index(&e.columns, &idx.columns))
-                            {
+                            if idx.columns.is_empty() {
                                 continue;
+                            }
+                            let unique_exists = existing_indexes
+                                .iter()
+                                .any(|e| e.unique && same_index(&e.columns, &idx.columns));
+                            if unique_exists || (!idx.unique
+                                && existing_indexes
+                                    .iter()
+                                    .any(|e| same_index(&e.columns, &idx.columns)))
+                            {
+                                // 已有同列唯一索引；或模型不要求唯一而库里已有同列索引（不降级）
+                                continue;
+                            }
+                            // 模型要求唯一但库里只有同列普通索引 → 同名时先删再建
+                            let want_name = self.kind.index_name(table, idx);
+                            if idx.unique
+                                && let Some(existing) = existing_indexes.iter().find(|e| {
+                                    !e.unique
+                                        && same_index(&e.columns, &idx.columns)
+                                        && e.name.eq_ignore_ascii_case(&want_name)
+                                })
+                                && let Some(drop_sql) =
+                                    self.kind.drop_index_sql(&existing.name, Some(table_name))
+                            {
+                                self.exec_ddl(&mut *session, mode, &mut report, &drop_sql)?;
+                                report
+                                    .dropped_indexes
+                                    .push((table_name.to_string(), existing.name.clone()));
                             }
                             if let Some(sql) = self.kind.create_index_sql(table, idx) {
                                 self.exec_ddl(&mut *session, mode, &mut report, &sql)?;
-                                report.added_indexes.push((
-                                    table_name.to_string(),
-                                    self.kind.index_name(table, idx),
-                                ));
+                                report
+                                    .added_indexes
+                                    .push((table_name.to_string(), want_name));
+                            }
+                        }
+                        // 清理多余索引：**按模型为准，该清的清**
+                        // - 模型里没有该列组合的索引 → 删除；
+                        // - 同列已有唯一索引时，残留的普通同列索引属冗余 → 删除；
+                        // - 主键/系统索引（`sqlite_autoindex*`、`*_pkey` 等）跳过；
+                        // - 索引增删不改数据，默认档（`On`）即执行，只读档收集 SQL。
+                        for e in &existing_indexes {
+                            if is_primary_index_name(&e.name) {
+                                continue;
+                            }
+                            let in_model = table
+                                .indexes
+                                .iter()
+                                .any(|idx| same_index(&idx.columns, &e.columns));
+                            let redundant = !e.unique
+                                && existing_indexes
+                                    .iter()
+                                    .any(|o| o.unique && same_index(&o.columns, &e.columns));
+                            if in_model && !redundant {
+                                continue;
+                            }
+                            if let Some(sql) =
+                                self.kind.drop_index_sql(&e.name, Some(table_name))
+                            {
+                                self.exec_ddl(&mut *session, mode, &mut report, &sql)?;
+                                report
+                                    .dropped_indexes
+                                    .push((table_name.to_string(), e.name.clone()));
                             }
                         }
                     }
@@ -1552,21 +1734,41 @@ impl Dal {
                                         .push((tname.to_string(), db_col.name.clone()));
                                 }
                             }
-                            // 索引：缺失 / 多余（同列且同序视为一致）
+                            // 索引：缺失 / 多余（同列且同序视为一致；唯一性差异按"需升级"报告）
                             if crate::catalog::supports_index_catalog(self.kind) {
                                 for idx in &table.indexes {
-                                    if idx.columns.is_empty()
-                                        || db
-                                            .indexes
-                                            .iter()
-                                            .any(|e| same_index(&e.columns, &idx.columns))
+                                    if idx.columns.is_empty() {
+                                        continue;
+                                    }
+                                    let unique_exists = db
+                                        .indexes
+                                        .iter()
+                                        .any(|e| e.unique && same_index(&e.columns, &idx.columns));
+                                    if unique_exists
+                                        || (!idx.unique
+                                            && db
+                                                .indexes
+                                                .iter()
+                                                .any(|e| same_index(&e.columns, &idx.columns)))
                                     {
                                         continue;
                                     }
-                                    diff.missing_indexes.push((
-                                        tname.to_string(),
-                                        self.kind.index_name(table, idx),
-                                    ));
+                                    // 模型要唯一、库里只有同列普通索引 → 需要先删同名再建
+                                    let want_name = self.kind.index_name(table, idx);
+                                    if idx.unique
+                                        && let Some(existing) =
+                                            db.indexes.iter().find(|e| {
+                                                !e.unique
+                                                    && same_index(&e.columns, &idx.columns)
+                                                    && e.name.eq_ignore_ascii_case(&want_name)
+                                            })
+                                        && let Some(drop_sql) =
+                                            self.kind.drop_index_sql(&existing.name, Some(tname))
+                                    {
+                                        diff.alter_sql.push(drop_sql);
+                                    }
+                                    diff.missing_indexes
+                                        .push((tname.to_string(), want_name));
                                     if let Some(sql) = self.kind.create_index_sql(table, idx) {
                                         diff.alter_sql.push(sql);
                                     }
