@@ -209,7 +209,7 @@ pub fn multi_write_sql_named(
     rows: usize,
     mode: BatchWriteMode,
 ) -> Result<String> {
-    multi_write_impl(kind, table, table_name, columns, rows, mode, None, None)
+    multi_write_impl(kind, table, table_name, columns, rows, mode, None, None, &[])
 }
 
 /// 组装多行 Upsert，并**指定冲突列**（通常是某个唯一索引列，如业务主键 `DeviceId`）。
@@ -226,6 +226,7 @@ pub fn multi_write_sql_upsert_by_named(
     table_name: &str,
     columns: &[&str],
     conflict_columns: &[&str],
+    increment_columns: &[&str],
     rows: usize,
     update_only: Option<&[&str]>,
 ) -> Result<String> {
@@ -244,6 +245,7 @@ pub fn multi_write_sql_upsert_by_named(
         BatchWriteMode::Upsert,
         update_only,
         Some(conflict_columns),
+        increment_columns,
     )
 }
 
@@ -272,6 +274,7 @@ pub fn multi_write_sql_upsert_named(
         BatchWriteMode::Upsert,
         update_only,
         None,
+        &[],
     )
 }
 
@@ -284,6 +287,7 @@ fn multi_write_impl(
     mode: BatchWriteMode,
     update_only: Option<&[&str]>,
     conflict_columns: Option<&[&str]>,
+    increment_columns: &[&str],
 ) -> Result<String> {
     if columns.is_empty() {
         return Err(Error::Model(format!(
@@ -372,7 +376,15 @@ fn multi_write_impl(
                             .iter()
                             .map(|field| {
                                 let col = kind.quote(column_name(table, field)?);
-                                Ok(format!("{col}=excluded.{col}"))
+                                // 累计列（如 Pings）：冲突时在旧值上累加新增量，而不是覆盖
+                                if increment_columns
+                                    .iter()
+                                    .any(|c| c.eq_ignore_ascii_case(field))
+                                {
+                                    Ok(format!("{col}={col}+excluded.{col}"))
+                                } else {
+                                    Ok(format!("{col}=excluded.{col}"))
+                                }
                             })
                             .collect::<Result<_>>()?;
                         format!(
@@ -393,7 +405,14 @@ fn multi_write_impl(
                             .iter()
                             .map(|field| {
                                 let col = kind.quote(column_name(table, field)?);
-                                Ok(format!("{col}=VALUES({col})"))
+                                if increment_columns
+                                    .iter()
+                                    .any(|c| c.eq_ignore_ascii_case(field))
+                                {
+                                    Ok(format!("{col}={col}+VALUES({col})"))
+                                } else {
+                                    Ok(format!("{col}=VALUES({col})"))
+                                }
                             })
                             .collect::<Result<_>>()?;
                         format!(" ON DUPLICATE KEY UPDATE {}", sets.join(", "))

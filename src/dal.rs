@@ -3259,6 +3259,7 @@ impl<'a> TableRef<'a> {
     /// - `columns`：插入列（所有行共用）；自增列应放在列集里并传 `DbValue::Null` 或 0，
     ///   或干脆不包含（推荐，让数据库生成）。
     /// - `conflict_columns`：冲突判定列（通常是唯一索引列，如 `DeviceId`）。
+    /// - `increment_columns`：冲突时**累加**而不是覆盖的列（如 `Pings`），传空 = 全部覆盖。
     /// - `rows`：每行的值，顺序与 `columns` 一致。
     /// - `batch_size`：单条语句的最大行数（`None` = 500）。
     ///
@@ -3269,6 +3270,7 @@ impl<'a> TableRef<'a> {
         session: &mut dyn SqlSession,
         columns: &[&str],
         conflict_columns: &[&str],
+        increment_columns: &[&str],
         rows: &[Vec<DbValue>],
         batch_size: Option<usize>,
     ) -> Result<u64> {
@@ -3295,6 +3297,7 @@ impl<'a> TableRef<'a> {
                 self.physical_name(),
                 columns,
                 conflict_columns,
+                increment_columns,
                 chunk.len(),
                 None,
             )?;

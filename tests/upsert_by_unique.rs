@@ -1,7 +1,7 @@
 //! 按业务唯一键批量 Upsert（`TableRef::upsert_batch_by_unique`）。
 //!
 //! 场景：设备在线表「一台设备一行」——表主键是自增 `Id`，业务唯一键是 `DeviceId`（唯一索引）。
-//! 心跳聚合后用一条语句写入多行，冲突按 `DeviceId` 更新，避免「先查再插/改」的 N 次往返。
+//! 心跳聚合后用一条语句写入多行，冲突按 `DeviceId` 更新；`Pings` 这类计数列按增量**累加**而非覆盖。
 
 use std::path::PathBuf;
 
@@ -14,6 +14,7 @@ const MODEL: &str = r#"<EntityModel><Tables><Table Name="DeviceOnline" TableName
     <Column Name="DeviceId" DataType="Int32" />
     <Column Name="Memory" DataType="Int64" />
     <Column Name="Delay" DataType="Int32" />
+    <Column Name="Pings" DataType="Int32" />
     <Column Name="AccessMode" DataType="String" Length="20" />
   </Columns>
   <Indexes>
@@ -38,50 +39,68 @@ fn setup(name: &str) -> (PathBuf, Dal) {
     (dir, dal)
 }
 
-/// 首批插入、第二批按 DeviceId 更新；自增 Id 由数据库生成，不会重复插入。
+/// 首批插入、第二批按 DeviceId 更新；`Pings` 累加而不覆盖。
 #[test]
 fn upsert_batch_by_unique_inserts_then_updates() {
     let (dir, dal) = setup("upsert");
     let table = dal.table("DeviceOnline").unwrap();
     let mut session = dal.open_session().unwrap();
-    let columns = ["DeviceId", "Memory", "Delay", "AccessMode"];
+    let columns = ["DeviceId", "Memory", "Delay", "Pings", "AccessMode"];
 
     let first = vec![
         vec![
             DbValue::Int(10),
             DbValue::Int(1024),
             DbValue::Int(5),
+            DbValue::Int(1),
             DbValue::Text("Mqtt".into()),
         ],
         vec![
             DbValue::Int(11),
             DbValue::Int(2048),
             DbValue::Int(6),
+            DbValue::Int(1),
             DbValue::Text("Mqtt".into()),
         ],
     ];
     let affected = table
-        .upsert_batch_by_unique(session.as_mut(), &columns, &["DeviceId"], &first, None)
+        .upsert_batch_by_unique(
+            session.as_mut(),
+            &columns,
+            &["DeviceId"],
+            &["Pings"],
+            &first,
+            None,
+        )
         .unwrap();
     assert_eq!(affected, 2, "首批应插入两行");
 
-    // 第二批：同 DeviceId 只更新指标，不新增行
+    // 第二批：同 DeviceId 更新指标，Pings 在旧值上累加
     let second = vec![
         vec![
             DbValue::Int(10),
             DbValue::Int(9999),
             DbValue::Int(9),
+            DbValue::Int(1),
             DbValue::Text("Mqtt".into()),
         ],
         vec![
             DbValue::Int(12),
             DbValue::Int(4096),
             DbValue::Int(7),
+            DbValue::Int(1),
             DbValue::Text("Mqtt".into()),
         ],
     ];
     table
-        .upsert_batch_by_unique(session.as_mut(), &columns, &["DeviceId"], &second, None)
+        .upsert_batch_by_unique(
+            session.as_mut(),
+            &columns,
+            &["DeviceId"],
+            &["Pings"],
+            &second,
+            None,
+        )
         .unwrap();
 
     let count = table.count(session.as_mut(), None).unwrap();
@@ -100,45 +119,46 @@ fn upsert_batch_by_unique_inserts_then_updates() {
         (
             row.get_by_name("Memory").and_then(DbValue::as_i64).unwrap_or(-1),
             row.get_by_name("Delay").and_then(DbValue::as_i64).unwrap_or(-1),
+            row.get_by_name("Pings").and_then(DbValue::as_i64).unwrap_or(-1),
         )
     };
-    assert_eq!(read(10), (9999, 9), "同 DeviceId 应被更新");
-    assert_eq!(read(11), (2048, 6), "未列出的行保持原值");
-    assert_eq!(read(12), (4096, 7), "新设备应插入");
+    assert_eq!(read(10), (9999, 9, 2), "同 DeviceId 应更新且 Pings 累加为 2");
+    assert_eq!(read(11), (2048, 6, 1), "未列出的行保持原值");
+    assert_eq!(read(12), (4096, 7, 1), "新设备应插入");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 入参校验：空列/空行/值个数不匹配都要报错且不发 SQL。
+/// 入参校验：空列/空行/值个数不匹配/未指定冲突列都要报错且不发 SQL。
 #[test]
 fn upsert_batch_by_unique_validates_inputs() {
     let (dir, dal) = setup("validate");
     let table = dal.table("DeviceOnline").unwrap();
     let mut session = dal.open_session().unwrap();
+    let one = vec![DbValue::Int(1)];
 
+    // 空列
     assert!(table
-        .upsert_batch_by_unique(session.as_mut(), &[], &["DeviceId"], &[vec![DbValue::Int(1)]], None)
+        .upsert_batch_by_unique(session.as_mut(), &[], &["DeviceId"], &[], &[one.clone()], None)
         .is_err());
+    // 空行
     assert!(table
-        .upsert_batch_by_unique(session.as_mut(), &["DeviceId"], &["DeviceId"], &[], None)
+        .upsert_batch_by_unique(session.as_mut(), &["DeviceId"], &["DeviceId"], &[], &[], None)
         .is_err());
+    // 值个数与列数不一致
     assert!(table
         .upsert_batch_by_unique(
             session.as_mut(),
             &["DeviceId", "Memory"],
             &["DeviceId"],
-            &[vec![DbValue::Int(1)]],
+            &[],
+            &[one.clone()],
             None,
         )
         .is_err());
+    // 未指定冲突列
     assert!(table
-        .upsert_batch_by_unique(
-            session.as_mut(),
-            &["DeviceId"],
-            &[],
-            &[vec![DbValue::Int(1)]],
-            None,
-        )
+        .upsert_batch_by_unique(session.as_mut(), &["DeviceId"], &[], &[], &[one], None)
         .is_err());
 
     let _ = std::fs::remove_dir_all(&dir);
