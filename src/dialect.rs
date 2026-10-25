@@ -744,6 +744,11 @@ impl DatabaseKind {
     }
 
     /// 生成索引创建语句（`None` 表示索引无列，可忽略）。
+    ///
+    /// **MySQL 特殊处理**：`TEXT`/`BLOB` 系列列（模型里 `String` 无 `Length`
+    /// 或超长、`Binary`）必须带前缀长度才能建索引（否则 `ERROR 1170 BLOB/TEXT column used
+    /// in key specification without a key length`）。这里自动补 `(191)`：
+    /// utf8mb4 下 191 字符 = 764 字节，兼容老版本 767 字节索引前缀上限。
     /// <param name="table">表</param>
     /// <param name="idx">索引定义</param>
     /// <returns>CREATE INDEX 语句</returns>
@@ -755,7 +760,14 @@ impl DatabaseKind {
             .columns
             .iter()
             .map(|c| match table.column(c) {
-                Some(col) => self.quote(table.effective_column_name(col)),
+                Some(col) => {
+                    let name = self.quote(table.effective_column_name(col));
+                    if *self == DatabaseKind::MySql && mysql_needs_index_prefix(col) {
+                        format!("{name}({MYSQL_INDEX_PREFIX_CHARS})")
+                    } else {
+                        name
+                    }
+                }
                 None => self.quote(c),
             })
             .collect();
@@ -1235,6 +1247,27 @@ fn reverse_order(order_sql: &str) -> String {
     format!("{prefix} {}", items.join(", "))
 }
 
+/// MySQL 索引前缀长度（utf8mb4 下 191 字符 = 764 字节，兼容 767 字节前缀上限）。
+pub const MYSQL_INDEX_PREFIX_CHARS: i32 = 191;
+
+/// 该列在 MySQL 里是不是 `TEXT`/`BLOB` 系列（建索引必须带前缀长度）。
+///
+/// 判定与 [`DatabaseKind::field_type`] 的 MySQL 分支保持一致：
+/// `String` 且 `Length` 为 0（不限）或超 `16383` → `longtext`；`Binary` → `longblob`。
+///
+/// # 参数
+/// - `col`：列定义。
+///
+/// # 返回值
+/// 需要前缀长度时为 `true`。
+fn mysql_needs_index_prefix(col: &ColumnMeta) -> bool {
+    match col.data_type {
+        DataType::String => col.length <= 0 || col.length > 16383,
+        DataType::Binary => true,
+        _ => false,
+    }
+}
+
 /// MySQL DECIMAL 精度规则（对齐 DH.NCode：Length 有值时覆盖 Precision，上限 255）。
 fn mysql_decimal_spec(col: &ColumnMeta) -> (i32, i32) {
     let scale = col.scale.max(0);
@@ -1282,12 +1315,19 @@ fn render_default(kind: &DatabaseKind, default: &str, col: &ColumnMeta) -> Strin
         };
     }
     // 字符串型默认值：已带引号时不重复包裹
-    if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    let literal = if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
         || (trimmed.starts_with('"') && trimmed.ends_with('"'))
     {
-        return trimmed.to_string();
+        trimmed.to_string()
+    } else {
+        format!("'{}'", trimmed.replace('\'', "''"))
+    };
+    // MySQL：TEXT/BLOB 列不接受字面量默认值（ERROR 1101），必须写成表达式默认 `DEFAULT ('')`
+    // （MySQL 8.0.13+ / MariaDB 10.2+ 支持；更老的版本会报语法错，属可接受的明确失败）
+    if *kind == DatabaseKind::MySql && mysql_needs_index_prefix(col) {
+        return format!("({literal})");
     }
-    format!("'{}'", trimmed.replace('\'', "''"))
+    literal
 }
 
 #[cfg(test)]
@@ -1523,6 +1563,81 @@ mod tests {
             stmts[1],
             "CREATE UNIQUE INDEX \"ix_DH_Order_Code\" ON \"DH_Order\" (\"Code\")"
         );
+    }
+
+    /// MySQL：`TEXT`/`BLOB` 列建索引必须带前缀长度（否则 ERROR 1170）。
+    ///
+    /// 场景来自真实模型：`String` 不写 `Length` → `longtext`，
+    /// 而模型里又有 `<Index Columns="SessionId" Unique="True" />`。
+    #[test]
+    fn mysql_text_column_index_uses_prefix_length() {
+        let mut table = sample_table();
+        // Code：Length=50 → varchar(50)，不需要前缀
+        // Title：String 无长度 → longtext，需要前缀
+        table.indexes.push(crate::model::IndexMeta {
+            name: None,
+            columns: vec!["Code".into()],
+            unique: true,
+        });
+        table.indexes.push(crate::model::IndexMeta {
+            name: None,
+            columns: vec!["Title".into()],
+            unique: true,
+        });
+        let stmts = DatabaseKind::MySql.create_table_sql(&table);
+        let joined = stmts.join("\n");
+        assert!(
+            joined.contains("(`Code`)"),
+            "变长列不应带前缀：{joined}"
+        );
+        assert!(
+            joined.contains("(`Title`(191))"),
+            "longtext 列必须带前缀长度：{joined}"
+        );
+        // 其它方言不加前缀
+        let sqlite = DatabaseKind::Sqlite
+            .create_table_sql(&table)
+            .join("\n");
+        assert!(sqlite.contains("(\"Title\")"), "{sqlite}");
+    }
+
+    /// MySQL：`TEXT`/`BLOB` 列不接受字面量默认值（ERROR 1101），要写成表达式默认。
+    #[test]
+    fn mysql_text_column_default_uses_expression() {
+        let mut col = ColumnMeta {
+            name: "UpdateUser".into(),
+            column_name: None,
+            data_type: DataType::String,
+            raw_type: None,
+            length: 0,
+            precision: 0,
+            scale: 0,
+            identity: false,
+            primary_key: false,
+            master: false,
+            nullable: false,
+            default_value: Some("''".into()),
+            description: String::new(),
+            enum_type: None,
+            data_scale: None,
+            map: None,
+            show_in: None,
+            model: None,
+            category: None,
+            item_type: None,
+            using_cache: None,
+            extra: Vec::new(),
+        };
+        let mysql = DatabaseKind::MySql.add_column_sql(&sample_table(), &col);
+        assert!(
+            mysql.contains("DEFAULT ('')") || mysql.to_uppercase().contains("DEFAULT ('')"),
+            "longtext 默认值必须写成表达式：{mysql}"
+        );
+        // 有长度的变长列仍是普通字面量默认值
+        col.length = 50;
+        let mysql = DatabaseKind::MySql.add_column_sql(&sample_table(), &col);
+        assert!(mysql.contains("DEFAULT ''"), "{mysql}");
+        assert!(!mysql.contains("('')"), "变长列不应包成表达式：{mysql}");
     }
 
     #[test]
