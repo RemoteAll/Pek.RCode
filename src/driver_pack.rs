@@ -1068,6 +1068,136 @@ fn format_tail(tail: &str) -> String {
     }
 }
 
+/// 官方组件源地址（默认值；自建平台时改成内网地址）。
+pub const DEFAULT_STORE: &str = "https://p.sc8.fun";
+
+/// 组件源地址归一化：把误写成 `.../components` 的地址退回站点根。
+///
+/// [`DriverManager`] 会自行拼 `/components/catalog.json`，
+/// 传 `.../components` 会拼成 `/components/components/...` 而 404。
+///
+/// # 参数
+/// - `url`：配置里的组件源地址。
+///
+/// # 返回值
+/// 归一化后的地址（去掉尾部斜杠与 `/components` 后缀）。
+pub fn normalize_store_url(url: &str) -> String {
+    let u = url.trim().trim_end_matches('/');
+    match u.strip_suffix("/components") {
+        Some(base) => base.to_string(),
+        None => u.to_string(),
+    }
+}
+
+/// 组件源是否被显式关闭（`off` / `none` / `-`）。
+///
+/// # 参数
+/// - `url`：配置里的组件源地址。
+///
+/// # 返回值
+/// 关闭为 `true`。
+pub fn store_disabled(url: &str) -> bool {
+    matches!(url.trim().to_ascii_lowercase().as_str(), "off" | "none" | "-")
+}
+
+/// 解析最终生效的组件源地址：空 = 官方默认源；`off` = 关闭（仅本地缓存）。
+///
+/// # 参数
+/// - `url`：配置里的组件源地址。
+///
+/// # 返回值
+/// 生效地址（空串表示只读本地缓存）。
+pub fn resolve_store_url(url: &str) -> String {
+    let v = url.trim();
+    if v.is_empty() {
+        return DEFAULT_STORE.to_string();
+    }
+    if store_disabled(v) {
+        return String::new();
+    }
+    normalize_store_url(v)
+}
+
+/// 驱动组件源配置（各项目 `Panel.toml` / `Config/*.toml` 里的「三件套」）。
+///
+/// 收编自 HLZX.EIP / Pek.RPanlServer / HlktechIoT 三处逐字同构的装配代码：
+/// 归一化地址 → 读自定义 CA → 生成 [`DriverManagerConfig`]。
+#[derive(Debug, Clone, Default)]
+pub struct StoreConfig {
+    /// 组件源地址（空 = 官方默认；`off` = 关闭联网，仅用本地缓存）
+    pub url: String,
+    /// 平台 Ed25519 公钥（空 = 不验签；内网 http 仍受限）
+    pub pubkey: String,
+    /// https 自定义根证书（PEM 内容；自签/内网 CA 场景）
+    pub ca_pem: Option<Vec<u8>>,
+}
+
+impl StoreConfig {
+    /// 从配置值装配（相对路径的 CA 文件按 `base` 解析）。
+    ///
+    /// # 参数
+    /// - `url`：组件源地址。
+    /// - `pubkey`：Ed25519 公钥（hex / SPKI，可空）。
+    /// - `ca_file`：自定义根证书文件路径（可空；相对路径按 `base` 解析）。
+    /// - `base`：数据根目录。
+    ///
+    /// # 返回值
+    /// 配置对象（CA 文件缺失/不可读时报错，避免静默降级成"验签失败"）。
+    pub fn load(
+        url: &str,
+        pubkey: &str,
+        ca_file: &str,
+        base: &std::path::Path,
+    ) -> std::result::Result<Self, String> {
+        let ca_pem = {
+            let p = ca_file.trim();
+            if p.is_empty() {
+                None
+            } else {
+                let path = if std::path::Path::new(p).is_absolute() {
+                    std::path::PathBuf::from(p)
+                } else {
+                    base.join(p)
+                };
+                Some(
+                    std::fs::read(&path)
+                        .map_err(|e| format!("读取组件源 CA 失败（{}）：{e}", path.display()))?,
+                )
+            }
+        };
+        Ok(Self {
+            url: resolve_store_url(url),
+            pubkey: pubkey.trim().to_string(),
+            ca_pem,
+        })
+    }
+
+    /// 是否已关闭联网（仅本地缓存）。
+    ///
+    /// # 返回值
+    /// 关闭为 `true`。
+    pub fn is_offline(&self) -> bool {
+        self.url.trim().is_empty()
+    }
+
+    /// 生成管理器配置。
+    ///
+    /// # 参数
+    /// - `cache_dir`：驱动缓存目录。
+    ///
+    /// # 返回值
+    /// [`DriverManagerConfig`]。
+    pub fn manager_config(&self, cache_dir: std::path::PathBuf) -> DriverManagerConfig {
+        DriverManagerConfig {
+            store_url: self.url.clone(),
+            pubkey: self.pubkey.clone(),
+            ca_pem: self.ca_pem.clone(),
+            cache_dir: Some(cache_dir),
+            ..Default::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
