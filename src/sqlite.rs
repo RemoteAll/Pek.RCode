@@ -130,6 +130,12 @@ pub struct SqliteOptions {
     pub busy_timeout_ms: u64,
     /// 只读连接（不设置 journal_mode）
     pub read_only: bool,
+    /// **只读池**连接（`PRAGMA query_only=ON`）：连接本身可写，但 SQLite 层直接拒绝任何写入。
+    ///
+    /// 与 [`Self::read_only`] 的区别：`read_only` 是“这个库文件只能读”（连 WAL 都不设），
+    /// `query_only` 是“这个连接只允许 SELECT”—— 用于 `SharedStore` 的只读池，
+    /// 同一个 WAL 库可以有 1 个写连接 + N 个 `query_only` 读连接。
+    pub query_only: bool,
 }
 
 impl Default for SqliteOptions {
@@ -139,8 +145,7 @@ impl Default for SqliteOptions {
             synchronous: DEFAULT_SYNCHRONOUS,
             cache_size_kib: None,
             busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
-            read_only: false,
-        }
+            read_only: false,            query_only: false,        }
     }
 }
 
@@ -217,6 +222,10 @@ impl SqliteSession {
         // 页缓存（负数 = KiB；未配置则用 SQLite 默认）
         if let Some(size) = options.cache_size_kib {
             let _ = conn.execute_batch(&format!("PRAGMA cache_size={size};"));
+        }
+        // 只读池连接：SQLite 层直接拒绝写入（写 SQL 属调用方 bug，尽快报错而不是偷偷写进库）
+        if options.query_only {
+            let _ = conn.execute_batch("PRAGMA query_only=ON;");
         }
 
         Ok(Self {

@@ -691,6 +691,28 @@ impl Dal {
         self.readonly.load(Ordering::Relaxed)
     }
 
+    /// 打开一个**只读会话**（供 [`crate::store::SharedStore::with_read_session`] 的只读池使用）。
+    ///
+    /// 与 [`Self::open_session`] 的差别：SQLite 连接追加 `PRAGMA query_only=ON`，
+    /// 任何写入都会被数据库层直接拒绝（`attempt to write a readonly database`）。
+    ///
+    /// **语义边界**：只读池里跑写 SQL 属于调用方 bug，必须尽早暴露，不能“借用读连接偷偷写”。
+    /// 其它数据库类型没有进程内读写互斥问题，直接复用普通会话。
+    pub fn open_read_session(&self) -> Result<Box<dyn SqlSession>> {
+        if self.kind != DatabaseKind::Sqlite {
+            return self.open_session();
+        }
+        let path = self.conn_str.data_source().ok_or_else(|| {
+            Error::Model("SQLite 连接串缺少 Data Source（数据库文件路径）".into())
+        })?;
+        let mut options = crate::sqlite::SqliteOptions::from_connection_string(&self.conn_str);
+        options.query_only = true;
+        // 读连接不负责设置日志模式：写连接已在首开时把库切到 WAL；
+        // 在这里再设一次只会白抢一次写锁（只读文件上还会失败）。
+        options.journal_mode = None;
+        Ok(Box::new(SqliteSession::open_with_options(path, &options)?))
+    }
+
     /// 运行期切换只读（对应 C# `SuspendReadOnly` / `ResumeReadOnly`）。
     ///
     /// 只影响**后续** `open_session()`；已取出的会话保持创建时的保护状态。

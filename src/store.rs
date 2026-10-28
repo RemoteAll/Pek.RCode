@@ -12,16 +12,25 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, Once};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once};
 
 use crate::dal::Dal;
 use crate::session::SqlSession;
+use crate::DatabaseKind;
 
 /// 共享存储：一个数据目录一个数据访问层 + 一把串行锁。
 pub struct SharedStore {
     base: PathBuf,
     dal: Dal,
     lock: Mutex<()>,
+    /// 只读会话池（**仅 SQLite 文件库**：WAL 天然 1 写 N 读）。
+    /// `None` = 读写分离不适用（内存库 / DuckDB / 网络库）→ 退回串行会话。
+    reads: Option<ReadPool>,
+    /// 只读池不可用而退回串行会话的次数。
+    read_fallbacks: AtomicU64,
+    /// 是否已发生「只读池降级」（宿主可据此告警一次，而不必自己去数次数）。
+    read_degraded: AtomicBool,
 }
 
 impl SharedStore {
@@ -76,6 +85,158 @@ impl SharedStore {
             .map_err(|e| format!("数据会话创建失败：{e}"))?;
         f(&self.dal, session.as_mut()).map_err(|e| e.to_string())
     }
+
+    /// **只读**会话：与写路径互斥锁无关（SQLite/WAL 允许 1 写 N 读）。
+    ///
+    /// 面板查询 / 设备认证这类纯读请求走这里，不再被一次上万行的批量写堵住；
+    /// 写路径仍然单写者串行（SQLite 只允许一个写者，这一点不能变）。
+    ///
+    /// 安全约束：
+    /// - 只读连接带 `PRAGMA query_only=ON`，**写 SQL 会直接报错**（不会偷偷写进库）；
+    /// - 只对 **SQLite 文件库** 生效：`Data Source=:memory:` / `mode=memory` 下每个连接是
+    ///   独立数据库，不能开池（否则读到空库）；DuckDB / 网络库保持原行为；
+    /// - 池不可用（如 `-shm` 无法创建、权限不足）时**自动退回串行会话**，
+    ///   即“优化失效但功能不受影响”，并计入 [`SharedStore::read_fallback_count`]。
+    ///
+    /// # 参数
+    /// - `f`：会话回调（只能发查询；写入会报错）。
+    ///
+    /// # 返回值
+    /// 回调结果（错误转字符串）。
+    pub fn with_read_session<F, R>(&self, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&Dal, &mut dyn SqlSession) -> crate::Result<R>,
+    {
+        let Some(pool) = &self.reads else {
+            // 不适用读写分离：行为与旧版完全一致
+            return if matches!(self.dal.kind(), DatabaseKind::Sqlite | DatabaseKind::DuckDb) {
+                self.with_session(f)
+            } else {
+                self.with_session_concurrent(f)
+            };
+        };
+        let mut session = match pool.checkout(&self.dal) {
+            Ok(session) => session,
+            Err(_) => {
+                // 只读连接建不起来：退回串行会话（宁可慢，不能因为“优化”让读请求失败）
+                self.read_fallbacks.fetch_add(1, Ordering::Relaxed);
+                self.read_degraded.store(true, Ordering::Relaxed);
+                return if matches!(self.dal.kind(), DatabaseKind::Sqlite | DatabaseKind::DuckDb) {
+                    self.with_session(f)
+                } else {
+                    self.with_session_concurrent(f)
+                };
+            }
+        };
+        let out = f(&self.dal, session.as_mut());
+        pool.checkin(session);
+        out.map_err(|e| e.to_string())
+    }
+
+    /// 只读池失效退回串行会话的次数（运维观察用；持续增长说明只读连接打不开）。
+    ///
+    /// # 返回值
+    /// 累计次数。
+    pub fn read_fallback_count(&self) -> u64 {
+        self.read_fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// 是否发生过「只读池降级」（只读连接建不起来，已退回串行会话）。
+    ///
+    /// 宿主可在面板/日志里拿它做一次性告警，不必自己计数。
+    ///
+    /// # 返回值
+    /// 降级过返回 `true`。
+    pub fn read_degraded(&self) -> bool {
+        self.read_degraded.load(Ordering::Relaxed)
+    }
+}
+
+/// 只读会话池（SQLite/WAL）。
+///
+/// 设计取舍：
+/// - 空闲会话待在池里复用（建连 + 编译语句都有成本），上限 [`default_read_pool_size`]；
+/// - 池满时**阻塞等**空位（`Condvar`）——这里不丢读请求，只排队；
+/// - 会话建连失败时立即释放名额并把错误交给调用方（调用方会退回串行会话）。
+struct ReadPool {
+    state: Mutex<ReadPoolState>,
+    wait: Condvar,
+}
+
+struct ReadPoolState {
+    idle: Vec<Box<dyn SqlSession>>,
+    /// 已创建（含借出）的会话数。
+    created: usize,
+    /// 上限。
+    max: usize,
+}
+
+impl ReadPool {
+    fn new(max: usize) -> Self {
+        Self {
+            state: Mutex::new(ReadPoolState {
+                idle: Vec::new(),
+                created: 0,
+                max: max.max(1),
+            }),
+            wait: Condvar::new(),
+        }
+    }
+
+    fn checkout(&self, dal: &Dal) -> Result<Box<dyn SqlSession>, String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(session) = state.idle.pop() {
+                return Ok(session);
+            }
+            if state.created < state.max {
+                state.created += 1;
+                drop(state);
+                match dal.open_read_session() {
+                    Ok(session) => return Ok(session),
+                    Err(e) => {
+                        // 建连失败：把名额退回去，再通知可能在等的人
+                        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.created = state.created.saturating_sub(1);
+                        self.wait.notify_one();
+                        return Err(format!("创建只读会话失败：{e}"));
+                    }
+                }
+            }
+            state = self.wait.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn checkin(&self, session: Box<dyn SqlSession>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.idle.push(session);
+        drop(state);
+        self.wait.notify_one();
+    }
+}
+
+/// 默认只读池大小：CPU 核数（2~8）。读请求通常很短，不需要与核数同量级的连接。
+fn default_read_pool_size() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 8)
+}
+
+/// 该库是否适合开只读池（仅 SQLite 文件库：内存库每个连接是**独立数据库**，开池会读到空表）。
+fn read_pool_for(dal: &Dal) -> Option<ReadPool> {
+    if dal.kind() != DatabaseKind::Sqlite || dal.is_readonly() {
+        return None;
+    }
+    let source = dal.connection_string().data_source()?.trim().to_string();
+    if source.is_empty() {
+        return None;
+    }
+    let lower = source.to_ascii_lowercase();
+    if lower == ":memory:" || lower.contains("mode=memory") {
+        return None;
+    }
+    Some(ReadPool::new(default_read_pool_size()))
 }
 
 /// 注册表：（数据目录 + 作用域名）→ 共享存储（同一目录可承载多个逻辑库，如多数据源连接的多个文件）。
@@ -118,8 +279,11 @@ where
     let dal = open()?;
     let store = Arc::new(SharedStore {
         base: key.0.clone(),
+        reads: read_pool_for(&dal),
         dal,
         lock: Mutex::new(()),
+        read_fallbacks: AtomicU64::new(0),
+        read_degraded: AtomicBool::new(false),
     });
     registry.insert(key, store.clone());
     Ok((store, true))
@@ -233,9 +397,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 只读会话：**读得到已提交的写**，但写 SQL 必须被数据库层拒绝（`query_only`）。
     #[test]
-    fn reopen_after_drop_runs_open_again() {
-        let dir = temp_dir("reopen");
+    fn read_session_sees_committed_rows_but_cannot_write() {
+        let dir = temp_dir("read");
+        let (store, _) = get_or_open(&dir, || open_dal(&dir)).unwrap();
+
+        store
+            .with_session(|_dal, session| {
+                session.execute("create table t (id integer primary key, v text)", &[])?;
+                session.execute("insert into t (id, v) values (1, 'a')", &[])?;
+                Ok(())
+            })
+            .unwrap();
+
+        // 只读会话能看到写连接已提交的数据
+        let n = store
+            .with_read_session(|_dal, session| {
+                let rs = session.query("select count(*) as n from t", &[])?;
+                Ok(rs
+                    .first()
+                    .and_then(|r| r.get_by_name("n"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0))
+            })
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // 只读会话写库必须报错（PRAGMA query_only=ON）
+        let write = store.with_read_session(|_dal, session| {
+            session.execute("insert into t (id, v) values (2, 'b')", &[])
+        });
+        assert!(write.is_err(), "只读连接上写库必须失败，实际：{write:?}");
+
+        // 内存库不适合只读池（每个连接是独立数据库）
+        let mem = Dal::open("Data Source=:memory:;Provider=SQLite").unwrap();
+        assert!(read_pool_for(&mem).is_none(), "内存库不得开只读池");
+
+        drop_for_test(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写会话被长时间占用时，只读会话**不该被阻塞**（这就是读写分离的目的）。
+    #[test]
+    fn read_session_is_not_blocked_by_long_write() {
+        let dir = temp_dir("rwsplit");
+        let (store, _) = get_or_open(&dir, || open_dal(&dir)).unwrap();
+        store
+            .with_session(|_dal, session| {
+                session.execute("create table t (id integer primary key, v text)", &[])?;
+                Ok(())
+            })
+            .unwrap();
+
+        // 后台占住写会话 300ms（模拟一次大事务）
+        let holder = store.clone();
+        let started = Arc::new(AtomicUsize::new(0));
+        let flag = started.clone();
+        let handle = std::thread::spawn(move || {
+            holder
+                .with_session(|_dal, session| {
+                    flag.store(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    session.execute("insert into t (id, v) values (1, 'a')", &[])
+                })
+                .unwrap();
+        });
+        // 等写会话真的被占住
+        while started.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let t0 = std::time::Instant::now();
+        store
+            .with_read_session(|_dal, session| {
+                session.query("select count(*) as n from t", &[])?;
+                Ok(())
+            })
+            .unwrap();
+        let elapsed = t0.elapsed();
+        handle.join().unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "只读会话被写会话阻塞了（{elapsed:?}），读写分离没生效"
+        );
+
+        drop_for_test(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_after_drop_runs_open_again() {        let dir = temp_dir("reopen");
         let (_, created1) = get_or_open(&dir, || open_dal(&dir)).unwrap();
         assert!(created1);
         drop_for_test(&dir);
