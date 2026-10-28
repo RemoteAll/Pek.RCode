@@ -243,6 +243,11 @@ pub struct DbClient {
     pub token: Option<String>,
     /// 请求超时。
     pub timeout: Duration,
+    /// 出站 `User-Agent`（`None` = 不发送）。
+    ///
+    /// 部分服务端 WAF 的 `block_empty_ua` 开关会拒绝无 UA 的机器请求，
+    /// 工具/Agent 类消费方建议显式设置（如 `pek-rdbproxy-tool/0.1.0`）。
+    pub user_agent: Option<String>,
 }
 
 impl DbClient {
@@ -256,7 +261,15 @@ impl DbClient {
             db: db.into(),
             token: token.map(str::to_string),
             timeout: DEFAULT_TIMEOUT,
+            user_agent: None,
         }
+    }
+
+    /// 设置出站 `User-Agent`（建造器风格，便于链式调用）。
+    /// <param name="user_agent">UA 字符串</param>
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
+        self
     }
 
     /// 从 XCode 风格连接串构造（`Server`/`Database`/`Password` 三键；供 `provider=network` 驱动）。
@@ -277,7 +290,13 @@ impl DbClient {
     /// <returns>登录信息</returns>
     pub fn login(&self) -> Result<LoginInfo> {
         let body = json!({ "db": self.db, "token": self.token }).to_string();
-        let text = http::post_json(&self.url("Db/Login"), &body, None, self.timeout)?;
+        let text = http::post_json_ua(
+            &self.url("Db/Login"),
+            &body,
+            None,
+            self.timeout,
+            self.user_agent.as_deref(),
+        )?;
         let data = parse_envelope(&text)?;
         Ok(LoginInfo {
             db_type: get_str_field(&data, &["dbType", "DbType"]),
@@ -294,12 +313,13 @@ impl DbClient {
     /// <returns>结果集</returns>
     pub fn query_rowset(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<RowSet> {
         let args = self.build_args(sql, parameters);
-        let bytes = http::post_bytes(
+        let bytes = http::post_bytes_ua(
             &self.url("Db/Query"),
             &args.to_string(),
             true,
             None,
             self.timeout,
+            self.user_agent.as_deref(),
         )?;
         if bytes.is_empty() {
             return Ok(RowSet::new(Vec::new()));
@@ -327,7 +347,13 @@ impl DbClient {
     /// <returns>受影响行数</returns>
     pub fn execute(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<i64> {
         let args = self.build_args(sql, parameters);
-        let text = http::post_json(&self.url("Db/Execute"), &args.to_string(), None, self.timeout)?;
+        let text = http::post_json_ua(
+            &self.url("Db/Execute"),
+            &args.to_string(),
+            None,
+            self.timeout,
+            self.user_agent.as_deref(),
+        )?;
         parse_envelope_i64(&text)
     }
 
@@ -337,11 +363,12 @@ impl DbClient {
     /// <returns>自增主键值</returns>
     pub fn insert_and_get_identity(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<i64> {
         let args = self.build_args(sql, parameters);
-        let text = http::post_json(
+        let text = http::post_json_ua(
             &self.url("Db/InsertAndGetIdentity"),
             &args.to_string(),
             None,
             self.timeout,
+            self.user_agent.as_deref(),
         )?;
         parse_envelope_i64(&text)
     }
@@ -357,7 +384,7 @@ impl DbClient {
             percent_encode(&self.db),
             percent_encode(self.token.as_deref().unwrap_or_default())
         );
-        let text = http::get_text(&url, None, self.timeout)?;
+        let text = http::get_text_ua(&url, None, self.timeout, self.user_agent.as_deref())?;
         parse_envelope_i64(&text)
     }
 
@@ -370,7 +397,7 @@ impl DbClient {
             percent_encode(&self.db),
             percent_encode(self.token.as_deref().unwrap_or_default())
         );
-        let text = http::get_text(&url, None, self.timeout)?;
+        let text = http::get_text_ua(&url, None, self.timeout, self.user_agent.as_deref())?;
         parse_envelope(&text)
     }
 
