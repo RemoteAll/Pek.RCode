@@ -248,6 +248,11 @@ pub struct DbClient {
     /// 部分服务端 WAF 的 `block_empty_ua` 开关会拒绝无 UA 的机器请求，
     /// 工具/Agent 类消费方建议显式设置（如 `pek-rdbproxy-tool/0.1.0`）。
     pub user_agent: Option<String>,
+    /// 用户令牌（`Authorization: Bearer`）；`None` = 不发送。
+    ///
+    /// 代理按此识别“谁在调数据”，并据此做按用户/按数据源的权限控制；
+    /// 不传时保持旧行为（仅数据源令牌）。
+    pub bearer: Option<String>,
 }
 
 impl DbClient {
@@ -262,6 +267,7 @@ impl DbClient {
             token: token.map(str::to_string),
             timeout: DEFAULT_TIMEOUT,
             user_agent: None,
+            bearer: None,
         }
     }
 
@@ -269,6 +275,13 @@ impl DbClient {
     /// <param name="user_agent">UA 字符串</param>
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = Some(user_agent.into());
+        self
+    }
+
+    /// 设置用户令牌（`Authorization: Bearer`）。
+    /// <param name="token">登录拿到的 JWT</param>
+    pub fn with_bearer(mut self, token: impl Into<String>) -> Self {
+        self.bearer = Some(token.into());
         self
     }
 
@@ -290,10 +303,11 @@ impl DbClient {
     /// <returns>登录信息</returns>
     pub fn login(&self) -> Result<LoginInfo> {
         let body = json!({ "db": self.db, "token": self.token }).to_string();
-        let text = http::post_json_ua(
+        let text = http::post_json_auth(
             &self.url("Db/Login"),
             &body,
             None,
+            self.bearer.as_deref(),
             self.timeout,
             self.user_agent.as_deref(),
         )?;
@@ -313,11 +327,12 @@ impl DbClient {
     /// <returns>结果集</returns>
     pub fn query_rowset(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<RowSet> {
         let args = self.build_args(sql, parameters);
-        let bytes = http::post_bytes_ua(
+        let bytes = http::post_bytes_auth(
             &self.url("Db/Query"),
             &args.to_string(),
             true,
             None,
+            self.bearer.as_deref(),
             self.timeout,
             self.user_agent.as_deref(),
         )?;
@@ -347,10 +362,11 @@ impl DbClient {
     /// <returns>受影响行数</returns>
     pub fn execute(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<i64> {
         let args = self.build_args(sql, parameters);
-        let text = http::post_json_ua(
+        let text = http::post_json_auth(
             &self.url("Db/Execute"),
             &args.to_string(),
             None,
+            self.bearer.as_deref(),
             self.timeout,
             self.user_agent.as_deref(),
         )?;
@@ -363,10 +379,11 @@ impl DbClient {
     /// <returns>自增主键值</returns>
     pub fn insert_and_get_identity(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<i64> {
         let args = self.build_args(sql, parameters);
-        let text = http::post_json_ua(
+        let text = http::post_json_auth(
             &self.url("Db/InsertAndGetIdentity"),
             &args.to_string(),
             None,
+            self.bearer.as_deref(),
             self.timeout,
             self.user_agent.as_deref(),
         )?;
@@ -384,7 +401,13 @@ impl DbClient {
             percent_encode(&self.db),
             percent_encode(self.token.as_deref().unwrap_or_default())
         );
-        let text = http::get_text_ua(&url, None, self.timeout, self.user_agent.as_deref())?;
+        let text = http::get_text_auth(
+            &url,
+            None,
+            self.bearer.as_deref(),
+            self.timeout,
+            self.user_agent.as_deref(),
+        )?;
         parse_envelope_i64(&text)
     }
 
@@ -397,7 +420,13 @@ impl DbClient {
             percent_encode(&self.db),
             percent_encode(self.token.as_deref().unwrap_or_default())
         );
-        let text = http::get_text_ua(&url, None, self.timeout, self.user_agent.as_deref())?;
+        let text = http::get_text_auth(
+            &url,
+            None,
+            self.bearer.as_deref(),
+            self.timeout,
+            self.user_agent.as_deref(),
+        )?;
         parse_envelope(&text)
     }
 

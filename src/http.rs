@@ -126,7 +126,7 @@ fn agent(timeout: Duration) -> ureq::Agent {
 
 /// 发送 HTTP 请求（POST 文本），返回响应体文本；非 2xx 时给出带响应体的错误。
 pub fn post_text(url: &str, body: &str, auth: Option<(&str, &str)>, timeout: Duration) -> Result<String> {
-    post_text_ua(url, body, auth, timeout, None)
+    send_post(url, body, "text/plain; charset=utf-8", auth, None, timeout, None)
 }
 
 /// 同 [`post_text`]，可携带 `User-Agent`（`None` = 不发送该头）。
@@ -137,12 +137,12 @@ pub fn post_text_ua(
     timeout: Duration,
     user_agent: Option<&str>,
 ) -> Result<String> {
-    send_post(url, body, "text/plain; charset=utf-8", auth, timeout, user_agent)
+    send_post(url, body, "text/plain; charset=utf-8", auth, None, timeout, user_agent)
 }
 
 /// 发送 HTTP 请求（POST JSON），返回响应体文本；非 2xx 时给出带响应体的错误。
 pub fn post_json(url: &str, body: &str, auth: Option<(&str, &str)>, timeout: Duration) -> Result<String> {
-    post_json_ua(url, body, auth, timeout, None)
+    send_post(url, body, "application/json; charset=utf-8", auth, None, timeout, None)
 }
 
 /// 同 [`post_json`]，可携带 `User-Agent`（`None` = 不发送该头）。
@@ -153,7 +153,29 @@ pub fn post_json_ua(
     timeout: Duration,
     user_agent: Option<&str>,
 ) -> Result<String> {
-    send_post(url, body, "application/json; charset=utf-8", auth, timeout, user_agent)
+    send_post(url, body, "application/json; charset=utf-8", auth, None, timeout, user_agent)
+}
+
+/// 同 [`post_json`]，可携带 **Bearer 令牌**（代理按用户身份放行）与 `User-Agent`。
+///
+/// <param name="bearer">`Authorization: Bearer <令牌>`；`None` = 不发送</param>
+pub fn post_json_auth(
+    url: &str,
+    body: &str,
+    auth: Option<(&str, &str)>,
+    bearer: Option<&str>,
+    timeout: Duration,
+    user_agent: Option<&str>,
+) -> Result<String> {
+    send_post(
+        url,
+        body,
+        "application/json; charset=utf-8",
+        auth,
+        bearer,
+        timeout,
+        user_agent,
+    )
 }
 
 /// 发送 HTTP 请求（POST JSON 体），返回响应体**原始字节**（用于二进制协议应答）。
@@ -167,7 +189,7 @@ pub fn post_bytes(
     auth: Option<(&str, &str)>,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    post_bytes_ua(url, body, accept_octet_stream, auth, timeout, None)
+    post_bytes_auth(url, body, accept_octet_stream, auth, None, timeout, None)
 }
 
 /// 同 [`post_bytes`]，可携带 `User-Agent`（`None` = 不发送该头）。
@@ -176,6 +198,19 @@ pub fn post_bytes_ua(
     body: &str,
     accept_octet_stream: bool,
     auth: Option<(&str, &str)>,
+    timeout: Duration,
+    user_agent: Option<&str>,
+) -> Result<Vec<u8>> {
+    post_bytes_auth(url, body, accept_octet_stream, auth, None, timeout, user_agent)
+}
+
+/// 同 [`post_bytes`]，可携带 **Bearer 令牌**与 `User-Agent`。
+pub fn post_bytes_auth(
+    url: &str,
+    body: &str,
+    accept_octet_stream: bool,
+    auth: Option<(&str, &str)>,
+    bearer: Option<&str>,
     timeout: Duration,
     user_agent: Option<&str>,
 ) -> Result<Vec<u8>> {
@@ -188,6 +223,9 @@ pub fn post_bytes_ua(
     }
     if let Some(ua) = user_agent {
         request = request.header("User-Agent", ua);
+    }
+    if let Some(token) = bearer {
+        request = request.header("Authorization", &format!("Bearer {token}"));
     }
 
     if let Some((user, password)) = auth {
@@ -216,6 +254,7 @@ fn send_post(
     body: &str,
     content_type: &str,
     auth: Option<(&str, &str)>,
+    bearer: Option<&str>,
     timeout: Duration,
     user_agent: Option<&str>,
 ) -> Result<String> {
@@ -223,6 +262,9 @@ fn send_post(
     let mut request = agent.post(url).header("Content-Type", content_type);
     if let Some(ua) = user_agent {
         request = request.header("User-Agent", ua);
+    }
+    if let Some(token) = bearer {
+        request = request.header("Authorization", &format!("Bearer {token}"));
     }
 
     if let Some((user, password)) = auth {
@@ -246,7 +288,7 @@ fn send_post(
 
 /// 发送 HTTP GET，返回响应体文本。
 pub fn get_text(url: &str, auth: Option<(&str, &str)>, timeout: Duration) -> Result<String> {
-    get_text_ua(url, auth, timeout, None)
+    get_text_auth(url, auth, None, timeout, None)
 }
 
 /// 同 [`get_text`]，可携带 `User-Agent`（`None` = 不发送该头）。
@@ -256,10 +298,45 @@ pub fn get_text_ua(
     timeout: Duration,
     user_agent: Option<&str>,
 ) -> Result<String> {
+    get_text_auth(url, auth, None, timeout, user_agent)
+}
+
+/// 同 [`get_text`]，可携带 **Bearer 令牌**与 `User-Agent`。
+pub fn get_text_auth(
+    url: &str,
+    auth: Option<(&str, &str)>,
+    bearer: Option<&str>,
+    timeout: Duration,
+    user_agent: Option<&str>,
+) -> Result<String> {
+    let bytes = get_bytes_auth(url, auth, bearer, timeout, user_agent)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// 发送 HTTP GET，返回响应体**原始字节**（下载升级包/图片等二进制内容）。
+pub fn get_bytes(
+    url: &str,
+    auth: Option<(&str, &str)>,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    get_bytes_auth(url, auth, None, timeout, None)
+}
+
+/// 同 [`get_bytes`]，可携带 **Bearer 令牌**与 `User-Agent`。
+pub fn get_bytes_auth(
+    url: &str,
+    auth: Option<(&str, &str)>,
+    bearer: Option<&str>,
+    timeout: Duration,
+    user_agent: Option<&str>,
+) -> Result<Vec<u8>> {
     let agent = agent(timeout);
     let mut request = agent.get(url);
     if let Some(ua) = user_agent {
         request = request.header("User-Agent", ua);
+    }
+    if let Some(token) = bearer {
+        request = request.header("Authorization", &format!("Bearer {token}"));
     }
 
     if let Some((user, password)) = auth {
@@ -271,14 +348,15 @@ pub fn get_text_ua(
         .call()
         .map_err(|e| Error::Db(format!("HTTP 请求失败：{e}")))?;
     let status = response.status();
-    let text = response
+    let bytes = response
         .body_mut()
-        .read_to_string()
+        .read_to_vec()
         .map_err(|e| Error::Db(format!("读取 HTTP 响应失败：{e}")))?;
     if !status.is_success() {
+        let text = String::from_utf8_lossy(&bytes);
         return Err(Error::Db(format!("HTTP {}：{}", status.as_u16(), text.trim())));
     }
-    Ok(text)
+    Ok(bytes)
 }
 
 /// Base64 编码（Basic 认证用）——实现已下沉 `dhrust::sign::base64_encode`（2026-10-09 收编；
