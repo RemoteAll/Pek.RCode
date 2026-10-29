@@ -238,7 +238,9 @@ let dal = Dal::open_with_model(
 - VastBase（海量）：`provider=vastbase`（驱动组件 `dbserver-vastbase`）。连接串支持 `Search Path`/`SearchPath`/`Current Schema`（经连接参数下发，`current_schema()` 与表结构探测跟随该 schema）；建库语句为 `Create Database "x"`（内核不支持 `IF NOT EXISTS`/`ENCODING`，对齐 C# `VastBaseMetaData`）
 - 自增回写：PostgreSQL 用 `INSERT ... RETURNING`（对齐 DH.NCode 的 `RETURNING *`）；SQL Server 用 `SCOPE_IDENTITY()`；
   Oracle 用序列 `SEQ_{表名}`（建表/同步结构时自动创建，插入时写 `NEXTVAL`、随后读 `CURRVAL`）
-- 事务：PostgreSQL/MySQL/SQL Server 显式 `BEGIN`；Oracle 隐式事务（`begin()` 为空操作）
+- 事务：PostgreSQL/MySQL/SQL Server 显式 `BEGIN`；Oracle 隐式事务（`begin()` 为空操作）；
+  **`network` 也支持真事务**（`Db/Begin` → `Db/Commit`/`Db/Rollback`，服务端把语句固定到同一条会话，
+  因此事务内可读自己的写、可拿未提交的自增值；远端是 C# `DbServer` 时自动降级为“不支持”）
 - 真实库端到端测试（各库默认自动跳过；只创建/删除 `rcode_test_` 前缀的专用对象）：
 
 ```powershell
@@ -267,7 +269,7 @@ DH.NCode 内置的其余数据库均已接入，按 `provider` 分发：
 | `db2` / `dameng` / `iris` / `access` | `Driver={...};...` 直通 ODBC；或 XCode 风格模板（缺省巴适） | 经 odbc-api 桥接本机 ODBC 驱动 |
 | `mongodb` | `Server=..;Port=27017;Database=..`（或 `Uri=mongodb://...`） | SQL 子集翻译为文档操作；无 DDL（`sync_schema` 自动跳过） |
 | `nova` | 同 MySQL | NovaDb 走 MySQL 协议（声明为 MySql 驱动） |
-| `network` | `Server=http://..;Database=连接名;Password=令牌` | SQL 转发到远端 XCode DbServer（C# `DbServer` 或本仓 `examples/dbserver`）；打开即登录探明远端类型（占位符/分页按远端方言）；无事务转发、无本地结构迁移 |
+| `network` | `Server=http://..;Database=连接名;Password=令牌` | SQL 转发到远端 XCode DbServer（C# `DbServer` 或本仓 `examples/dbserver`）；打开即登录探明远端类型（占位符/分页按远端方言）；**事务已支持**（`Db/Begin`→`Db/Commit`/`Db/Rollback`，服务端固定一条会话；C# 服务端无此路由时自动降级为“不支持”）；无本地结构迁移 |
 | `sqlce` | — | 明确不支持（SSCE 已停止维护） |
 
 - 这些库的方言（类型/DDL/分页/自增/引用）与连接串解析均已有单测；网络型驱动另单测覆盖值转换与语句翻译

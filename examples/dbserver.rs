@@ -10,6 +10,14 @@
 //! | `/Db/InsertAndGetIdentity` | POST | 插入并返回自增 ID，返回 `{data: id}` |
 //! | `/Db/QueryCount` | GET | 单表记录数（`tableName`/`db`/`token`），返回 `{data: n}` |
 //! | `/Db/GetTables` | GET | 表结构（`db`/`token`），返回 `[{Name, Columns:[{Name}]}]` |
+//! | `/Db/Begin` | POST | 开启事务（`{db, token}`），返回 `{data: "<事务令牌>"}` |
+//! | `/Db/Commit` | POST | 提交事务（`{db, token, tx}`） |
+//! | `/Db/Rollback` | POST | 回滚事务（`{db, token, tx}`） |
+//!
+//! 事务：`Db/Begin` 会**固定一条会话**（`begin()`），`Db/Query`/`Db/Execute`/
+//! `Db/InsertAndGetIdentity` 带上 `tx` 字段就会路由到这条会话 → **真事务**
+//! （可 rollback、可读自己的写、事务内能拿到未提交的自增值）。
+//! 空闲超时（默认 60 秒）自动回滚并释放连接，防止调用方崩溃后占住连接。
 //!
 //! 运行：
 //!
@@ -187,7 +195,9 @@ fn handle(mut stream: TcpStream, dal: &Dal, service: &DbService) -> std::io::Res
             }
             let sql = arg_str(&args, "sql");
             let parameters = arg_parameters(&args);
-            match service.query_packet(dal, &sql, parameters.as_ref()) {
+            let tx_owned = arg_str(&args, "tx");
+            let tx = Some(tx_owned.as_str()).filter(|s| !s.trim().is_empty());
+            match service.query_packet_in(dal, tx, &sql, parameters.as_ref()) {
                 Ok(packet) => respond(&mut stream, 200, "application/octet-stream", &packet),
                 Err(e) => respond_error(&mut stream, 500, &e.to_string()),
             }
@@ -201,7 +211,9 @@ fn handle(mut stream: TcpStream, dal: &Dal, service: &DbService) -> std::io::Res
             }
             let sql = arg_str(&args, "sql");
             let parameters = arg_parameters(&args);
-            match service.execute(dal, &sql, parameters.as_ref()) {
+            let tx_owned = arg_str(&args, "tx");
+            let tx = Some(tx_owned.as_str()).filter(|s| !s.trim().is_empty());
+            match service.execute_in(dal, tx, &sql, parameters.as_ref()) {
                 Ok(n) => respond_json(&mut stream, 200, &json!({ "data": n })),
                 Err(e) => respond_error(&mut stream, 500, &e.to_string()),
             }
@@ -215,8 +227,41 @@ fn handle(mut stream: TcpStream, dal: &Dal, service: &DbService) -> std::io::Res
             }
             let sql = arg_str(&args, "sql");
             let parameters = arg_parameters(&args);
-            match service.insert_and_get_identity(dal, &sql, parameters.as_ref()) {
+            let tx_owned = arg_str(&args, "tx");
+            let tx = Some(tx_owned.as_str()).filter(|s| !s.trim().is_empty());
+            match service.insert_and_get_identity_in(dal, tx, &sql, parameters.as_ref()) {
                 Ok(id) => respond_json(&mut stream, 200, &json!({ "data": id })),
+                Err(e) => respond_error(&mut stream, 500, &e.to_string()),
+            }
+        }
+        // ── 事务（C# DbServer 没有这三个路由；Rust 客户端会自动探测/回退）
+        ("POST", "/Db/Begin") => {
+            let args = parse_json_body(&body);
+            let db = arg_str(&args, "db");
+            let token = arg_str(&args, "token");
+            if let Err(e) = service.validate_token(&token, &db) {
+                return respond_error(&mut stream, 401, &e.to_string());
+            }
+            match service.begin_tx(dal, &db) {
+                Ok(tx) => respond_json(&mut stream, 200, &json!({ "data": tx })),
+                Err(e) => respond_error(&mut stream, 500, &e.to_string()),
+            }
+        }
+        ("POST", "/Db/Commit") | ("POST", "/Db/Rollback") => {
+            let args = parse_json_body(&body);
+            let db = arg_str(&args, "db");
+            let token = arg_str(&args, "token");
+            if let Err(e) = service.validate_token(&token, &db) {
+                return respond_error(&mut stream, 401, &e.to_string());
+            }
+            let tx = arg_str(&args, "tx");
+            let r = if path == "/Db/Commit" {
+                service.commit_tx(&db, &tx)
+            } else {
+                service.rollback_tx(&db, &tx)
+            };
+            match r {
+                Ok(()) => respond_json(&mut stream, 200, &json!({ "data": 1 })),
                 Err(e) => respond_error(&mut stream, 500, &e.to_string()),
             }
         }

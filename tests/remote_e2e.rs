@@ -352,7 +352,7 @@ fn oracle_roundtrip_when_configured() {
     run_roundtrip(&dal);
 }
 
-/// network 驱动全链路（不包含建表迁移与事务：网络协议未提供，语义对齐 C# `Network.cs`）。
+/// network 驱动全链路（不含建表迁移；事务自 2026-10-29 起**支持**）。
 fn run_network_roundtrip(dal: &Dal) {
     let mut session = dal.open_session().unwrap();
 
@@ -439,8 +439,48 @@ fn run_network_roundtrip(dal: &Dal) {
     // 6) delete
     assert_eq!(reloaded.delete(dal, session.as_mut()).unwrap(), 1);
 
-    // 7) 事务：网络协议未提供，明确报错（对齐 C# `Network` 无法真正生效的事务）
-    assert!(session.begin().is_err(), "network 驱动应明确拒绝事务");
+    // 7) 事务：Rust 宿主（`examples/dbserver`）提供 `Db/Begin/Commit/Rollback` → 真事务；
+    //    C# `DbServer` 没有这三个路由 → `begin()` 返回 Unsupported（跳过，不算失败）
+    assert_eq!(RCodeTestItem::count(dal, session.as_mut(), None).unwrap(), 1);
+    match session.begin() {
+        Err(e) => {
+            eprintln!("跳过事务断言：远端不支持事务（{e}）——C# DbServer 无 Db/Begin 路由");
+        }
+        Ok(()) => {
+            // 回滚：事务内的写必须消失；且**事务内能读到自己未提交的写**
+            // （每一步都是独立 HTTP 请求，能读到就证明远端把语句路由到了同一条固定会话）
+            let mut doomed = RCodeTestItem {
+                code: "tx-rollback".into(),
+                ..RCodeTestItem::new()
+            };
+            doomed.insert(dal, session.as_mut()).unwrap();
+            assert_eq!(
+                RCodeTestItem::count(dal, session.as_mut(), None).unwrap(),
+                2,
+                "事务内应读到自己未提交的写（证明会话被固定）"
+            );
+            session.rollback().unwrap();
+            assert_eq!(
+                RCodeTestItem::count(dal, session.as_mut(), None).unwrap(),
+                1,
+                "回滚后不应留下数据"
+            );
+
+            // 提交：事务内的写要持久化
+            session.begin().unwrap();
+            let mut kept = RCodeTestItem {
+                code: "tx-commit".into(),
+                ..RCodeTestItem::new()
+            };
+            kept.insert(dal, session.as_mut()).unwrap();
+            session.commit().unwrap();
+            assert_eq!(
+                RCodeTestItem::count(dal, session.as_mut(), None).unwrap(),
+                2,
+                "提交后数据应持久化"
+            );
+        }
+    }
 }
 
 #[test]

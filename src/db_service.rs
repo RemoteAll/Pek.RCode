@@ -8,6 +8,16 @@
 //!   `POST Db/Login`、`POST Db/Query`、`POST Db/Execute`、`POST Db/InsertAndGetIdentity`、
 //!   `GET Db/QueryCount`、`GET Db/GetTables`；响应采用 NewLife 信封 `{code, data, msg}`。
 //!
+//! ## 事务（2026-10-29 新增，C# 无对应路由）
+//!
+//! `POST Db/Begin` → 返回事务令牌；`POST Db/Commit` / `POST Db/Rollback` 携带令牌结束事务。
+//! 带令牌的 `Db/Query` / `Db/Execute` / `Db/InsertAndGetIdentity` 在**开事务时固定的那条会话**上执行，
+//! 所以是**真事务**（可回滚、可读自己的写、可拿未提交的自增值）。
+//!
+//! - **不破坏 C#**：C# `DbServer` 没这三个路由，C# 客户端也不会调；Rust 客户端连 C# 时拿到 404
+//!   → 降级为 `Unsupported`（与旧行为一致）。
+//! - **防泄漏**：客户端会话 `Drop` 尽力回滚 + 服务端空闲超时（默认 60 秒）自动回滚回收。
+//!
 //! 与 C# 的协议互通：
 //! - `POST Db/Query` 的应答为 **DbTable v3 二进制**（[`crate::dbtable`]），与 C#
 //!   `DbController.Query` 的 `rs.ToPacket()` 一致：C# `DbClient.QueryAsync` 可直接解析，
@@ -20,7 +30,11 @@
 //!   按字典键序（字母序）兼容绑定（见 `bind_forwarded`）。
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -29,7 +43,7 @@ use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
 use crate::http;
 use crate::model::TableMeta;
-use crate::session::RowSet;
+use crate::session::{RowSet, SqlSession};
 use crate::value::DbValue;
 
 /// 默认请求超时。
@@ -56,6 +70,132 @@ pub struct LoginInfo {
     pub version: String,
 }
 
+/// 事务槽：一条被「固定住」的会话。
+///
+/// 为什么需要固定：`provider=network` 是**无状态 HTTP**，而事务要求「BEGIN 之后的语句必须落在
+/// 同一条数据库连接上」。服务端因此在 `Db/Begin` 时从连接池取一条会话并 `begin()`，
+/// 之后的语句凭令牌路由到这条会话，直到 `Db/Commit` / `Db/Rollback`。
+struct TxSlot {
+    /// 被固定的会话（已 `begin()`）。
+    ///
+    /// 加锁是为了**串行化**：同一事务内的语句不允许并发混插（否则语义就乱了）。
+    session: Mutex<Box<dyn SqlSession>>,
+    /// 最近一次使用时刻（用于空闲超时回收）。
+    last_used: Mutex<Instant>,
+    /// 归属的数据源名（防止拿 A 库的事务令牌去操作 B 库）。
+    db: String,
+}
+
+/// 事务注册表（[`DbService`] 内部状态）。
+///
+/// **防泄漏设计**（这是 `provider=network` 事务最容易出事的地方）：
+/// - 调用方崩溃 / 忘了 commit / `?` 提前返回 → 客户端 `Drop` 会尽力回滚；
+/// - 客户端连回滚都发不出去（进程被杀）→ 服务端惰性清扫：任何事务相关请求最多每 1 秒扫一次，
+///   空闲超过 `timeout`（默认 60 秒）的事务自动 `rollback` 并释放连接；
+/// - 清扫只 `try_lock` 会话：正在跑语句的不动，下一轮再收。
+#[derive(Default)]
+pub struct TxRegistry {
+    map: Mutex<HashMap<String, Arc<TxSlot>>>,
+    /// 最近一次清扫时刻（惰性清扫，不需要后台线程，也不用要求宿主定时调用）。
+    last_sweep: Mutex<Option<Instant>>,
+    /// 空闲超时秒数（<=0 视为 1）。
+    timeout_secs: AtomicU64,
+}
+
+impl fmt::Debug for TxRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let active = self.map.lock().map(|m| m.len()).unwrap_or(0);
+        write!(f, "TxRegistry(active={active}, timeout={}s)", self.timeout().as_secs())
+    }
+}
+
+impl TxRegistry {
+    /// 默认空闲超时（秒）。
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
+    /// 清扫最小间隔。
+    const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// 当前空闲超时。
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.load(Ordering::Relaxed).max(1))
+    }
+
+    /// 设置空闲超时（秒）。
+    /// <param name="secs">秒数（<=0 视为 1）</param>
+    pub fn set_timeout(&self, secs: u64) {
+        self.timeout_secs.store(secs.max(1), Ordering::Relaxed);
+    }
+
+    /// 活跃事务数。
+    pub fn len(&self) -> usize {
+        self.map.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// 是否没有活跃事务。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 回收空闲超时的事务（回滚后释放连接），返回回收数量。
+    pub fn sweep(&self) -> usize {
+        let timeout = self.timeout();
+        let now = Instant::now();
+        let expired: Vec<(String, Arc<TxSlot>)> = {
+            let Ok(map) = self.map.lock() else { return 0 };
+            map.iter()
+                .filter(|(_, slot)| {
+                    slot.last_used
+                        .lock()
+                        .map(|t| now.duration_since(*t) >= timeout)
+                        .unwrap_or(false)
+                })
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
+        };
+        let mut n = 0;
+        for (id, slot) in expired {
+            // 正在执行语句（锁被占）→ 说明它还活着，下一轮再收
+            let Ok(mut session) = slot.session.try_lock() else { continue };
+            let _ = session.rollback();
+            drop(session);
+            if let Ok(mut map) = self.map.lock() {
+                map.remove(&id);
+            }
+            n += 1;
+        }
+        n
+    }
+
+    /// 至多每 [`Self::SWEEP_INTERVAL`] 扫一次。
+    fn lazy_sweep(&self) {
+        let now = Instant::now();
+        {
+            let Ok(mut last) = self.last_sweep.lock() else { return };
+            if let Some(t) = *last
+                && now.duration_since(t) < Self::SWEEP_INTERVAL
+            {
+                return;
+            }
+            *last = Some(now);
+        }
+        self.sweep();
+    }
+
+    /// 取事务槽。
+    fn get(&self, id: &str) -> Result<Arc<TxSlot>> {
+        let map = self
+            .map
+            .lock()
+            .map_err(|_| Error::Db("事务表锁已中毒（上一次操作 panic）".into()))?;
+        map.get(id).cloned().ok_or_else(|| {
+            Error::Db(format!(
+                "事务[{id}]不存在或已空闲超时回收（默认 {} 秒）",
+                self.timeout().as_secs()
+            ))
+        })
+    }
+}
+
 /// 数据库服务层（对齐 `DbService`）：令牌校验与 SQL 操作，可被任意 HTTP 宿主复用。
 #[derive(Debug, Default)]
 pub struct DbService {
@@ -64,6 +204,8 @@ pub struct DbService {
     /// 空字典表示不校验；某令牌的列表为空表示允许所有数据库（对齐 C# 语义）。
     /// 令牌查找与库名比较均忽略大小写。
     pub tokens: BTreeMap<String, Vec<String>>,
+    /// 事务注册表（`Db/Begin` → `Db/Commit` / `Db/Rollback` 之间的固定会话）。
+    txs: TxRegistry,
 }
 
 impl DbService {
@@ -115,6 +257,117 @@ impl DbService {
         }
     }
 
+    /// 事务空闲超时（秒；默认 60）。超时的事务会被自动回滚并释放连接。
+    /// <param name="secs">秒数（<=0 视为 1）</param>
+    pub fn set_tx_timeout(&self, secs: u64) {
+        self.txs.set_timeout(secs);
+    }
+
+    /// 活跃事务数（运维观测用）。
+    pub fn tx_count(&self) -> usize {
+        self.txs.len()
+    }
+
+    /// 主动回滚并回收空闲超时的事务，返回回收数量。
+    ///
+    /// 宿**不必**定时调（事务相关请求会自动惰性清扫）；如需在面板展示健康度，可自行定时调。
+    pub fn sweep_txs(&self) -> usize {
+        self.txs.sweep()
+    }
+
+    /// 开启事务：固定一条会话、`begin()` 后返回事务令牌（对齐 `POST Db/Begin`）。
+    ///
+    /// 与 C# 的关系：C# `DbServer` **没有**该路由，所以 C# 客户端不会调，零破坏；
+    /// Rust 客户端连接 C# 服务端时拿到 404 → 客户端降级为 `Unsupported`（见 `DbClient::begin_tx`）。
+    /// <param name="dal">数据访问层</param>
+    /// <param name="db">数据源名（仅用于归属校验）</param>
+    /// <returns>事务令牌</returns>
+    pub fn begin_tx(&self, dal: &Dal, db: &str) -> Result<String> {
+        self.txs.lazy_sweep();
+        let mut session = dal.open_session()?;
+        session.begin()?;
+        let id = dhrust::random::hex(16);
+        let slot = Arc::new(TxSlot {
+            session: Mutex::new(session),
+            last_used: Mutex::new(Instant::now()),
+            db: db.to_string(),
+        });
+        self.txs
+            .map
+            .lock()
+            .map_err(|_| Error::Db("事务表锁已中毒（上一次操作 panic）".into()))?
+            .insert(id.clone(), slot);
+        Ok(id)
+    }
+
+    /// 提交事务（对齐 `POST Db/Commit`）。
+    /// <param name="db">数据源名</param>
+    /// <param name="tx">事务令牌</param>
+    pub fn commit_tx(&self, db: &str, tx: &str) -> Result<()> {
+        self.finish_tx(db, tx, true)
+    }
+
+    /// 回滚事务（对齐 `POST Db/Rollback`）。
+    /// <param name="db">数据源名</param>
+    /// <param name="tx">事务令牌</param>
+    pub fn rollback_tx(&self, db: &str, tx: &str) -> Result<()> {
+        self.finish_tx(db, tx, false)
+    }
+
+    /// 收取事务并提交/回滚。
+    ///
+    /// **先从表里摘除再执行**：即使 commit 报错，令牌也不会再被用（避免“半死不活的事务”）。
+    fn finish_tx(&self, db: &str, tx: &str, commit: bool) -> Result<()> {
+        let id = tx.trim();
+        if id.is_empty() {
+            return Err(Error::Argument("事务令牌不能为空".into()));
+        }
+        let slot = self.txs.get(id)?;
+        if !db.trim().is_empty() && !slot.db.trim().is_empty() && !slot.db.eq_ignore_ascii_case(db.trim()) {
+            return Err(Error::Db(format!(
+                "事务[{id}]属于数据源[{}]，不能用于[{db}]",
+                slot.db
+            )));
+        }
+        if let Ok(mut map) = self.txs.map.lock() {
+            map.remove(id);
+        }
+        let mut session = slot
+            .session
+            .lock()
+            .map_err(|_| Error::Db(format!("事务[{id}]的会话锁已中毒（上一次执行 panic）")))?;
+        if commit { session.commit() } else { session.rollback() }
+    }
+
+    /// 在「事务固定会话」或「新建会话」上执行闭包。
+    fn with_session_tx<R>(
+        &self,
+        dal: &Dal,
+        tx: Option<&str>,
+        f: impl FnOnce(&mut dyn SqlSession) -> Result<R>,
+    ) -> Result<R> {
+        match tx.map(str::trim).filter(|s| !s.is_empty()) {
+            None => {
+                let mut session = dal.open_session()?;
+                f(session.as_mut())
+            }
+            Some(id) => {
+                self.txs.lazy_sweep();
+                let slot = self.txs.get(id)?;
+                let mut guard = slot.session.lock().map_err(|_| {
+                    Error::Db(format!("事务[{id}]的会话锁已中毒（上一次执行 panic）"))
+                })?;
+                let r = f(guard.as_mut());
+                drop(guard);
+                // 用“完成时刻”续期：长语句不应被空闲超时误杀
+                if let Ok(mut last) = slot.last_used.lock() {
+                    *last = Instant::now();
+                }
+                r
+            }
+        }
+    }
+
     /// 执行 SQL 查询，返回结果集（对齐 `Query`）。
     ///
     /// 参数绑定：命名占位符（`@p0`/`:p0`/`?p0`）按名绑定；否则按字典键序兼容绑定。
@@ -123,12 +376,27 @@ impl DbService {
     /// <param name="parameters">参数字典</param>
     /// <returns>结果集</returns>
     pub fn query(&self, dal: &Dal, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<RowSet> {
+        self.query_in(dal, None, sql, parameters)
+    }
+
+    /// 同 [`Self::query`]，但可指定事务令牌（`Some` = 在该事务的固定会话上执行）。
+    /// <param name="dal">数据访问层</param>
+    /// <param name="tx">事务令牌</param>
+    /// <param name="sql">SQL 语句</param>
+    /// <param name="parameters">参数字典</param>
+    /// <returns>结果集</returns>
+    pub fn query_in(
+        &self,
+        dal: &Dal,
+        tx: Option<&str>,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<RowSet> {
         if sql.is_empty() {
             return Err(Error::Argument("SQL不能为空".into()));
         }
         let (sql, params) = bind_forwarded(dal.kind(), sql, parameters);
-        let mut session = dal.open_session()?;
-        session.query(&sql, &params)
+        self.with_session_tx(dal, tx, |session| session.query(&sql, &params))
     }
 
     /// 执行 SQL 查询并返回 **DbTable v3 二进制报文**（对齐 C# `DbController.Query` 的 `rs.ToPacket()`）。
@@ -145,7 +413,23 @@ impl DbService {
         sql: &str,
         parameters: Option<&BTreeMap<String, Value>>,
     ) -> Result<Vec<u8>> {
-        let set = self.query(dal, sql, parameters)?;
+        self.query_packet_in(dal, None, sql, parameters)
+    }
+
+    /// 同 [`Self::query_packet`]，但可指定事务令牌。
+    /// <param name="dal">数据访问层</param>
+    /// <param name="tx">事务令牌</param>
+    /// <param name="sql">SQL 语句</param>
+    /// <param name="parameters">参数字典</param>
+    /// <returns>DbTable 二进制报文</returns>
+    pub fn query_packet_in(
+        &self,
+        dal: &Dal,
+        tx: Option<&str>,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<Vec<u8>> {
+        let set = self.query_in(dal, tx, sql, parameters)?;
         Ok(crate::dbtable::encode_rowset(&set))
     }
 
@@ -155,12 +439,27 @@ impl DbService {
     /// <param name="parameters">参数字典</param>
     /// <returns>受影响行数</returns>
     pub fn execute(&self, dal: &Dal, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<u64> {
+        self.execute_in(dal, None, sql, parameters)
+    }
+
+    /// 同 [`Self::execute`]，但可指定事务令牌。
+    /// <param name="dal">数据访问层</param>
+    /// <param name="tx">事务令牌</param>
+    /// <param name="sql">SQL 语句</param>
+    /// <param name="parameters">参数字典</param>
+    /// <returns>受影响行数</returns>
+    pub fn execute_in(
+        &self,
+        dal: &Dal,
+        tx: Option<&str>,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<u64> {
         if sql.is_empty() {
             return Err(Error::Argument("SQL不能为空".into()));
         }
         let (sql, params) = bind_forwarded(dal.kind(), sql, parameters);
-        let mut session = dal.open_session()?;
-        session.execute(&sql, &params)
+        self.with_session_tx(dal, tx, |session| session.execute(&sql, &params))
     }
 
     /// 执行插入语句并返回自增标识（对齐 `InsertAndGetIdentity`）。
@@ -174,12 +473,31 @@ impl DbService {
         sql: &str,
         parameters: Option<&BTreeMap<String, Value>>,
     ) -> Result<i64> {
+        self.insert_and_get_identity_in(dal, None, sql, parameters)
+    }
+
+    /// 同 [`Self::insert_and_get_identity`]，但可指定事务令牌。
+    ///
+    /// 事务内取自增**必须走这条**：远程另开会话拿不到未提交事务的自增值。
+    /// <param name="dal">数据访问层</param>
+    /// <param name="tx">事务令牌</param>
+    /// <param name="sql">SQL 语句</param>
+    /// <param name="parameters">参数字典</param>
+    /// <returns>自增主键值</returns>
+    pub fn insert_and_get_identity_in(
+        &self,
+        dal: &Dal,
+        tx: Option<&str>,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<i64> {
         if sql.is_empty() {
             return Err(Error::Argument("SQL不能为空".into()));
         }
         let (sql, params) = bind_forwarded(dal.kind(), sql, parameters);
-        let mut session = dal.open_session()?;
-        session.insert_and_get_identity(&sql, &params, None)
+        self.with_session_tx(dal, tx, |session| {
+            session.insert_and_get_identity(&sql, &params, None)
+        })
     }
 
     /// 快速查询单表记录数（对齐 `QueryCount`）。
@@ -326,7 +644,21 @@ impl DbClient {
     /// <param name="parameters">参数字典</param>
     /// <returns>结果集</returns>
     pub fn query_rowset(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<RowSet> {
-        let args = self.build_args(sql, parameters);
+        self.query_rowset_in(None, sql, parameters)
+    }
+
+    /// 同 [`Self::query_rowset`]，但可带事务令牌（`Some` = 在远端已开启的事务里执行）。
+    /// <param name="tx">事务令牌</param>
+    /// <param name="sql">SQL 语句</param>
+    /// <param name="parameters">参数字典</param>
+    /// <returns>结果集</returns>
+    pub fn query_rowset_in(
+        &self,
+        tx: Option<&str>,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<RowSet> {
+        let args = self.build_args_in(sql, parameters, tx);
         let bytes = http::post_bytes_auth(
             &self.url("Db/Query"),
             &args.to_string(),
@@ -361,7 +693,21 @@ impl DbClient {
     /// <param name="parameters">参数字典</param>
     /// <returns>受影响行数</returns>
     pub fn execute(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<i64> {
-        let args = self.build_args(sql, parameters);
+        self.execute_in(None, sql, parameters)
+    }
+
+    /// 同 [`Self::execute`]，但可带事务令牌。
+    /// <param name="tx">事务令牌</param>
+    /// <param name="sql">SQL 语句</param>
+    /// <param name="parameters">参数字典</param>
+    /// <returns>受影响行数</returns>
+    pub fn execute_in(
+        &self,
+        tx: Option<&str>,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<i64> {
+        let args = self.build_args_in(sql, parameters, tx);
         let text = http::post_json_auth(
             &self.url("Db/Execute"),
             &args.to_string(),
@@ -378,7 +724,21 @@ impl DbClient {
     /// <param name="parameters">参数字典</param>
     /// <returns>自增主键值</returns>
     pub fn insert_and_get_identity(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<i64> {
-        let args = self.build_args(sql, parameters);
+        self.insert_and_get_identity_in(None, sql, parameters)
+    }
+
+    /// 同 [`Self::insert_and_get_identity`]，但可带事务令牌。
+    /// <param name="tx">事务令牌</param>
+    /// <param name="sql">SQL 语句</param>
+    /// <param name="parameters">参数字典</param>
+    /// <returns>自增主键值</returns>
+    pub fn insert_and_get_identity_in(
+        &self,
+        tx: Option<&str>,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<i64> {
+        let args = self.build_args_in(sql, parameters, tx);
         let text = http::post_json_auth(
             &self.url("Db/InsertAndGetIdentity"),
             &args.to_string(),
@@ -388,6 +748,60 @@ impl DbClient {
             self.user_agent.as_deref(),
         )?;
         parse_envelope_i64(&text)
+    }
+
+    /// 开启远端事务（`POST Db/Begin`），返回事务令牌。
+    ///
+    /// **与 C# 的兼容**：C# `DbServer` 没有该路由（HTTP 404/405）→ 本方法返回
+    /// [`Error::Unsupported`]，调用方据此回退成「无事务」而不报错（与旧行为一致）。
+    /// <returns>事务令牌</returns>
+    pub fn begin_tx(&self) -> Result<String> {
+        let body = json!({ "db": self.db, "token": self.token }).to_string();
+        let text = http::post_json_auth(
+            &self.url("Db/Begin"),
+            &body,
+            None,
+            self.bearer.as_deref(),
+            self.timeout,
+            self.user_agent.as_deref(),
+        )
+        .map_err(route_missing_to_unsupported)?;
+        let data = parse_envelope(&text)?;
+        let id = match &data {
+            Value::String(s) => s.trim().to_string(),
+            other => get_str_field(other, &["tx", "Tx"]),
+        };
+        if id.is_empty() {
+            return Err(Error::Db("远端未返回事务令牌".into()));
+        }
+        Ok(id)
+    }
+
+    /// 提交远端事务（`POST Db/Commit`）。
+    /// <param name="tx">事务令牌</param>
+    pub fn commit_tx(&self, tx: &str) -> Result<()> {
+        self.finish_tx("Db/Commit", tx)
+    }
+
+    /// 回滚远端事务（`POST Db/Rollback`）。
+    /// <param name="tx">事务令牌</param>
+    pub fn rollback_tx(&self, tx: &str) -> Result<()> {
+        self.finish_tx("Db/Rollback", tx)
+    }
+
+    /// 提交/回滚的公共实现。
+    fn finish_tx(&self, route: &str, tx: &str) -> Result<()> {
+        let body = json!({ "db": self.db, "token": self.token, "tx": tx }).to_string();
+        let text = http::post_json_auth(
+            &self.url(route),
+            &body,
+            None,
+            self.bearer.as_deref(),
+            self.timeout,
+            self.user_agent.as_deref(),
+        )
+        .map_err(route_missing_to_unsupported)?;
+        parse_envelope(&text).map(|_| ())
     }
 
     /// 查询单表记录数（对齐 `QueryCountAsync`）。
@@ -436,8 +850,16 @@ impl DbClient {
     }
 
     /// 构建请求参数（sql/parameters/db/token；parameters 为 JSON 字符串，对齐 C# `BuildArgs`）。
-    fn build_args(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Value {
-        match parameters {
+    ///
+    /// 带 `tx` 时额外附上事务令牌；不带 `tx` 时请求体与旧版**逐字节一致**
+    /// （C# 服务端与既有联调不受影响）。
+    fn build_args_in(
+        &self,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+        tx: Option<&str>,
+    ) -> Value {
+        let mut args = match parameters {
             None => json!({ "sql": sql, "db": self.db, "token": self.token }),
             Some(ps) => {
                 let map: serde_json::Map<String, Value> =
@@ -449,7 +871,30 @@ impl DbClient {
                     "token": self.token,
                 })
             }
+        };
+        if let Some(id) = tx.map(str::trim).filter(|s| !s.is_empty())
+            && let Some(obj) = args.as_object_mut()
+        {
+            obj.insert("tx".to_string(), Value::String(id.to_string()));
         }
+        args
+    }
+}
+
+/// 远端是 C# `DbServer`（没有事务路由）时，把 HTTP 404/405/501 归一化为 `Unsupported`。
+///
+/// 这样调用方可以「有事务就用、没有就回退」，而不是把“对端不支持”当成故障。
+fn route_missing_to_unsupported(e: Error) -> Error {
+    let missing = match &e {
+        Error::Db(m) => ["HTTP 404", "HTTP 405", "HTTP 501"]
+            .iter()
+            .any(|code| m.contains(code)),
+        _ => false,
+    };
+    if missing {
+        Error::Unsupported(format!("远端 DbServer 未提供事务接口（{e}）"))
+    } else {
+        e
     }
 }
 
@@ -998,6 +1443,16 @@ mod tests {
         body: Vec<u8>,
         times: usize,
     ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        spawn_mock_status_response("200 OK", content_type, body, times)
+    }
+
+    /// 同 [`spawn_mock_response`]，但可指定**状态行**（如 `404 Not Found`）。
+    fn spawn_mock_status_response(
+        status: &'static str,
+        content_type: &'static str,
+        body: Vec<u8>,
+        times: usize,
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -1040,7 +1495,7 @@ mod tests {
                 requests.push(String::from_utf8_lossy(&data).to_string());
 
                 let mut response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 )
                 .into_bytes();
@@ -1102,5 +1557,155 @@ mod tests {
         assert_eq!(set.len(), 2);
         assert_eq!(set.rows[0].get(0), Some(&DbValue::Int(1)));
         assert_eq!(set.rows[1].get(0), Some(&DbValue::Int(2)));
+    }
+
+    // ── 事务（`Db/Begin` → `Db/Commit` / `Db/Rollback`）───────────────────────────
+
+    fn probe_table(svc: &DbService, dal: &Dal) {
+        svc.execute(
+            dal,
+            "CREATE TABLE TxProbe (Id INTEGER PRIMARY KEY AUTOINCREMENT, Name TEXT)",
+            None,
+        )
+        .unwrap();
+    }
+
+    fn probe_count(svc: &DbService, dal: &Dal, tx: Option<&str>) -> i64 {
+        let set = svc
+            .query_in(dal, tx, "SELECT COUNT(*) FROM TxProbe", None)
+            .unwrap();
+        set.rows
+            .first()
+            .and_then(|r| r.get(0))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1)
+    }
+
+    /// 提交：事务内的写要落库；且事务内能读到自己的写。
+    #[test]
+    fn tx_commit_persists_and_reads_own_writes() {
+        let (dal, dir) = temp_dal("tx-commit");
+        let svc = DbService::new();
+        probe_table(&svc, &dal);
+
+        let tx = svc.begin_tx(&dal, "Demo").unwrap();
+        assert_eq!(svc.tx_count(), 1, "开启后应有一个活跃事务");
+        svc.execute_in(&dal, Some(&tx), "INSERT INTO TxProbe (Name) VALUES ('a')", None)
+            .unwrap();
+        // 事务内可见自己的未提交写（说明语句确实落在同一条连接上）
+        assert_eq!(probe_count(&svc, &dal, Some(&tx)), 1, "事务内应读到自己的写");
+
+        svc.commit_tx("Demo", &tx).unwrap();
+        assert_eq!(svc.tx_count(), 0, "提交后事务应被收取");
+        assert_eq!(probe_count(&svc, &dal, None), 1, "提交后数据应持久化");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回滚：事务内的写必须消失。
+    #[test]
+    fn tx_rollback_discards_writes() {
+        let (dal, dir) = temp_dal("tx-rollback");
+        let svc = DbService::new();
+        probe_table(&svc, &dal);
+
+        let tx = svc.begin_tx(&dal, "Demo").unwrap();
+        svc.execute_in(&dal, Some(&tx), "INSERT INTO TxProbe (Name) VALUES ('b')", None)
+            .unwrap();
+        assert_eq!(probe_count(&svc, &dal, Some(&tx)), 1);
+
+        svc.rollback_tx("Demo", &tx).unwrap();
+        assert_eq!(probe_count(&svc, &dal, None), 0, "回滚后不应留下数据");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 事务内的自增：必须在同一会话上取（远端另开会话拿不到未提交的自增值）。
+    #[test]
+    fn tx_identity_is_visible_inside_transaction() {
+        let (dal, dir) = temp_dal("tx-identity");
+        let svc = DbService::new();
+        probe_table(&svc, &dal);
+
+        let tx = svc.begin_tx(&dal, "Demo").unwrap();
+        let id1 = svc
+            .insert_and_get_identity_in(
+                &dal,
+                Some(&tx),
+                "INSERT INTO TxProbe (Name) VALUES ('x')",
+                None,
+            )
+            .unwrap();
+        let id2 = svc
+            .insert_and_get_identity_in(
+                &dal,
+                Some(&tx),
+                "INSERT INTO TxProbe (Name) VALUES ('y')",
+                None,
+            )
+            .unwrap();
+        assert!(id1 >= 1 && id2 == id1 + 1, "自增应连续（{id1} → {id2}）");
+        svc.commit_tx("Demo", &tx).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 令牌不存在 / 归属不符 / 空令牌：都要给可定位的错误，且不能误伤仍有效的事务。
+    #[test]
+    fn tx_bad_token_is_rejected() {
+        let (dal, dir) = temp_dal("tx-bad");
+        let svc = DbService::new();
+        probe_table(&svc, &dal);
+
+        assert!(svc.execute_in(&dal, Some("deadbeef"), "SELECT 1", None).is_err());
+        assert!(svc.commit_tx("Demo", "").is_err(), "空令牌应报参数错误");
+        assert!(svc.rollback_tx("Demo", "deadbeef").is_err(), "不存在的令牌应报错");
+
+        let tx = svc.begin_tx(&dal, "Demo").unwrap();
+        let wrong_db = svc.commit_tx("Other", &tx);
+        assert!(wrong_db.is_err(), "跨数据源用同一令牌应被拒");
+        // 归属校验失败**不消耗**令牌：用对的库名仍能正常提交
+        svc.commit_tx("Demo", &tx).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 空闲超时：自动回滚并回收（防止调用方崩溃后把连接占死）。
+    #[test]
+    fn tx_expires_and_releases_connection() {
+        let (dal, dir) = temp_dal("tx-expire");
+        let svc = DbService::new();
+        probe_table(&svc, &dal);
+
+        svc.set_tx_timeout(1);
+        let tx = svc.begin_tx(&dal, "Demo").unwrap();
+        svc.execute_in(&dal, Some(&tx), "INSERT INTO TxProbe (Name) VALUES ('z')", None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+
+        assert_eq!(svc.sweep_txs(), 1, "空闲超时的事务应被回收");
+        assert_eq!(svc.tx_count(), 0);
+        assert!(
+            svc.execute_in(&dal, Some(&tx), "SELECT 1", None).is_err(),
+            "回收后旧令牌必须失效"
+        );
+        assert_eq!(probe_count(&svc, &dal, None), 0, "回收时应已回滚");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 远端是 C# `DbServer`（没有 `Db/Begin`）→ 客户端必须降级为 `Unsupported`，
+    /// 而不是当成故障。这条守着「与 C# 互不破坏」的底线。
+    #[test]
+    fn db_client_begin_tx_degrades_when_route_missing() {
+        // 模拟 C# DbServer：/Db/Begin 不存在 → 404
+        let (port, handle) = spawn_mock_status_response(
+            "404 Not Found",
+            "text/plain",
+            b"404 page not found".to_vec(),
+            1,
+        );
+        let client = DbClient::new(format!("http://127.0.0.1:{port}"), "Demo", None);
+        let err = client.begin_tx().map(|_| ()).expect_err("404 应转为 Unsupported");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "应降级为 Unsupported（调用方据此回退无事务），实际：{err}"
+        );
+        handle.join().ok();
     }
 }

@@ -13,8 +13,12 @@
 //!   执行 `POST Db/Execute`、插入自增 `POST Db/InsertAndGetIdentity`；
 //! - 占位符：本端生成的位置占位符（`?`/`$N`/`:N`/`@pN`）改写为带远端前缀的命名占位符
 //!   （`@p0`/`:p0`/`?p0`，与 C# `FormatParameterName` 一致），参数字典键与之同名；
-//! - 事务：**不支持转发**（远端 `DbServer` 未提供事务接口，C# 侧同样无法真正生效）——
-//!   `begin`/`commit`/`rollback` 返回 [`Error::Unsupported`]；
+//! - 事务：**转发到远端**（`POST Db/Begin` / `Db/Commit` / `Db/Rollback`，后续语句带 `tx`）。
+//!   服务端用「固定会话」实现（把 BEGIN 之后的语句路由回同一条连接），因此是**真事务**：
+//!   可 `commit`/`rollback`、可在事务内读取自己的写、可拿未提交的自增值。
+//!   远端若是 **C# `DbServer`**（无此路由，HTTP 404/405）→ 本端降级为
+//!   [`Error::Unsupported`]，与旧行为一致；会话 `Drop` 时若未结束事务会**尽力回滚**，
+//!   服务端另有空闲超时自动回收（默认 60 秒），双重防泄漏。
 //! - 表结构：不在本端建表（对齐 C# `NetworkMetaData.OnSetTables` 空实现，`sync_schema` 返回空清单）；
 //!   `table_exists`/`table_columns` 用探测查询 `SELECT * FROM 表 WHERE 1=0`（C#/Rust 服务端通用）；
 //! - 参数：值为 NULL 的占位符**内联为 `NULL` 字面量**（C# 服务端会丢弃 NULL 参数，保留占位符会报缺少参数）；
@@ -178,6 +182,8 @@ pub struct NetworkSession {
     client: DbClient,
     /// 远端数据库类型（本地套用其方言规则）
     kind: DatabaseKind,
+    /// 事务令牌（`Some` = 已开启远端事务，语句需带它路由到固定会话）。
+    tx: Option<String>,
 }
 
 impl NetworkSession {
@@ -188,12 +194,18 @@ impl NetworkSession {
         Ok(Self {
             client: DbClient::from_connection_string(conn_str)?,
             kind,
+            tx: None,
         })
     }
 
     /// 远端 HTTP 客户端（供诊断或扩展接口如 `query_count` 使用）。
     pub fn client(&self) -> &DbClient {
         &self.client
+    }
+
+    /// 当前事务令牌（`None` = 未在事务中）。
+    pub fn tx_id(&self) -> Option<&str> {
+        self.tx.as_deref()
     }
 
     /// 探测远端表的列（`SELECT * FROM 表 WHERE 1=0`；表不存在时报错）。
@@ -208,9 +220,18 @@ impl NetworkSession {
     }
 }
 
-/// 事务不支持的统一错误。
-fn tx_unsupported() -> Error {
-    Error::Unsupported("network 驱动不支持事务转发：远端 DbServer 未提供事务接口".into())
+/// 会话被丢弃时若事务还没结束 → **尽力回滚**。
+///
+/// 这条兜底很重要：调用方大量使用 `?` 提前返回，不会写 `rollback()`；
+/// 不回滚的话远端的连接会被一直占住（`Db/Begin` 的会话不会自动归还）。
+/// 即使这里也失败（进程被杀 / 网络断），服务端还有空闲超时自动回收。
+impl Drop for NetworkSession {
+    fn drop(&mut self) {
+        if let Some(id) = self.tx.take() {
+            // 尽力而为：Drop 里无法上报错误，远端超时回收是第二道防线
+            let _ = self.client.rollback_tx(&id);
+        }
+    }
 }
 
 impl SqlSession for NetworkSession {
@@ -220,16 +241,18 @@ impl SqlSession for NetworkSession {
 
     fn execute(&mut self, sql: &str, params: &[DbValue]) -> Result<u64> {
         let (sql, parameters) = translate(sql, params, self.kind);
-        let n = self.client.execute(&sql, Some(&parameters))?;
+        let n = self.client.execute_in(self.tx.as_deref(), &sql, Some(&parameters))?;
         Ok(n.max(0) as u64)
     }
 
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
         let (sql, parameters) = translate(sql, params, self.kind);
-        self.client.query_rowset(&sql, Some(&parameters))
+        self.client.query_rowset_in(self.tx.as_deref(), &sql, Some(&parameters))
     }
 
     /// 插入并取自增：转发到远端原子接口 `POST Db/InsertAndGetIdentity`（对齐 C# `NetworkSession`）。
+    ///
+    /// 事务中会带上 `tx` —— 否则远端另开会话拿不到未提交的自增值。
     fn insert_and_get_identity(
         &mut self,
         sql: &str,
@@ -238,19 +261,38 @@ impl SqlSession for NetworkSession {
     ) -> Result<i64> {
         let _ = table;
         let (sql, parameters) = translate(sql, params, self.kind);
-        self.client.insert_and_get_identity(&sql, Some(&parameters))
+        self.client
+            .insert_and_get_identity_in(self.tx.as_deref(), &sql, Some(&parameters))
     }
 
     fn begin(&mut self) -> Result<()> {
-        Err(tx_unsupported())
+        if self.tx.is_some() {
+            return Err(Error::Db("事务已开启（请先 commit 或 rollback）".into()));
+        }
+        match self.client.begin_tx() {
+            Ok(id) => {
+                self.tx = Some(id);
+                Ok(())
+            }
+            // 远端是 C# DBServer / 旧版 Rust 宿主：保持旧行为（不支持事务）
+            Err(Error::Unsupported(e)) => Err(Error::Unsupported(e)),
+            Err(e) => Err(e),
+        }
     }
 
     fn commit(&mut self) -> Result<()> {
-        Err(tx_unsupported())
+        let Some(id) = self.tx.take() else {
+            return Err(Error::Db("没有已开启的事务".into()));
+        };
+        // 失败也不把令牌放回：远端可能已经提交或已超时回收，重试结果不可预测
+        self.client.commit_tx(&id)
     }
 
     fn rollback(&mut self) -> Result<()> {
-        Err(tx_unsupported())
+        let Some(id) = self.tx.take() else {
+            return Err(Error::Db("没有已开启的事务".into()));
+        };
+        self.client.rollback_tx(&id)
     }
 
     fn last_identity(&mut self) -> Result<i64> {
