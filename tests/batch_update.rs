@@ -127,3 +127,72 @@ fn batch_update_validates_inputs() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **分片守护**：超过数据库变量上限的行数也必须成功（分片前会整批失败）。
+///
+/// 实测依据（2026-10-29，SQLite，本用例的列集 = 3 列 → 参数 = `行数 × 3 × 2 + 行数`）：
+/// - 6000 行 = 30000 参数 → OK；8000 行 = 40000 参数 → `too many SQL variables`
+///   （SQLite 的 `SQLITE_MAX_VARIABLE_NUMBER` = 32766；MySQL 协议上限 65535）。
+/// - 同一批行走单条 `UPDATE ... CASE` 是 O(行数²)：实测 5000 行单片 1030ms，
+///   分片 500 后 1 万行只要 67.7ms。
+///
+/// 这条用例不验证性能（CI 机器差异大），只守住「不因分片丢行/漏更新」。
+#[test]
+fn batch_update_spans_rows_beyond_variable_limit() {
+    let (dir, dal) = setup("chunked");
+    let table = dal.table("DeviceOnline").unwrap();
+    let mut session = dal.open_session().unwrap();
+
+    // 12000 行 × 3 列 = 84000 参数，远超 SQLite 上限
+    const N: usize = 12_000;
+    let seed: Vec<Vec<(&str, DbValue)>> = (0..N)
+        .map(|i| {
+            vec![
+                ("DeviceId", DbValue::Int(i as i64 + 1)),
+                ("Memory", DbValue::Int(0)),
+                ("CpuRate", DbValue::Float(0.0)),
+                ("Delay", DbValue::Int(0)),
+            ]
+        })
+        .collect();
+    table.insert_batch(session.as_mut(), &seed, Some(500)).unwrap();
+
+    let data: Vec<(DbValue, Vec<DbValue>)> = (0..N)
+        .map(|i| {
+            (
+                DbValue::Int(i as i64 + 1),
+                vec![
+                    DbValue::Int(i as i64 + 100),
+                    DbValue::Float(0.5),
+                    DbValue::Int(7),
+                ],
+            )
+        })
+        .collect();
+    let affected = table
+        .update_batch_by_pk(session.as_mut(), &["Memory", "CpuRate", "Delay"], &data)
+        .expect("分片后应成功（分片前会报 too many SQL variables）");
+    assert_eq!(affected, N as u64, "分片不能丢行");
+
+    // 首尾 + 中间各抽查一行，确认值真的写进去了
+    for probe in [1i64, (N / 2) as i64, N as i64] {
+        let rows = table
+            .query(
+                session.as_mut(),
+                &Query::new()
+                    .column("Memory")
+                    .column("Delay")
+                    .filter(Where::new().eq("DeviceId", probe)),
+            )
+            .unwrap();
+        let row = rows.first().expect("设备行应存在");
+        assert_eq!(
+            row.get_by_name("Memory").and_then(|v| v.as_i64()),
+            Some(probe - 1 + 100),
+            "第 {probe} 行的 Memory 应被更新"
+        );
+        assert_eq!(row.get_by_name("Delay").and_then(|v| v.as_i64()), Some(7));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
