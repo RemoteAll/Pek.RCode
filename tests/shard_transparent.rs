@@ -41,8 +41,10 @@ fn temp_db(name: &str) -> (PathBuf, PathBuf) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("rcode-shard-auto-{}-{stamp}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "rcode-shard-auto-{}-{stamp}-{name}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     (dir.clone(), dir.join("auto.db"))
 }
@@ -111,7 +113,11 @@ fn transparent_crud_routes_by_day() {
             .unwrap();
     }
 
-    for name in ["TradeLog_20260901", "TradeLog_20260902", "TradeLog_20260903"] {
+    for name in [
+        "TradeLog_20260901",
+        "TradeLog_20260902",
+        "TradeLog_20260903",
+    ] {
         assert!(session.table_exists(name).unwrap(), "{name} 应已自动创建");
     }
     assert!(
@@ -146,9 +152,7 @@ fn transparent_crud_routes_by_day() {
     assert_eq!(set.rows.len(), 2);
 
     // 条件删除（跨表）
-    let deleted = table
-        .delete_where(session.as_mut(), &filter)
-        .unwrap();
+    let deleted = table.delete_where(session.as_mut(), &filter).unwrap();
     assert_eq!(deleted, 5);
     assert_eq!(table.count(session.as_mut(), Some(&filter)).unwrap(), 0);
 }
@@ -173,7 +177,14 @@ fn no_time_filter_falls_back_to_base_table() {
         .unwrap();
 
     assert_eq!(table.count(session.as_mut(), None).unwrap(), 0);
-    assert_eq!(table.query(session.as_mut(), &Query::new()).unwrap().rows.len(), 0);
+    assert_eq!(
+        table
+            .query(session.as_mut(), &Query::new())
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
 }
 
 /// 显式物理表（`table_as`）不参与自动分表 —— 分表引擎内部的防递归机制。
@@ -383,7 +394,8 @@ fn entity_layer_inherits_transparent_sharding() {
         TradeRow::count(&dal, session.as_mut(), Some(&filter)).unwrap(),
         1
     );
-    let list = TradeRow::query(&dal, session.as_mut(), &Query::new().filter(filter.clone())).unwrap();
+    let list =
+        TradeRow::query(&dal, session.as_mut(), &Query::new().filter(filter.clone())).unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].note, "e1");
 }
@@ -401,5 +413,12 @@ fn plain_table_keeps_single_table_semantics() {
         .insert(session.as_mut(), &[("Note", DbValue::from("n1"))])
         .unwrap();
     assert_eq!(table.count(session.as_mut(), None).unwrap(), 1);
-    assert_eq!(table.query(session.as_mut(), &Query::new()).unwrap().rows.len(), 1);
+    assert_eq!(
+        table
+            .query(session.as_mut(), &Query::new())
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
 }

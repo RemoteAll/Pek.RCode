@@ -59,10 +59,7 @@ fn main() -> pek_rcode::Result<()> {
     let is_mysql = conn.contains("mysql");
     let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL)?)?;
     dal.sync_schema()?;
-    println!(
-        "后端：{}",
-        if is_mysql { "MySQL" } else { "SQLite" }
-    );
+    println!("后端：{}", if is_mysql { "MySQL" } else { "SQLite" });
 
     // ② 预热连接池：建连 ~3~4 次往返，冷启动首批并发请求不该各自承担
     let warmed = dal.warmup_pool(4);
@@ -136,12 +133,7 @@ fn main() -> pek_rcode::Result<()> {
             }
             Err(RecvTimeoutError::Timeout) => {
                 // 时间闸门：流量低于批大小时也按时落库
-                flush(
-                    &mut queue,
-                    &mut session,
-                    &mut pending,
-                    &mut max_flush,
-                )?;
+                flush(&mut queue, &mut session, &mut pending, &mut max_flush)?;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -159,12 +151,7 @@ fn main() -> pek_rcode::Result<()> {
     }
 
     // ⑤ 优雅关闭：**必须**最终 flush，否则队列里的最后一批会丢
-    flush(
-        &mut queue,
-        &mut session,
-        &mut pending,
-        &mut max_flush,
-    )?;
+    flush(&mut queue, &mut session, &mut pending, &mut max_flush)?;
     written = queue.stats().total();
     producer.join().ok();
 

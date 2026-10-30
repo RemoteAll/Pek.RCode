@@ -149,10 +149,7 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-sim-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rcode-sim-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("sim.db");
 

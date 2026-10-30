@@ -224,7 +224,10 @@ fn bench_dirty_legacy_path() {
 #[test]
 #[ignore]
 fn report_sizes() {
-    println!("size_of::<DirtyState>()            = {}", std::mem::size_of::<DirtyState>());
+    println!(
+        "size_of::<DirtyState>()            = {}",
+        std::mem::size_of::<DirtyState>()
+    );
     println!(
         "size_of::<Option<DirtyState>>()    = {}",
         std::mem::size_of::<Option<DirtyState>>()
@@ -358,7 +361,12 @@ fn bench_session_checkout() {
         let s = dal.open_session().unwrap();
         drop(s);
     }
-    report("会话借出+归还（连接池，单线程）", N, t.elapsed(), alloc_since(mark));
+    report(
+        "会话借出+归还（连接池，单线程）",
+        N,
+        t.elapsed(),
+        alloc_since(mark),
+    );
 
     const THREADS: usize = 8;
     const PER: usize = 50_000;
@@ -398,7 +406,12 @@ fn bench_read_session() {
         let s = dal.read_session_for("DH_Wide").unwrap();
         drop(s);
     }
-    report("读会话获取（read_session_for）", N, t.elapsed(), alloc_since(mark));
+    report(
+        "读会话获取（read_session_for）",
+        N,
+        t.elapsed(),
+        alloc_since(mark),
+    );
 }
 
 /// 行取值：宽表（20 列）按列名取 20 次。
@@ -422,7 +435,12 @@ fn bench_row_lookup_wide() {
             sink += usize::from(row.get_by_name(c).is_some());
         }
     }
-    report("行取值（20 列，原文列名 × 20）", N * 20, t.elapsed(), alloc_since(mark));
+    report(
+        "行取值（20 列，原文列名 × 20）",
+        N * 20,
+        t.elapsed(),
+        alloc_since(mark),
+    );
 
     // 小写列名（模拟手写代码/OR 映射传小写）
     let lower: Vec<String> = columns.iter().map(|c| c.to_ascii_lowercase()).collect();
@@ -433,7 +451,12 @@ fn bench_row_lookup_wide() {
             sink += usize::from(row.get_by_name(c).is_some());
         }
     }
-    report("行取值（20 列，小写列名 × 20）", N * 20, t.elapsed(), alloc_since(mark));
+    report(
+        "行取值（20 列，小写列名 × 20）",
+        N * 20,
+        t.elapsed(),
+        alloc_since(mark),
+    );
     assert!(sink > 0);
 }
 
@@ -448,10 +471,26 @@ fn bench_insert_row() {
     let sets: Vec<(&'static str, pek_rcode::DbValue)> = (1..=20)
         .map(|i| {
             let name: &'static str = match i {
-                1 => "C1", 2 => "C2", 3 => "C3", 4 => "C4", 5 => "C5",
-                6 => "C6", 7 => "C7", 8 => "C8", 9 => "C9", 10 => "C10",
-                11 => "C11", 12 => "C12", 13 => "C13", 14 => "C14", 15 => "C15",
-                16 => "C16", 17 => "C17", 18 => "C18", 19 => "C19", _ => "C20",
+                1 => "C1",
+                2 => "C2",
+                3 => "C3",
+                4 => "C4",
+                5 => "C5",
+                6 => "C6",
+                7 => "C7",
+                8 => "C8",
+                9 => "C9",
+                10 => "C10",
+                11 => "C11",
+                12 => "C12",
+                13 => "C13",
+                14 => "C14",
+                15 => "C15",
+                16 => "C16",
+                17 => "C17",
+                18 => "C18",
+                19 => "C19",
+                _ => "C20",
             };
             (name, pek_rcode::DbValue::Text("0123456789abcdef".into()))
         })
@@ -480,10 +519,26 @@ fn bench_insert_batch() {
     let sets: Vec<(&'static str, pek_rcode::DbValue)> = (1..=20)
         .map(|i| {
             let name: &'static str = match i {
-                1 => "C1", 2 => "C2", 3 => "C3", 4 => "C4", 5 => "C5",
-                6 => "C6", 7 => "C7", 8 => "C8", 9 => "C9", 10 => "C10",
-                11 => "C11", 12 => "C12", 13 => "C13", 14 => "C14", 15 => "C15",
-                16 => "C16", 17 => "C17", 18 => "C18", 19 => "C19", _ => "C20",
+                1 => "C1",
+                2 => "C2",
+                3 => "C3",
+                4 => "C4",
+                5 => "C5",
+                6 => "C6",
+                7 => "C7",
+                8 => "C8",
+                9 => "C9",
+                10 => "C10",
+                11 => "C11",
+                12 => "C12",
+                13 => "C13",
+                14 => "C14",
+                15 => "C15",
+                16 => "C16",
+                17 => "C17",
+                18 => "C18",
+                19 => "C19",
+                _ => "C20",
             };
             (name, pek_rcode::DbValue::Text("0123456789abcdef".into()))
         })
@@ -491,8 +546,20 @@ fn bench_insert_batch() {
     let rows: Vec<Vec<(&str, pek_rcode::DbValue)>> = (0..ROWS).map(|_| sets.clone()).collect();
     let mark = ALLOCS.load(Ordering::Relaxed);
     let t = Instant::now();
-    table.write_batch(session.as_mut(), &rows, pek_rcode::sqlbuild::BatchWriteMode::Insert, Some(5000)).unwrap();
-    report("批量插入摊销（5000/批，20 列）", ROWS, t.elapsed(), alloc_since(mark));
+    table
+        .write_batch(
+            session.as_mut(),
+            &rows,
+            pek_rcode::sqlbuild::BatchWriteMode::Insert,
+            Some(5000),
+        )
+        .unwrap();
+    report(
+        "批量插入摊销（5000/批，20 列）",
+        ROWS,
+        t.elapsed(),
+        alloc_since(mark),
+    );
 }
 
 /// 查询一行并取值（20 列）。
@@ -506,10 +573,26 @@ fn bench_select_row() {
     let sets: Vec<(&'static str, pek_rcode::DbValue)> = (1..=20)
         .map(|i| {
             let name: &'static str = match i {
-                1 => "C1", 2 => "C2", 3 => "C3", 4 => "C4", 5 => "C5",
-                6 => "C6", 7 => "C7", 8 => "C8", 9 => "C9", 10 => "C10",
-                11 => "C11", 12 => "C12", 13 => "C13", 14 => "C14", 15 => "C15",
-                16 => "C16", 17 => "C17", 18 => "C18", 19 => "C19", _ => "C20",
+                1 => "C1",
+                2 => "C2",
+                3 => "C3",
+                4 => "C4",
+                5 => "C5",
+                6 => "C6",
+                7 => "C7",
+                8 => "C8",
+                9 => "C9",
+                10 => "C10",
+                11 => "C11",
+                12 => "C12",
+                13 => "C13",
+                14 => "C14",
+                15 => "C15",
+                16 => "C16",
+                17 => "C17",
+                18 => "C18",
+                19 => "C19",
+                _ => "C20",
             };
             (name, pek_rcode::DbValue::Text("0123456789abcdef".into()))
         })
@@ -524,7 +607,12 @@ fn bench_select_row() {
         let set = table.query(session.as_mut(), &query).unwrap();
         sink += set.len();
     }
-    report("查询一行（20 列，不取值）", N, t.elapsed(), alloc_since(mark));
+    report(
+        "查询一行（20 列，不取值）",
+        N,
+        t.elapsed(),
+        alloc_since(mark),
+    );
     assert!(sink >= N);
 }
 
@@ -583,7 +671,11 @@ fn bench_update_if() {
     // 预热：让语句缓存与页缓存进入稳态（避免首个阶段独自承担编译成本）
     for _ in 0..2_000 {
         table
-            .update_by_pk(session.as_mut(), &[("Amount", DbValue::Int(1))], &[DbValue::Int(id)])
+            .update_by_pk(
+                session.as_mut(),
+                &[("Amount", DbValue::Int(1))],
+                &[DbValue::Int(id)],
+            )
             .unwrap();
         table
             .update_if(
@@ -599,7 +691,11 @@ fn bench_update_if() {
     let t = Instant::now();
     for _ in 0..N {
         table
-            .update_by_pk(session.as_mut(), &[("Amount", DbValue::Int(1))], &[DbValue::Int(id)])
+            .update_by_pk(
+                session.as_mut(),
+                &[("Amount", DbValue::Int(1))],
+                &[DbValue::Int(id)],
+            )
             .unwrap();
     }
     let plain = t.elapsed();
@@ -762,10 +858,7 @@ fn bench_audit_dal(tag: &str) -> pek_rcode::Dal {
 }
 
 /// 一次 `update_by_pk` / `update_by_pk_static` 对照测量（独立库，避免顺序偏差）。
-fn measure_updates(
-    dal: &pek_rcode::Dal,
-    n: usize,
-) -> ((Duration, usize), (Duration, usize)) {
+fn measure_updates(dal: &pek_rcode::Dal, n: usize) -> ((Duration, usize), (Duration, usize)) {
     use pek_rcode::DbValue;
     let table = dal.table("IoA").unwrap();
     let mut session = dal.open_session().unwrap();
@@ -781,7 +874,9 @@ fn measure_updates(
     session.begin().unwrap();
     for _ in 0..2_000 {
         table.update_by_pk(session.as_mut(), &sets, &pk).unwrap();
-        table.update_by_pk_static(session.as_mut(), &sets, &pk).unwrap();
+        table
+            .update_by_pk_static(session.as_mut(), &sets, &pk)
+            .unwrap();
     }
 
     let mark = ALLOCS.load(Ordering::Relaxed);
@@ -794,7 +889,9 @@ fn measure_updates(
     let mark = ALLOCS.load(Ordering::Relaxed);
     let t = Instant::now();
     for _ in 0..n {
-        table.update_by_pk_static(session.as_mut(), &sets, &pk).unwrap();
+        table
+            .update_by_pk_static(session.as_mut(), &sets, &pk)
+            .unwrap();
     }
     let cow = (t.elapsed(), alloc_since(mark));
     session.commit().unwrap();
@@ -1042,7 +1139,12 @@ fn bench_entity_read_paths() {
     for _ in 0..N {
         sink += dal.cached_count("IoA", session.as_mut()).unwrap() as usize;
     }
-    report("行数缓存命中（cached_count）", N, t.elapsed(), alloc_since(mark));
+    report(
+        "行数缓存命中（cached_count）",
+        N,
+        t.elapsed(),
+        alloc_since(mark),
+    );
 
     // ③ find：单对象缓存命中 + from_row
     let pk = [DbValue::Int(id)];
@@ -1054,7 +1156,12 @@ fn bench_entity_read_paths() {
             .map(|e| e.id as usize)
             .unwrap_or(0);
     }
-    report("Entity::find（单对象缓存命中）", N, t.elapsed(), alloc_since(mark));
+    report(
+        "Entity::find（单对象缓存命中）",
+        N,
+        t.elapsed(),
+        alloc_since(mark),
+    );
 
     // ④ find_cached_by：整表缓存内存匹配（零 SQL）
     let key = [("Code", DbValue::Text("A".into()))];
@@ -1082,7 +1189,12 @@ fn bench_entity_read_paths() {
             .unwrap()
             .len();
     }
-    report("Entity::query 一行（SQL + 映射）", N, t.elapsed(), alloc_since(mark));
+    report(
+        "Entity::query 一行（SQL + 映射）",
+        N,
+        t.elapsed(),
+        alloc_since(mark),
+    );
 
     println!("(sink={sink})");
 }
@@ -1104,10 +1216,26 @@ fn bench_entity_queue_insert() {
         let mut session = dal.open_session().unwrap();
         let columns: Vec<&'static str> = (1..=20)
             .map(|i| match i {
-                1 => "C1", 2 => "C2", 3 => "C3", 4 => "C4", 5 => "C5",
-                6 => "C6", 7 => "C7", 8 => "C8", 9 => "C9", 10 => "C10",
-                11 => "C11", 12 => "C12", 13 => "C13", 14 => "C14", 15 => "C15",
-                16 => "C16", 17 => "C17", 18 => "C18", 19 => "C19", _ => "C20",
+                1 => "C1",
+                2 => "C2",
+                3 => "C3",
+                4 => "C4",
+                5 => "C5",
+                6 => "C6",
+                7 => "C7",
+                8 => "C8",
+                9 => "C9",
+                10 => "C10",
+                11 => "C11",
+                12 => "C12",
+                13 => "C13",
+                14 => "C14",
+                15 => "C15",
+                16 => "C16",
+                17 => "C17",
+                18 => "C18",
+                19 => "C19",
+                _ => "C20",
             })
             .collect();
         let fields: Vec<(&'static str, DbValue)> = columns
@@ -1123,7 +1251,9 @@ fn bench_entity_queue_insert() {
         let t = Instant::now();
         for _ in 0..ROWS {
             if use_static {
-                queue.insert_static(&dal, session.as_mut(), &fields).unwrap();
+                queue
+                    .insert_static(&dal, session.as_mut(), &fields)
+                    .unwrap();
             } else {
                 queue.insert(&dal, session.as_mut(), &fields).unwrap();
             }

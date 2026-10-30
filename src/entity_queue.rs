@@ -276,11 +276,7 @@ impl EntityQueue {
     /// - 返回与累计的统计均按**提交行数**计（不受驱动「更新行计 2」的差异影响）；
     /// - 段内成批执行 = 单条语句原子（与逐条相比不产生更多锁冲突）；事务仍由调用方按需包裹
     ///   （与 C# 一致，SQLite 下不要在外层无条件包事务）。
-    pub fn flush(
-        &mut self,
-        dal: &Dal,
-        session: &mut dyn SqlSession,
-    ) -> Result<QueueStats> {
+    pub fn flush(&mut self, dal: &Dal, session: &mut dyn SqlSession) -> Result<QueueStats> {
         let table = dal.table(&self.table)?;
         let mut stats = QueueStats::default();
         let items = std::mem::take(&mut self.items);
@@ -305,8 +301,12 @@ impl EntityQueue {
                         })
                         .collect();
                     let refs: Vec<&Vec<(&str, &DbValue)>> = rows.iter().collect();
-                    stats.inserted +=
-                        table.write_batch_rows_core(session, &refs, BatchWriteMode::Insert, None)?;
+                    stats.inserted += table.write_batch_rows_core(
+                        session,
+                        &refs,
+                        BatchWriteMode::Insert,
+                        None,
+                    )?;
                 }
                 QueueMethod::Delete => {
                     // 连续 Delete 段：单一主键时合并为主键 IN 批量删除
@@ -521,10 +521,8 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-queue-{}-{stamp}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rcode-queue-{}-{stamp}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("queue.db");
         let model = EntityModel::parse(MODEL).expect("测试模型应可解析");
@@ -546,14 +544,20 @@ mod tests {
         let mut queue = EntityQueue::new("Item");
         queue.set_batch_size(2);
 
-        queue.insert(&dal, session.as_mut(), &[("Code", "A".into())]).unwrap();
+        queue
+            .insert(&dal, session.as_mut(), &[("Code", "A".into())])
+            .unwrap();
         assert_eq!(queue.len(), 1, "未达批大小不执行");
-        queue.insert(&dal, session.as_mut(), &[("Code", "B".into())]).unwrap();
+        queue
+            .insert(&dal, session.as_mut(), &[("Code", "B".into())])
+            .unwrap();
         assert_eq!(queue.len(), 0, "达到批大小自动 flush");
         assert_eq!(table.count(session.as_mut(), None).unwrap(), 2);
 
         // 手动 flush 剩余
-        queue.insert(&dal, session.as_mut(), &[("Code", "C".into())]).unwrap();
+        queue
+            .insert(&dal, session.as_mut(), &[("Code", "C".into())])
+            .unwrap();
         let stats = queue.flush(&dal, session.as_mut()).unwrap();
         assert_eq!(stats.inserted, 1);
         assert_eq!(queue.stats().total(), 3);
@@ -574,24 +578,43 @@ mod tests {
         let mut queue = EntityQueue::new("Item");
         // 已存在 → 更新
         queue
-            .upsert(&dal, session.as_mut(), &[DbValue::Int(id)], &[("Code", "A2".into())])
+            .upsert(
+                &dal,
+                session.as_mut(),
+                &[DbValue::Int(id)],
+                &[("Code", "A2".into())],
+            )
             .unwrap();
         // 不存在 → 插入（自动补主键）
         queue
-            .upsert(&dal, session.as_mut(), &[DbValue::Int(id + 100)], &[("Code", "NEW".into())])
+            .upsert(
+                &dal,
+                session.as_mut(),
+                &[DbValue::Int(id + 100)],
+                &[("Code", "NEW".into())],
+            )
             .unwrap();
         let stats = queue.flush(&dal, session.as_mut()).unwrap();
         assert_eq!(stats.updated, 1);
         assert_eq!(stats.inserted, 1);
 
-        let row = table.find_by_pk(session.as_mut(), &[DbValue::Int(id)]).unwrap().unwrap();
+        let row = table
+            .find_by_pk(session.as_mut(), &[DbValue::Int(id)])
+            .unwrap()
+            .unwrap();
         assert_eq!(row.get_by_name("Code").unwrap().as_str(), Some("A2"));
 
         // 删除
-        queue.delete(&dal, session.as_mut(), &[DbValue::Int(id)]).unwrap();
+        queue
+            .delete(&dal, session.as_mut(), &[DbValue::Int(id)])
+            .unwrap();
         let stats = queue.flush(&dal, session.as_mut()).unwrap();
         assert_eq!(stats.deleted, 1);
-        assert!(!table.exists_by_pk(session.as_mut(), &[DbValue::Int(id)]).unwrap());
+        assert!(
+            !table
+                .exists_by_pk(session.as_mut(), &[DbValue::Int(id)])
+                .unwrap()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -611,14 +634,18 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir()
-            .join(format!("rcode-queue-dirty-{}-{stamp}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "rcode-queue-dirty-{}-{stamp}-{name}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("queue.db");
         let model = EntityModel::parse(MODEL_DIRTY).expect("测试模型应可解析");
-        let dal =
-            Dal::open_with_model(&format!("Data Source={};Provider=SQLite", db.display()), model)
-                .unwrap();
+        let dal = Dal::open_with_model(
+            &format!("Data Source={};Provider=SQLite", db.display()),
+            model,
+        )
+        .unwrap();
         dal.sync_schema().unwrap();
         (dal, dir)
     }

@@ -37,11 +37,8 @@ fn temp_conn(name: &str) -> (PathBuf, String) {
         .format("%H%M%S%.9f")
         .to_string()
         .replace('.', "");
-    let dir = std::env::temp_dir().join(format!(
-        "rcode-idx-{}-{}-{name}",
-        std::process::id(),
-        stamp
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("rcode-idx-{}-{}-{name}", std::process::id(), stamp));
     std::fs::create_dir_all(&dir).unwrap();
     let conn = format!("Data Source={};Provider=SQLite", dir.join("t.db").display());
     (dir, conn)
@@ -50,7 +47,9 @@ fn temp_conn(name: &str) -> (PathBuf, String) {
 /// 读取 `DeviceId` 索引的唯一性（找不到返回 `None`）。
 fn device_index_unique(dal: &Dal) -> Option<bool> {
     let mut session = dal.open_session().unwrap();
-    let rows = session.query("pragma index_list('DeviceOnline')", &[]).unwrap();
+    let rows = session
+        .query("pragma index_list('DeviceOnline')", &[])
+        .unwrap();
     for row in rows.rows.iter() {
         let name = row
             .get_by_name("name")
@@ -101,7 +100,10 @@ fn sync_schema_upgrades_plain_index_to_unique() {
     {
         let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL_UNIQUE).unwrap()).unwrap();
         let report = dal.sync_schema().unwrap();
-        assert!(report.added_indexes.is_empty(), "已存在唯一索引时不应重复建");
+        assert!(
+            report.added_indexes.is_empty(),
+            "已存在唯一索引时不应重复建"
+        );
         assert_eq!(device_index_unique(&dal), Some(true));
     }
 
@@ -123,60 +125,62 @@ fn sync_schema_never_downgrades_unique_index() {
         let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL_PLAIN).unwrap()).unwrap();
         let report = dal.sync_schema().unwrap();
         assert!(report.added_indexes.is_empty());
-        assert_eq!(
-            device_index_unique(&dal),
-            Some(true),
-            "不应降级为普通索引"
-        );
+        assert_eq!(device_index_unique(&dal), Some(true), "不应降级为普通索引");
     }
 
- 
+    /// 「该清的清」：模型里没有的索引由 `sync_indexes` 自动删除（主键/系统索引除外）。
+    #[test]
+    fn sync_indexes_drops_extra_index_not_in_model() {
+        let (dir, conn) = temp_conn("drop-extra");
 
-/// 「该清的清」：模型里没有的索引由 `sync_indexes` 自动删除（主键/系统索引除外）。
-#[test]
-fn sync_indexes_drops_extra_index_not_in_model() {
-    let (dir, conn) = temp_conn("drop-extra");
+        {
+            let dal =
+                Dal::open_with_model(&conn, EntityModel::parse(MODEL_PLAIN).unwrap()).unwrap();
+            dal.sync_schema().unwrap();
+            // 手工加一个模型里没有的索引，模拟历史遗留
+            let mut session = dal.open_session().unwrap();
+            session
+                .execute("create index ix_extra_pings on DeviceOnline(Pings)", &[])
+                .unwrap();
+        }
 
-    {
-        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL_PLAIN).unwrap()).unwrap();
-        dal.sync_schema().unwrap();
-        // 手工加一个模型里没有的索引，模拟历史遗留
-        let mut session = dal.open_session().unwrap();
-        session
-            .execute("create index ix_extra_pings on DeviceOnline(Pings)", &[])
-            .unwrap();
-    }
+        {
+            // 模型只有 DeviceId 索引 → Pings 的索引属"多余"，应被清理
+            let dal =
+                Dal::open_with_model(&conn, EntityModel::parse(MODEL_PLAIN).unwrap()).unwrap();
+            let report = dal.sync_indexes().unwrap();
+            assert!(
+                report
+                    .dropped_indexes
+                    .iter()
+                    .any(|(_, name)| name.to_lowercase().contains("extra")),
+                "应删除模型外的索引：{:?}",
+                report.dropped_indexes
+            );
 
-    {
-        // 模型只有 DeviceId 索引 → Pings 的索引属"多余"，应被清理
-        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL_PLAIN).unwrap()).unwrap();
-        let report = dal.sync_indexes().unwrap();
-        assert!(
-            report
-                .dropped_indexes
+            let mut session = dal.open_session().unwrap();
+            let rows = session
+                .query("pragma index_list('DeviceOnline')", &[])
+                .unwrap();
+            let names: Vec<String> = rows
+                .rows
                 .iter()
-                .any(|(_, name)| name.to_lowercase().contains("extra")),
-            "应删除模型外的索引：{:?}",
-            report.dropped_indexes
-        );
+                .filter_map(|r| {
+                    r.get_by_name("name")
+                        .and_then(|v| v.as_str().map(|s| s.to_lowercase()))
+                })
+                .collect();
+            assert!(
+                !names.iter().any(|n| n.contains("extra")),
+                "多余索引应已被删除：{names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n.contains("deviceid")),
+                "模型里的索引必须保留：{names:?}"
+            );
+        }
 
-        let mut session = dal.open_session().unwrap();
-        let rows = session.query("pragma index_list('DeviceOnline')", &[]).unwrap();
-        let names: Vec<String> = rows
-            .rows
-            .iter()
-            .filter_map(|r| r.get_by_name("name").and_then(|v| v.as_str().map(|s| s.to_lowercase())))
-            .collect();
-        assert!(
-            !names.iter().any(|n| n.contains("extra")),
-            "多余索引应已被删除：{names:?}"
-        );
-        assert!(
-            names.iter().any(|n| n.contains("deviceid")),
-            "模型里的索引必须保留：{names:?}"
-        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
-
     let _ = std::fs::remove_dir_all(&dir);
-}   let _ = std::fs::remove_dir_all(&dir);
 }

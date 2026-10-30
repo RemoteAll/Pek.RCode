@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use pek_rcode::{shards, Dal, EntityModel, Query};
+use pek_rcode::{Dal, EntityModel, Query, shards};
 
 const MODEL: &str = r#"
 <EntityModel>

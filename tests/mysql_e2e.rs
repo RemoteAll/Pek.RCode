@@ -103,16 +103,30 @@ impl Entity for RCodeTestItem {
 
     fn from_row(row: &DbRow) -> Result<Self> {
         Ok(Self {
-            id: row.get_by_name("Id").and_then(DbValue::as_i32).unwrap_or_default(),
-            code: row.get_by_name("Code").map(DbValue::to_text).unwrap_or_default(),
-            amount: row.get_by_name("Amount").and_then(DbValue::as_decimal).unwrap_or_default(),
-            ok: row.get_by_name("Ok").and_then(DbValue::as_bool).unwrap_or_default(),
+            id: row
+                .get_by_name("Id")
+                .and_then(DbValue::as_i32)
+                .unwrap_or_default(),
+            code: row
+                .get_by_name("Code")
+                .map(DbValue::to_text)
+                .unwrap_or_default(),
+            amount: row
+                .get_by_name("Amount")
+                .and_then(DbValue::as_decimal)
+                .unwrap_or_default(),
+            ok: row
+                .get_by_name("Ok")
+                .and_then(DbValue::as_bool)
+                .unwrap_or_default(),
             s_id: row.get_by_name("SId").and_then(DbValue::as_i64),
             create_time: row
                 .get_by_name("CreateTime")
                 .and_then(DbValue::as_datetime)
                 .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc()),
-            data: row.get_by_name("Data").and_then(|v| v.as_blob().map(<[u8]>::to_vec)),
+            data: row
+                .get_by_name("Data")
+                .and_then(|v| v.as_blob().map(<[u8]>::to_vec)),
         })
     }
 
@@ -170,8 +184,13 @@ impl Entity for RCodeTestKey {
 
     fn from_row(row: &DbRow) -> Result<Self> {
         Ok(Self {
-            key: row.get_by_name("Key").map(DbValue::to_text).unwrap_or_default(),
-            value: row.get_by_name("Value").and_then(|v| (!v.is_null()).then(|| v.to_text())),
+            key: row
+                .get_by_name("Key")
+                .map(DbValue::to_text)
+                .unwrap_or_default(),
+            value: row
+                .get_by_name("Value")
+                .and_then(|v| (!v.is_null()).then(|| v.to_text())),
         })
     }
 }
@@ -200,7 +219,8 @@ fn mysql_init_command_and_stmt_cache_options() {
     };
     // 连接串新增两个 IoT 常用旋钮：`StatementCacheSize=`（预编译语句缓存）与
     // `InitCommand=`（会话级 SET，分号分隔）。这里把会话超时改成 5 秒并回读验证。
-    let tuned = format!("{conn};StatementCacheSize=128;InitCommand=SET SESSION innodb_lock_wait_timeout=5");
+    let tuned =
+        format!("{conn};StatementCacheSize=128;InitCommand=SET SESSION innodb_lock_wait_timeout=5");
     let dal = Dal::open_with_model(&tuned, EntityModel::parse(MODEL).unwrap()).expect("连接");
     let mut session = dal.open_session().unwrap();
     let set = session
@@ -283,7 +303,10 @@ fn run_roundtrip(dal: &Dal) {
     let mut expected = item1.clone();
     expected.create_time = expected_seconds;
     assert_eq!(found, expected, "实体全字段应原样往返（时间为秒精度）");
-    assert_eq!(found.create_time, expected_seconds, "时间按 DATETIME 秒精度往返");
+    assert_eq!(
+        found.create_time, expected_seconds,
+        "时间按 DATETIME 秒精度往返"
+    );
 
     // 未提供的可空列应为 NULL（Option 字段为 None）
     let found2 = RCodeTestItem::find(dal, session.as_mut(), &[item2.id.into()])
@@ -294,12 +317,18 @@ fn run_roundtrip(dal: &Dal) {
 
     // 条件统计 + 分页查询（实体 count/query/all）
     let filter = Where::new().like("Code", "HLT-%");
-    assert_eq!(RCodeTestItem::count(dal, session.as_mut(), Some(&filter)).unwrap(), 2);
+    assert_eq!(
+        RCodeTestItem::count(dal, session.as_mut(), Some(&filter)).unwrap(),
+        2
+    );
 
     let page1 = RCodeTestItem::query(
         dal,
         session.as_mut(),
-        &Query::new().filter(filter.clone()).order_by("Id", true).page(1, 1),
+        &Query::new()
+            .filter(filter.clone())
+            .order_by("Id", true)
+            .page(1, 1),
     )
     .unwrap();
     assert_eq!(page1.len(), 1, "每页 1 条");
@@ -335,16 +364,28 @@ fn run_roundtrip(dal: &Dal) {
     let mut key1 = RCodeTestKey::new();
     key1.key = "k-001".into();
     key1.value = Some("你好，MySQL".into());
-    assert_eq!(key1.save(dal, session.as_mut()).unwrap(), 1, "无自增实体 save 应走新增");
+    assert_eq!(
+        key1.save(dal, session.as_mut()).unwrap(),
+        1,
+        "无自增实体 save 应走新增"
+    );
 
     let loaded = RCodeTestKey::find(dal, session.as_mut(), &["k-001".into()])
         .unwrap()
         .unwrap();
-    assert_eq!(loaded.value.as_deref(), Some("你好，MySQL"), "utf8mb4 中文应原样往返");
+    assert_eq!(
+        loaded.value.as_deref(),
+        Some("你好，MySQL"),
+        "utf8mb4 中文应原样往返"
+    );
 
     let mut edit_key = loaded.clone();
     edit_key.value = Some("改过的值".into());
-    assert_eq!(edit_key.save(dal, session.as_mut()).unwrap(), 1, "已存在实体 save 应走更新");
+    assert_eq!(
+        edit_key.save(dal, session.as_mut()).unwrap(),
+        1,
+        "已存在实体 save 应走更新"
+    );
     let reloaded_key = RCodeTestKey::find(dal, session.as_mut(), &["k-001".into()])
         .unwrap()
         .unwrap();
@@ -384,7 +425,11 @@ fn run_roundtrip(dal: &Dal) {
     let reloaded_up = RCodeTestKey::find(dal, session.as_mut(), &["k-up-0".into()])
         .unwrap()
         .unwrap();
-    assert_eq!(reloaded_up.value.as_deref(), Some("v2"), "Upsert 应真正更新");
+    assert_eq!(
+        reloaded_up.value.as_deref(),
+        Some("v2"),
+        "Upsert 应真正更新"
+    );
     for entity in &upserts {
         assert_eq!(entity.delete(dal, session.as_mut()).unwrap(), 1);
     }
@@ -406,7 +451,10 @@ fn run_roundtrip(dal: &Dal) {
     assert!(after_tx.is_empty(), "回滚后不应存在事务内插入的数据");
 
     // 剩余数据核对（id1 仍在）
-    assert_eq!(RCodeTestItem::count(dal, session.as_mut(), None).unwrap(), 1);
+    assert_eq!(
+        RCodeTestItem::count(dal, session.as_mut(), None).unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -418,7 +466,8 @@ fn mysql_connection_failure_is_reported() {
     }
 
     // 指向一个必然连不上的端口，应得到清晰错误而非 panic
-    let dal = Dal::open("Server=127.0.0.1;Port=1;Database=x;Uid=x;Pwd=x;provider=mysql;timeout=2").unwrap();
+    let dal = Dal::open("Server=127.0.0.1;Port=1;Database=x;Uid=x;Pwd=x;provider=mysql;timeout=2")
+        .unwrap();
     let err = match dal.open_session() {
         Ok(_) => panic!("端口 1 不应连接成功"),
         Err(e) => e.to_string(),

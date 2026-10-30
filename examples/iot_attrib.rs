@@ -144,16 +144,29 @@ fn main() -> pek_rcode::Result<()> {
     println!("每批 {BATCH} 行 × {ROUNDS} 批 = {} 行", BATCH * ROUNDS);
     println!("SQL 文本长度 {sql_len} 字节");
     println!();
-    println!("① 客户端 SQL 拼接      {:>8.2} ms  每批 {:>7.1} µs", ms(sql_cost), per_batch(sql_cost) * 1000.0);
-    println!("② 客户端参数构造+分配  {:>8.2} ms  每批 {:>7.1} µs", ms(param_cost), per_batch(param_cost) * 1000.0);
-    println!("③ 完整路径(构造+发送+服务端) {:>8.2} ms  每批 {:>7.1} µs", ms(exec_cost), per_batch(exec_cost) * 1000.0);
-    println!("④ `SELECT 1` 往返基线  {:>8.2} ms  每次 {:>7.1} µs", ms(ping_cost), per_batch(ping_cost) * 1000.0);
+    println!(
+        "① 客户端 SQL 拼接      {:>8.2} ms  每批 {:>7.1} µs",
+        ms(sql_cost),
+        per_batch(sql_cost) * 1000.0
+    );
+    println!(
+        "② 客户端参数构造+分配  {:>8.2} ms  每批 {:>7.1} µs",
+        ms(param_cost),
+        per_batch(param_cost) * 1000.0
+    );
+    println!(
+        "③ 完整路径(构造+发送+服务端) {:>8.2} ms  每批 {:>7.1} µs",
+        ms(exec_cost),
+        per_batch(exec_cost) * 1000.0
+    );
+    println!(
+        "④ `SELECT 1` 往返基线  {:>8.2} ms  每次 {:>7.1} µs",
+        ms(ping_cost),
+        per_batch(ping_cost) * 1000.0
+    );
     println!();
     let batch_us = per_batch(exec_cost) * 1000.0;
-    println!(
-        "→ 一批 500 行的 {} µs 中：",
-        batch_us.round()
-    );
+    println!("→ 一批 500 行的 {} µs 中：", batch_us.round());
     println!(
         "   · SQL 拼接      {:>7.1} µs（{:.1}%）",
         per_batch(sql_cost) * 1000.0,
@@ -171,8 +184,14 @@ fn main() -> pek_rcode::Result<()> {
     );
     println!(
         "   · 服务端执行    {:>7.1} µs（{:.1}%）",
-        (batch_us - per_batch(sql_cost) * 1000.0 - per_batch(param_cost) * 1000.0 - per_batch(ping_cost) * 1000.0).max(0.0),
-        (1.0 - (per_batch(sql_cost) + per_batch(param_cost) + per_batch(ping_cost)) / per_batch(exec_cost)) * 100.0
+        (batch_us
+            - per_batch(sql_cost) * 1000.0
+            - per_batch(param_cost) * 1000.0
+            - per_batch(ping_cost) * 1000.0)
+            .max(0.0),
+        (1.0 - (per_batch(sql_cost) + per_batch(param_cost) + per_batch(ping_cost))
+            / per_batch(exec_cost))
+            * 100.0
     );
     println!();
     println!(
@@ -183,7 +202,8 @@ fn main() -> pek_rcode::Result<()> {
     println!(
         "   （对比多行 Upsert：每行 {:>5.1} µs；差距 {:>5.1} 倍）",
         per_batch(exec_cost) * 1000.0 / BATCH as f64,
-        (ms(tracked_cost) * 1000.0 / TRACKED_ROWS as f64) / (per_batch(exec_cost) * 1000.0 / BATCH as f64)
+        (ms(tracked_cost) * 1000.0 / TRACKED_ROWS as f64)
+            / (per_batch(exec_cost) * 1000.0 / BATCH as f64)
     );
     Ok(())
 }

@@ -133,8 +133,6 @@ fn to_table_meta(info: catalog::TableInfo) -> TableMeta {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,9 +167,15 @@ mod tests {
         assert_eq!(map_sqlite_type("bit", false).0, DataType::Boolean);
         assert_eq!(map_sqlite_type("single", false).0, DataType::Single);
         assert_eq!(map_sqlite_type("real", false).0, DataType::Double);
-        assert_eq!(map_sqlite_type("nvarchar(50)", false), (DataType::String, 50, 0, 0));
+        assert_eq!(
+            map_sqlite_type("nvarchar(50)", false),
+            (DataType::String, 50, 0, 0)
+        );
         assert_eq!(map_sqlite_type("text", false), (DataType::String, 0, 0, 0));
-        assert_eq!(map_sqlite_type("decimal(18,4)", false), (DataType::Decimal, 0, 18, 4));
+        assert_eq!(
+            map_sqlite_type("decimal(18,4)", false),
+            (DataType::Decimal, 0, 18, 4)
+        );
         assert_eq!(map_sqlite_type("datetime", false).0, DataType::DateTime);
         assert_eq!(map_sqlite_type("binary", false).0, DataType::Binary);
         // 未知类型兜底为文本
@@ -186,10 +190,8 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-reverse-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rcode-reverse-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("reverse.db");
 
@@ -231,7 +233,10 @@ mod tests {
         let xml = reversed.to_xml();
         let again = EntityModel::parse(&xml).unwrap();
         assert_eq!(again.tables.len(), 1);
-        assert_eq!(again.tables[0].columns.len(), source.tables[0].columns.len());
+        assert_eq!(
+            again.tables[0].columns.len(),
+            source.tables[0].columns.len()
+        );
 
         // 默认值反向（手工建表带默认值的列）
         let mut session = dal.open_session().unwrap();

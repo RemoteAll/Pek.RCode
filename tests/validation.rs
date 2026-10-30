@@ -100,7 +100,8 @@ fn temp_dir(name: &str) -> PathBuf {
         .format("%H%M%S%.9f")
         .to_string()
         .replace('.', "");
-    let dir = std::env::temp_dir().join(format!("rcode-val-{}-{}-{name}", std::process::id(), stamp));
+    let dir =
+        std::env::temp_dir().join(format!("rcode-val-{}-{}-{name}", std::process::id(), stamp));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

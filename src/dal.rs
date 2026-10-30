@@ -373,7 +373,9 @@ fn pool_options_from(conn: &ConnectionString) -> (PoolOptions, usize) {
 fn create_session(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
     // network：SQL 转发到远端 XCode/DbServer（远端类型由 `Dal::open` 登录探明）
     if crate::network::is_network(conn_str) {
-        return Ok(Box::new(crate::network::NetworkSession::new(conn_str, kind)?));
+        return Ok(Box::new(crate::network::NetworkSession::new(
+            conn_str, kind,
+        )?));
     }
     match kind {
         DatabaseKind::Sqlite => {
@@ -471,7 +473,9 @@ fn open_firebird(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
 
 #[cfg(feature = "driver-clickhouse")]
 fn open_clickhouse(conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
-    Ok(Box::new(crate::clickhouse::ClickHouseSession::open(conn_str)?))
+    Ok(Box::new(crate::clickhouse::ClickHouseSession::open(
+        conn_str,
+    )?))
 }
 #[cfg(not(feature = "driver-clickhouse"))]
 fn open_clickhouse(_conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
@@ -520,7 +524,10 @@ fn open_odbc(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Box<dyn 
 }
 #[cfg(not(feature = "driver-odbc"))]
 fn open_odbc(_kind: DatabaseKind, _conn_str: &ConnectionString) -> Result<Box<dyn SqlSession>> {
-    Err(driver_missing("ODBC（DB2/达梦/IRIS/Access）", "driver-odbc"))
+    Err(driver_missing(
+        "ODBC（DB2/达梦/IRIS/Access）",
+        "driver-odbc",
+    ))
 }
 
 impl Dal {
@@ -576,8 +583,8 @@ impl Dal {
             pool_enabled,
             readonly: AtomicBool::new(readonly),
             read_replicas: RwLock::new(Arc::new(Vec::new())),
-        has_replicas: AtomicBool::new(false),
-        rw_needs_check: AtomicBool::new(false),
+            has_replicas: AtomicBool::new(false),
+            rw_needs_check: AtomicBool::new(false),
             rw_strategy: RwLock::new(ReadWriteStrategy::new()),
             read_cursor: AtomicUsize::new(0),
         })
@@ -629,7 +636,8 @@ impl Dal {
             for (i, table) in model.tables.iter().enumerate() {
                 // 原名（生成代码传入字面量 = 零分配精确匹配）
                 map.entry(table.name.clone()).or_insert(i);
-                map.entry(table.effective_table_name().to_string()).or_insert(i);
+                map.entry(table.effective_table_name().to_string())
+                    .or_insert(i);
                 // 小写（兼容大小写不一致的调用）
                 map.entry(table.name.to_ascii_lowercase()).or_insert(i);
                 map.entry(table.effective_table_name().to_ascii_lowercase())
@@ -1167,15 +1175,12 @@ impl Dal {
             {
                 continue;
             }
-            let existing = match crate::catalog::read_indexes(
-                session.as_mut(),
-                self.kind,
-                table_name,
-            ) {
-                Ok(indexes) => indexes,
-                Err(Error::Unsupported(_)) => continue,
-                Err(e) => return Err(e),
-            };
+            let existing =
+                match crate::catalog::read_indexes(session.as_mut(), self.kind, table_name) {
+                    Ok(indexes) => indexes,
+                    Err(Error::Unsupported(_)) => continue,
+                    Err(e) => return Err(e),
+                };
             for idx in &table.indexes {
                 if idx.columns.is_empty() {
                     continue;
@@ -1198,8 +1203,7 @@ impl Dal {
                             && same_index(&e.columns, &idx.columns)
                             && e.name.eq_ignore_ascii_case(&want_name)
                     })
-                    && let Some(drop_sql) =
-                        self.kind.drop_index_sql(&plain.name, Some(table_name))
+                    && let Some(drop_sql) = self.kind.drop_index_sql(&plain.name, Some(table_name))
                 {
                     self.exec_ddl(session.as_mut(), Migration::On, &mut report, &drop_sql)?;
                     report
@@ -1345,10 +1349,11 @@ impl Dal {
                             let unique_exists = existing_indexes
                                 .iter()
                                 .any(|e| e.unique && same_index(&e.columns, &idx.columns));
-                            if unique_exists || (!idx.unique
-                                && existing_indexes
-                                    .iter()
-                                    .any(|e| same_index(&e.columns, &idx.columns)))
+                            if unique_exists
+                                || (!idx.unique
+                                    && existing_indexes
+                                        .iter()
+                                        .any(|e| same_index(&e.columns, &idx.columns)))
                             {
                                 // 已有同列唯一索引；或模型不要求唯一而库里已有同列索引（不降级）
                                 continue;
@@ -1396,9 +1401,7 @@ impl Dal {
                             if in_model && !redundant {
                                 continue;
                             }
-                            if let Some(sql) =
-                                self.kind.drop_index_sql(&e.name, Some(table_name))
-                            {
+                            if let Some(sql) = self.kind.drop_index_sql(&e.name, Some(table_name)) {
                                 self.exec_ddl(&mut *session, mode, &mut report, &sql)?;
                                 report
                                     .dropped_indexes
@@ -1523,10 +1526,9 @@ impl Dal {
                 Ok(()) => report
                     .altered_columns
                     .push((m.table.clone(), m.column.clone())),
-                Err(e) => report.notes.push(format!(
-                    "{}.{}：调整列长度失败（{e}）",
-                    m.table, m.column
-                )),
+                Err(e) => report
+                    .notes
+                    .push(format!("{}.{}：调整列长度失败（{e}）", m.table, m.column)),
             }
         }
         Ok(())
@@ -1567,9 +1569,9 @@ impl Dal {
                 continue;
             }
             let Some(sql) = self.kind.drop_index_sql(iname, Some(tname)) else {
-                report
-                    .notes
-                    .push(format!("{tname}.{iname}：该数据库不支持直接删除索引，请人工处理"));
+                report.notes.push(format!(
+                    "{tname}.{iname}：该数据库不支持直接删除索引，请人工处理"
+                ));
                 continue;
             };
             match self.exec_ddl(&mut *session, Migration::Full, report, &sql) {
@@ -1586,9 +1588,9 @@ impl Dal {
                 continue;
             }
             let Some(sql) = self.kind.drop_column_sql(tname, cname) else {
-                report
-                    .notes
-                    .push(format!("{tname}.{cname}：该数据库不支持直接删除列，请人工处理"));
+                report.notes.push(format!(
+                    "{tname}.{cname}：该数据库不支持直接删除列，请人工处理"
+                ));
                 continue;
             };
             match self.exec_ddl(&mut *session, Migration::Full, report, &sql) {
@@ -1622,9 +1624,10 @@ impl Dal {
                 Ok(()) => report
                     .altered_columns
                     .push((tname.clone(), mismatch.column.clone())),
-                Err(e) => report
-                    .notes
-                    .push(format!("{tname}.{}：修改列类型失败（{e}）", mismatch.column)),
+                Err(e) => report.notes.push(format!(
+                    "{tname}.{}：修改列类型失败（{e}）",
+                    mismatch.column
+                )),
             }
         }
 
@@ -1691,7 +1694,10 @@ impl Dal {
             Ok(db_tables) => {
                 for table in &model.tables {
                     let tname = table.effective_table_name();
-                    match db_tables.iter().find(|t| t.name.eq_ignore_ascii_case(tname)) {
+                    match db_tables
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(tname))
+                    {
                         None => {
                             diff.missing_tables.push(tname.to_string());
                             diff.alter_sql.extend(self.kind.create_table_sql(table));
@@ -1714,7 +1720,9 @@ impl Dal {
                                         let expected = self.kind.field_type(col);
                                         if !same_base_type(&expected, &db_col.raw_type) {
                                             // `Full` 档专用：修改类预检脚本（dry-run 导出；执行前请确认数据影响）
-                                            if let Some(sql) = self.kind.alter_column_sql(table, col) {
+                                            if let Some(sql) =
+                                                self.kind.alter_column_sql(table, col)
+                                            {
                                                 diff.full_sql.push(sql);
                                             }
                                             diff.type_mismatches.push(ColumnTypeMismatch {
@@ -1728,7 +1736,9 @@ impl Dal {
                                         {
                                             // 长度差异：**扩大在 `On` 档即执行**（对齐 C# `IsColumnLengthChanged`），
                                             // 缩窄只在 `Full` 档（`IsColumnChanged`）
-                                            if let Some(sql) = self.kind.alter_column_sql(table, col) {
+                                            if let Some(sql) =
+                                                self.kind.alter_column_sql(table, col)
+                                            {
                                                 if widening {
                                                     diff.alter_sql.push(sql);
                                                 } else {
@@ -1749,7 +1759,9 @@ impl Dal {
                             for db_col in &db.columns {
                                 if table.column(&db_col.name).is_none() {
                                     // `Full` 档专用：删除类预检脚本
-                                    if let Some(sql) = self.kind.drop_column_sql(tname, &db_col.name) {
+                                    if let Some(sql) =
+                                        self.kind.drop_column_sql(tname, &db_col.name)
+                                    {
                                         diff.full_sql.push(sql);
                                     }
                                     diff.extra_columns
@@ -1778,19 +1790,17 @@ impl Dal {
                                     // 模型要唯一、库里只有同列普通索引 → 需要先删同名再建
                                     let want_name = self.kind.index_name(table, idx);
                                     if idx.unique
-                                        && let Some(existing) =
-                                            db.indexes.iter().find(|e| {
-                                                !e.unique
-                                                    && same_index(&e.columns, &idx.columns)
-                                                    && e.name.eq_ignore_ascii_case(&want_name)
-                                            })
+                                        && let Some(existing) = db.indexes.iter().find(|e| {
+                                            !e.unique
+                                                && same_index(&e.columns, &idx.columns)
+                                                && e.name.eq_ignore_ascii_case(&want_name)
+                                        })
                                         && let Some(drop_sql) =
                                             self.kind.drop_index_sql(&existing.name, Some(tname))
                                     {
                                         diff.alter_sql.push(drop_sql);
                                     }
-                                    diff.missing_indexes
-                                        .push((tname.to_string(), want_name));
+                                    diff.missing_indexes.push((tname.to_string(), want_name));
                                     if let Some(sql) = self.kind.create_index_sql(table, idx) {
                                         diff.alter_sql.push(sql);
                                     }
@@ -1994,11 +2004,7 @@ impl fmt::Display for SchemaReport {
             write!(f, "；补索引：{}", list.join(", "))?;
         }
         if !self.created_sequences.is_empty() {
-            write!(
-                f,
-                "；补建序列：{}",
-                self.created_sequences.join(", ")
-            )?;
+            write!(f, "；补建序列：{}", self.created_sequences.join(", "))?;
         }
         if !self.altered_columns.is_empty() {
             let list: Vec<String> = self
@@ -2110,7 +2116,10 @@ fn is_primary_index_name(name: &str) -> bool {
 
 /// 索引列集合是否一致（同列且同序，忽略大小写）。
 fn same_index(a: &[String], b: &[String]) -> bool {
-    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq_ignore_ascii_case(y))
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 /// 宽松比较列类型：只比较基础类型名（忽略长度/精度/大小写），并处理常见等价别名。
@@ -2224,11 +2233,8 @@ impl<'a> TableRef<'a> {
             return self.insert_borrowed_single(session, fields);
         }
         // 拦截器补全审计字段（对应实体拦截器 OnValid）
-        let values = crate::interceptor::prepare(
-            self.table,
-            crate::interceptor::DataMethod::Insert,
-            fields,
-        );
+        let values =
+            crate::interceptor::prepare(self.table, crate::interceptor::DataMethod::Insert, fields);
         self.insert_prepared_owned(session, values)
     }
 
@@ -2300,12 +2306,8 @@ impl<'a> TableRef<'a> {
         session: &mut dyn SqlSession,
         fields: &[(&str, DbValue)],
     ) -> Result<i64> {
-        let (sql, params) = sqlbuild::insert_sql_named(
-            self.dal.kind,
-            self.table,
-            self.physical_name(),
-            fields,
-        )?;
+        let (sql, params) =
+            sqlbuild::insert_sql_named(self.dal.kind, self.table, self.physical_name(), fields)?;
         self.execute_insert_sql(session, sql, params)
     }
 
@@ -2325,7 +2327,12 @@ impl<'a> TableRef<'a> {
             )
         {
             sql.push_str(" RETURNING ");
-            sql.push_str(&self.dal.kind.quote(self.table.effective_column_name(id_col)));
+            sql.push_str(
+                &self
+                    .dal
+                    .kind
+                    .quote(self.table.effective_column_name(id_col)),
+            );
             self.dal.log_sql(&sql);
             let set = session.query_owned(&sql, params)?;
             // 写入使缓存失效（对应 DH.NCode：任何添删改都让缓存马上过期）
@@ -2450,8 +2457,7 @@ impl<'a> TableRef<'a> {
         mode: BatchWriteMode,
         batch_size: Option<usize>,
     ) -> Result<u64> {
-        let refs: Vec<&Vec<(&str, DbValue)>> =
-            rows.iter().filter(|row| !row.is_empty()).collect();
+        let refs: Vec<&Vec<(&str, DbValue)>> = rows.iter().filter(|row| !row.is_empty()).collect();
         self.write_batch_rows_core(session, &refs, mode, batch_size)
     }
 
@@ -2473,14 +2479,21 @@ impl<'a> TableRef<'a> {
 
         // 列集 = 首行列集；首行自增列为 0/缺失 → 整批排除自增列（对齐 C# `BuildInsertColumns`）
         let identity = self.table.identity().map(|c| c.name.clone());
-        let drop_identity = identity
-            .as_ref()
-            .is_some_and(|name| first.find_value(name).and_then(DbValue::as_i64).unwrap_or(0) == 0);
+        let drop_identity = identity.as_ref().is_some_and(|name| {
+            first
+                .find_value(name)
+                .and_then(DbValue::as_i64)
+                .unwrap_or(0)
+                == 0
+        });
         let columns: Vec<&str> = (0..first.len())
             .filter_map(|index| first.get(index))
             .map(|(name, _)| name)
             .filter(|name| {
-                !(drop_identity && identity.as_deref().is_some_and(|id| name.eq_ignore_ascii_case(id)))
+                !(drop_identity
+                    && identity
+                        .as_deref()
+                        .is_some_and(|id| name.eq_ignore_ascii_case(id)))
             })
             .collect();
         if columns.is_empty() {
@@ -2523,10 +2536,7 @@ impl<'a> TableRef<'a> {
         // MySQL 的 `ON DUPLICATE KEY UPDATE` 对「插入」行返回 1、对「更新」行返回 **2**，
         // 把驱动返回值直接当行数用会让重复上报的统计翻倍（实测 20 万行 Upsert 记成 40 万）。
         // 只要本批有任意行发生变化，其逻辑行数就是行数本身；全部无变化时才是 0。
-        if mode == BatchWriteMode::Upsert
-            && self.dal.kind == DatabaseKind::MySql
-            && affected > 0
-        {
+        if mode == BatchWriteMode::Upsert && self.dal.kind == DatabaseKind::MySql && affected > 0 {
             affected = rows.len() as u64;
         }
         self.dal.invalidate_cache(self.physical_name());
@@ -2651,7 +2661,11 @@ impl<'a> TableRef<'a> {
         // 列集 = 首行列集；首行自增列为 0/缺失 → 整批排除自增列（对齐 C# `BuildInsertColumns`）
         let identity = self.table.identity().map(|c| c.name.clone());
         let drop_identity = identity.as_ref().is_some_and(|name| {
-            first.find_value(name).and_then(DbValue::as_i64).unwrap_or(0) == 0
+            first
+                .find_value(name)
+                .and_then(DbValue::as_i64)
+                .unwrap_or(0)
+                == 0
         });
         let columns: Vec<&str> = (0..first.len())
             .filter_map(|index| first.get(index))
@@ -2704,9 +2718,10 @@ impl<'a> TableRef<'a> {
         for row in rows {
             let mut pk_values = Vec::with_capacity(pks.len());
             for pk in &pks {
-                let value = row.find_value(pk).cloned().ok_or_else(|| {
-                    Error::Model(format!("批量 Upsert 行缺少主键列 {pk}"))
-                })?;
+                let value = row
+                    .find_value(pk)
+                    .cloned()
+                    .ok_or_else(|| Error::Model(format!("批量 Upsert 行缺少主键列 {pk}")))?;
                 pk_values.push(value);
             }
             let exists = self.find_by_pk(session, &pk_values)?.is_some();
@@ -2715,7 +2730,9 @@ impl<'a> TableRef<'a> {
                     .filter_map(|index| row.get(index))
                     .filter(|(k, _)| {
                         !pks.iter().any(|p| p.eq_ignore_ascii_case(k))
-                            && !identity.as_deref().is_some_and(|i| i.eq_ignore_ascii_case(k))
+                            && !identity
+                                .as_deref()
+                                .is_some_and(|i| i.eq_ignore_ascii_case(k))
                     })
                     .map(|(k, v)| (k, v.clone()))
                     .collect();
@@ -2782,9 +2799,8 @@ impl<'a> TableRef<'a> {
         let batch = batch_size
             .unwrap_or(crate::batch::DEFAULT_DELETE_WHERE_BATCH_SIZE)
             .max(1);
-        let wait = interval.unwrap_or_else(|| {
-            Duration::from_millis(crate::batch::DEFAULT_BATCH_INTERVAL_MS)
-        });
+        let wait = interval
+            .unwrap_or_else(|| Duration::from_millis(crate::batch::DEFAULT_BATCH_INTERVAL_MS));
         let max = max_rows.unwrap_or(0);
         let mut total = 0u64;
         loop {
@@ -2796,9 +2812,12 @@ impl<'a> TableRef<'a> {
             if size == 0 {
                 break;
             }
-            let Some((sql, params)) =
-                sqlbuild::delete_batched_sql_named(self.dal.kind, self.physical_name(), filter, size)
-            else {
+            let Some((sql, params)) = sqlbuild::delete_batched_sql_named(
+                self.dal.kind,
+                self.physical_name(),
+                filter,
+                size,
+            ) else {
                 // 方言不支持分批删除：回退一次性删除
                 return self.delete_where(session, filter);
             };
@@ -2823,7 +2842,11 @@ impl<'a> TableRef<'a> {
     ///
     /// 表带 `DataScale="timeShard:..."` 且**主键为雪花 Id** 时自动路由到对应分表
     /// （无法从主键推时间时按模型默认表查，与 C# 一致）。
-    pub fn find_by_pk(&self, session: &mut dyn SqlSession, pk: &[DbValue]) -> Result<Option<DbRow>> {
+    pub fn find_by_pk(
+        &self,
+        session: &mut dyn SqlSession,
+        pk: &[DbValue],
+    ) -> Result<Option<DbRow>> {
         if let Some(spec) = self.shard_spec().cloned()
             && let Ok(shard) = self.auto_shard_model(&spec, None, pk)
         {
@@ -3057,11 +3080,8 @@ impl<'a> TableRef<'a> {
         if sets.is_empty() {
             return Err(Error::Argument("按条件更新至少需要一个待更新字段".into()));
         }
-        let values = crate::interceptor::prepare(
-            self.table,
-            crate::interceptor::DataMethod::Update,
-            sets,
-        );
+        let values =
+            crate::interceptor::prepare(self.table, crate::interceptor::DataMethod::Update, sets);
         let (sql, params) = sqlbuild::update_sql_owned_named(
             self.dal.kind,
             self.table,
@@ -3194,10 +3214,9 @@ impl<'a> TableRef<'a> {
             let cache = dal.entity_cache(&self.table.name)?;
             let rows = cache.entities(dal, session)?;
             for row in rows.iter() {
-                if key
-                    .iter()
-                    .all(|(column, value)| crate::entity::row_value_matches(row.get_by_name(column), value))
-                {
+                if key.iter().all(|(column, value)| {
+                    crate::entity::row_value_matches(row.get_by_name(column), value)
+                }) {
                     return Ok(Some(row.clone()));
                 }
             }
@@ -3231,11 +3250,8 @@ impl<'a> TableRef<'a> {
             return Err(Error::Argument("原子累加至少需要一个累加字段".into()));
         }
         // 拦截器会把 `UpdateTime` 之类补进待写列；它们应作为「普通赋值」而非累加
-        let prepared = crate::interceptor::prepare(
-            self.table,
-            crate::interceptor::DataMethod::Update,
-            deltas,
-        );
+        let prepared =
+            crate::interceptor::prepare(self.table, crate::interceptor::DataMethod::Update, deltas);
         let names: Vec<String> = deltas.iter().map(|(n, _)| n.to_string()).collect();
         let (delta_values, assign_values): (Vec<_>, Vec<_>) = prepared
             .into_iter()
@@ -3480,10 +3496,7 @@ impl<'a> TableRef<'a> {
         for (name, value) in keys {
             filter = filter.eq(*name, value.clone());
         }
-        let found = self.query(
-            session,
-            &Query::new().column("Id").filter(filter).take(1),
-        )?;
+        let found = self.query(session, &Query::new().column("Id").filter(filter).take(1))?;
         if let Some(row) = found.first() {
             let id = row
                 .get_by_name("Id")
@@ -3549,8 +3562,7 @@ impl<'a> TableRef<'a> {
             crate::interceptor::DataMethod::Delete,
             &mut notify,
         );
-        let (sql, params) =
-            sqlbuild::delete_sql_named(self.dal.kind, self.physical_name(), filter);
+        let (sql, params) = sqlbuild::delete_sql_named(self.dal.kind, self.physical_name(), filter);
         self.dal.log_sql(&sql);
         let affected = session.execute_owned(&sql, params)?;
         if affected > 0 {
@@ -3664,8 +3676,7 @@ impl<'a> TableRef<'a> {
         session: &mut dyn SqlSession,
         filter: Option<&Where>,
     ) -> Result<i64> {
-        let (sql, params) =
-            sqlbuild::count_sql_named(self.dal.kind, self.physical_name(), filter);
+        let (sql, params) = sqlbuild::count_sql_named(self.dal.kind, self.physical_name(), filter);
         self.dal.log_sql(&sql);
         let set = session.query_owned(&sql, params)?;
         Ok(set
@@ -3746,21 +3757,29 @@ mod tests {
     </Table></Tables></EntityModel>"#;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let stamp = chrono::Local::now().format("%H%M%S%.6f").to_string().replace('.', "");
-        let dir = std::env::temp_dir().join(format!("rcode-{}-{}-{name}", std::process::id(), stamp));
+        let stamp = chrono::Local::now()
+            .format("%H%M%S%.6f")
+            .to_string()
+            .replace('.', "");
+        let dir =
+            std::env::temp_dir().join(format!("rcode-{}-{}-{name}", std::process::id(), stamp));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     #[test]
     fn connection_string_parsing() {
-        let cs = ConnectionString::parse("Data Source=..\\..\\Data\\DG.db;ShowSql=false;Provider=SQLite");
+        let cs = ConnectionString::parse(
+            "Data Source=..\\..\\Data\\DG.db;ShowSql=false;Provider=SQLite",
+        );
         assert_eq!(cs.kind().unwrap(), DatabaseKind::Sqlite);
         assert_eq!(cs.data_source(), Some("..\\..\\Data\\DG.db"));
         assert!(!cs.show_sql());
         assert_eq!(cs.get("PROVIDER"), Some("SQLite"));
 
-        let cs = ConnectionString::parse("Server=localhost;Port=3307;Database=mes;Uid=root;Pwd=123456;provider=mysql");
+        let cs = ConnectionString::parse(
+            "Server=localhost;Port=3307;Database=mes;Uid=root;Pwd=123456;provider=mysql",
+        );
         assert_eq!(cs.kind().unwrap(), DatabaseKind::MySql);
 
         // 无 provider 但后缀为 .db → SQLite
@@ -3813,7 +3832,10 @@ mod tests {
         });
         let dal2 = Dal::open_with_model(&conn, model).unwrap();
         let report = dal2.sync_schema().unwrap();
-        assert_eq!(report.added_columns, vec![("DH_Order".to_string(), "Remark".to_string())]);
+        assert_eq!(
+            report.added_columns,
+            vec![("DH_Order".to_string(), "Remark".to_string())]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3862,25 +3884,29 @@ mod tests {
 
         // 首次：插入（CreateTime 为“仅插入”初值列）
         let keys: [(&str, DbValue); 1] = [("Code", "A001".into())];
-        assert!(table
-            .upsert_by_key(
-                session.as_mut(),
-                &keys,
-                &[("Status", 1i32.into())],
-                &[("CreateTime", now.into())],
-            )
-            .unwrap());
+        assert!(
+            table
+                .upsert_by_key(
+                    session.as_mut(),
+                    &keys,
+                    &[("Status", 1i32.into())],
+                    &[("CreateTime", now.into())],
+                )
+                .unwrap()
+        );
 
         // 再次：更新（不新增行；insert_extra 不参与更新）
         let later = now + chrono::Duration::seconds(5);
-        assert!(!table
-            .upsert_by_key(
-                session.as_mut(),
-                &keys,
-                &[("Status", 2i32.into())],
-                &[("CreateTime", later.into())],
-            )
-            .unwrap());
+        assert!(
+            !table
+                .upsert_by_key(
+                    session.as_mut(),
+                    &keys,
+                    &[("Status", 2i32.into())],
+                    &[("CreateTime", later.into())],
+                )
+                .unwrap()
+        );
         let rows = table
             .query(
                 session.as_mut(),
@@ -3893,15 +3919,19 @@ mod tests {
             Some(2)
         );
         assert_eq!(
-            rows.rows[0].get_by_name("CreateTime").and_then(|v| v.as_datetime()),
+            rows.rows[0]
+                .get_by_name("CreateTime")
+                .and_then(|v| v.as_datetime()),
             Some(now),
             "insert_extra 不应在更新时被覆盖"
         );
 
         // 空自然键：直接拒绝
-        assert!(table
-            .upsert_by_key(session.as_mut(), &[], &[], &[])
-            .is_err());
+        assert!(
+            table
+                .upsert_by_key(session.as_mut(), &[], &[], &[])
+                .is_err()
+        );
 
         drop(session);
         dal.clear_pool();
@@ -3923,14 +3953,19 @@ mod tests {
         let table = dal.table("Order").unwrap();
         let keys: [(&str, DbValue); 1] = [("Code", "B001".into())];
         // Status 同时出现在 values 与 insert_extra：应只插入一次，且保留 values 的值
-        assert!(table
-            .upsert_by_key(
-                session.as_mut(),
-                &keys,
-                &[("Status", 7i32.into())],
-                &[("Status", 0i32.into()), ("CreateTime", chrono::Local::now().naive_local().into())],
-            )
-            .unwrap());
+        assert!(
+            table
+                .upsert_by_key(
+                    session.as_mut(),
+                    &keys,
+                    &[("Status", 7i32.into())],
+                    &[
+                        ("Status", 0i32.into()),
+                        ("CreateTime", chrono::Local::now().naive_local().into())
+                    ],
+                )
+                .unwrap()
+        );
         let rows = table
             .query(
                 session.as_mut(),
@@ -4180,7 +4215,11 @@ mod tests {
         let diff = dal.diff_schema().unwrap();
         assert_eq!(diff.length_mismatches.len(), 1, "{diff:?}");
         let m = &diff.length_mismatches[0];
-        assert_eq!((m.expected, m.actual, m.widening), (100, 20, true), "{diff:?}");
+        assert_eq!(
+            (m.expected, m.actual, m.widening),
+            (100, 20, true),
+            "{diff:?}"
+        );
         let report = dal.sync_schema().unwrap();
         assert!(
             report.notes.iter().any(|n| n.contains("长度 20 → 100")),
@@ -4210,10 +4249,7 @@ mod tests {
         assert_eq!(diff.length_mismatches.len(), 1, "{diff:?}");
         assert!(!diff.length_mismatches[0].widening, "{diff:?}");
         let report = dal.sync_schema().unwrap();
-        assert!(
-            report.notes.is_empty(),
-            "On 档不应缩窄列长度：{report:?}"
-        );
+        assert!(report.notes.is_empty(), "On 档不应缩窄列长度：{report:?}");
         assert!(report.is_empty(), "{report:?}");
         dal.clear_pool();
         drop(dal);
@@ -4255,17 +4291,30 @@ mod tests {
         drop(dal);
 
         // ReadOnly：只收集待执行 DDL，不执行（对齐 C# `DDL模式[ReadOnly]，请手工创建表`）
-        let conn = format!("Data Source={};Provider=SQLite;Migration=ReadOnly", db.display());
+        let conn = format!(
+            "Data Source={};Provider=SQLite;Migration=ReadOnly",
+            db.display()
+        );
         let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
         assert_eq!(dal.migration(), Migration::ReadOnly);
         let report = dal.sync_schema().unwrap();
-        assert_eq!(report.created_tables, vec!["DH_Order"], "只读档应报告“将新建”");
+        assert_eq!(
+            report.created_tables,
+            vec!["DH_Order"],
+            "只读档应报告“将新建”"
+        );
         assert!(
-            report.pending_sql.iter().any(|s| s.starts_with("CREATE TABLE")),
+            report
+                .pending_sql
+                .iter()
+                .any(|s| s.starts_with("CREATE TABLE")),
             "只读档应收集待执行 DDL：{report:?}"
         );
         let mut session = dal.open_session().unwrap();
-        assert!(!session.table_exists("DH_Order").unwrap(), "只读档不应执行 DDL");
+        assert!(
+            !session.table_exists("DH_Order").unwrap(),
+            "只读档不应执行 DDL"
+        );
         drop(session);
         dal.clear_pool();
         drop(dal);
@@ -4281,7 +4330,10 @@ mod tests {
 
         // 模型级 Migration 作为缺省（对应 XCodeSetting.Migration）
         let mut model = EntityModel::parse(MODEL).unwrap();
-        model.options.raw.insert("Migration".into(), "ReadOnly".into());
+        model
+            .options
+            .raw
+            .insert("Migration".into(), "ReadOnly".into());
         let dal = Dal::open_with_model(&conn, model).unwrap();
         assert_eq!(dal.migration(), Migration::ReadOnly, "模型级档位应生效");
         drop(dal);
@@ -4289,7 +4341,10 @@ mod tests {
         // 连接串显式指定优先于模型级（对应 DbBase 从连接串解析 Migration）
         let conn2 = format!("Data Source={};Provider=SQLite;Migration=Off", db.display());
         let mut model = EntityModel::parse(MODEL).unwrap();
-        model.options.raw.insert("Migration".into(), "ReadOnly".into());
+        model
+            .options
+            .raw
+            .insert("Migration".into(), "ReadOnly".into());
         let dal = Dal::open_with_model(&conn2, model).unwrap();
         assert_eq!(dal.migration(), Migration::Off, "连接串优先于模型级");
 
@@ -4317,12 +4372,18 @@ mod tests {
         let xml = r#"<EntityModel><Tables><Table Name="Order" TableName="DH_Order" Migration="Off">
           <Columns><Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" /></Columns>
         </Table></Tables></EntityModel>"#;
-        let conn = format!("Data Source={};Provider=SQLite;Migration=Full", db.display());
+        let conn = format!(
+            "Data Source={};Provider=SQLite;Migration=Full",
+            db.display()
+        );
         let dal = Dal::open_with_model(&conn, EntityModel::parse(xml).unwrap()).unwrap();
         let report = dal.sync_schema().unwrap();
         assert!(report.is_empty(), "表级 Off 不应做任何变更：{report:?}");
         let mut session = dal.open_session().unwrap();
-        assert!(!session.table_exists("DH_Order").unwrap(), "表级 Off 不应建表");
+        assert!(
+            !session.table_exists("DH_Order").unwrap(),
+            "表级 Off 不应建表"
+        );
         drop(session);
         dal.clear_pool();
         drop(dal);
@@ -4348,7 +4409,10 @@ mod tests {
             .execute("ALTER TABLE \"DH_Order\" ADD COLUMN \"Extra\" text", &[])
             .unwrap();
         session
-            .execute("CREATE INDEX \"ix_extra\" ON \"DH_Order\" (\"Status\")", &[])
+            .execute(
+                "CREATE INDEX \"ix_extra\" ON \"DH_Order\" (\"Status\")",
+                &[],
+            )
             .unwrap();
         session
             .execute("CREATE TABLE \"DH_Other\" (\"X\" int)", &[])
@@ -4358,7 +4422,10 @@ mod tests {
         drop(raw);
 
         // Full 档同步：删多余列与索引；模型外表保留（对齐 XCode：从不触碰模型未声明的表）
-        let conn = format!("Data Source={};Provider=SQLite;Migration=Full", db.display());
+        let conn = format!(
+            "Data Source={};Provider=SQLite;Migration=Full",
+            db.display()
+        );
         let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL).unwrap()).unwrap();
         let report = dal.sync_schema().unwrap();
         assert_eq!(report.mode, Migration::Full);
@@ -4380,7 +4447,10 @@ mod tests {
         let mut session = dal.open_session().unwrap();
         let cols = session.table_columns("DH_Order").unwrap();
         assert!(!cols.iter().any(|c| c.eq_ignore_ascii_case("Extra")));
-        assert!(session.table_exists("DH_Other").unwrap(), "模型外的表从不自动删除");
+        assert!(
+            session.table_exists("DH_Other").unwrap(),
+            "模型外的表从不自动删除"
+        );
         drop(session);
 
         // 再次同步无变更
@@ -4418,7 +4488,10 @@ mod tests {
         drop(setup);
 
         // Full 档：SQLite 不支持直接改列类型 → 记入 notes 并继续，不中断
-        let conn = format!("Data Source={};Provider=SQLite;Migration=Full", db.display());
+        let conn = format!(
+            "Data Source={};Provider=SQLite;Migration=Full",
+            db.display()
+        );
         let dal = Dal::open_with_model(&conn, EntityModel::parse(TT).unwrap()).unwrap();
         let report = dal.sync_schema().unwrap();
         assert!(report.altered_columns.is_empty());
@@ -4453,14 +4526,24 @@ mod tests {
                 &[
                     ("Code", "HLT-001".into()),
                     ("Status", 1.into()),
-                    ("CreateTime", chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap().and_hms_opt(18, 0, 0).unwrap().into()),
+                    (
+                        "CreateTime",
+                        chrono::NaiveDate::from_ymd_opt(2026, 9, 26)
+                            .unwrap()
+                            .and_hms_opt(18, 0, 0)
+                            .unwrap()
+                            .into(),
+                    ),
                 ],
             )
             .unwrap();
         assert!(id > 0, "应返回自增主键");
 
         // 查询
-        let row = table.find_by_pk(session.as_mut(), &[id.into()]).unwrap().unwrap();
+        let row = table
+            .find_by_pk(session.as_mut(), &[id.into()])
+            .unwrap()
+            .unwrap();
         assert_eq!(row.get_by_name("Code").unwrap().as_str(), Some("HLT-001"));
         assert!(table.exists_by_pk(session.as_mut(), &[id.into()]).unwrap());
 
@@ -4469,7 +4552,10 @@ mod tests {
             .update_by_pk(session.as_mut(), &[("Status", 9.into())], &[id.into()])
             .unwrap();
         assert_eq!(affected, 1);
-        let row = table.find_by_pk(session.as_mut(), &[id.into()]).unwrap().unwrap();
+        let row = table
+            .find_by_pk(session.as_mut(), &[id.into()])
+            .unwrap()
+            .unwrap();
         assert_eq!(row.get_by_name("Status").unwrap().as_i64(), Some(9));
 
         // 统计与条件查询
@@ -4478,7 +4564,10 @@ mod tests {
         assert_eq!(table.count(session.as_mut(), Some(&filter)).unwrap(), 1);
 
         // 删除
-        assert_eq!(table.delete_by_pk(session.as_mut(), &[id.into()]).unwrap(), 1);
+        assert_eq!(
+            table.delete_by_pk(session.as_mut(), &[id.into()]).unwrap(),
+            1
+        );
         assert_eq!(table.count(session.as_mut(), None).unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);

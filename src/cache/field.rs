@@ -105,7 +105,11 @@ impl FieldCache {
     }
 
     /// 强制重新统计。
-    pub fn reload(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<Arc<Vec<(String, i64)>>> {
+    pub fn reload(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+    ) -> Result<Arc<Vec<(String, i64)>>> {
         let kind = dal.kind();
         let field = kind.quote(&self.field);
         let table = kind.quote(&self.table);
@@ -234,7 +238,14 @@ mod tests {
 
         let cache = FieldCache::new("DH_Goods", "Category");
         let items = cache.counts(&dal, session.as_mut()).unwrap();
-        assert_eq!(*items, vec![("A".to_string(), 3), ("B".to_string(), 2), ("C".to_string(), 1)]);
+        assert_eq!(
+            *items,
+            vec![
+                ("A".to_string(), 3),
+                ("B".to_string(), 2),
+                ("C".to_string(), 1)
+            ]
+        );
 
         // 命中缓存：绕过统计直接写库，结果不变
         insert_category(&dal, session.as_mut(), "D");

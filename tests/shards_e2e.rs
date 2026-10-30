@@ -197,7 +197,10 @@ fn temp_db(name: &str) -> (PathBuf, PathBuf) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("rcode-shards-{}-{stamp}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "rcode-shards-{}-{stamp}-{name}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     (dir.clone(), dir.join("shards.db"))
 }
@@ -258,7 +261,11 @@ fn time_sharded_crud_routes_to_physical_tables() {
     }
 
     // 分表已自动创建，且基础表保持为空（数据全部落在分表）
-    for table in ["TradeLog_20260901", "TradeLog_20260902", "TradeLog_20260903"] {
+    for table in [
+        "TradeLog_20260901",
+        "TradeLog_20260902",
+        "TradeLog_20260903",
+    ] {
         assert!(session.table_exists(table).unwrap(), "{table} 应已自动创建");
     }
     assert!(
@@ -304,7 +311,9 @@ fn time_sharded_crud_routes_to_physical_tables() {
     let mut to_update = found.clone();
     to_update.set_note("b1-updated");
     assert_eq!(
-        to_update.update_sharded(&dal, session.as_mut(), &policy).unwrap(),
+        to_update
+            .update_sharded(&dal, session.as_mut(), &policy)
+            .unwrap(),
         1
     );
     let again = TradeLog::find_sharded(
@@ -319,7 +328,12 @@ fn time_sharded_crud_routes_to_physical_tables() {
     assert_eq!(again.note, "b1-updated");
 
     // 单行删除
-    assert_eq!(again.delete_sharded(&dal, session.as_mut(), &policy).unwrap(), 1);
+    assert_eq!(
+        again
+            .delete_sharded(&dal, session.as_mut(), &policy)
+            .unwrap(),
+        1
+    );
 
     // 条件删除（跨表）：删掉 09-03 两行
     let filter = Where::new()
@@ -494,7 +508,10 @@ fn snow_id_sharded_insert_generates_id() {
     let id = row.insert_sharded(&dal, session.as_mut(), &policy).unwrap();
     assert_eq!(row.id, id, "雪花 Id 应回写实体");
     let (parsed, _, _) = snowflake::shared().parse(id);
-    assert!(parsed.year() >= 2026, "雪花 Id 应解析出生成时间（{parsed}）");
+    assert!(
+        parsed.year() >= 2026,
+        "雪花 Id 应解析出生成时间（{parsed}）"
+    );
 
     // 雪花 Id 按“生成时刻”路由（Id 是分表字段）：落到解析出的月份分表
     let month_table = format!("EventLog_{:04}{:02}", parsed.year(), parsed.month());
@@ -548,22 +565,37 @@ fn ensure_shard_table_respects_migration() {
     )
     .unwrap();
     let mut session = dal.open_session().unwrap();
-    assert!(!dal.ensure_shard_table("TradeLog", "TradeLog_20260901").unwrap());
+    assert!(
+        !dal.ensure_shard_table("TradeLog", "TradeLog_20260901")
+            .unwrap()
+    );
     assert!(!session.table_exists("TradeLog_20260901").unwrap());
     drop(session);
 
     // ReadOnly：只检查不执行 → 同样不建表
     let dal = Dal::open_with_model(
-        &format!("Data Source={};Provider=SQLite;Migration=ReadOnly", db.display()),
+        &format!(
+            "Data Source={};Provider=SQLite;Migration=ReadOnly",
+            db.display()
+        ),
         EntityModel::parse(MODEL).unwrap(),
     )
     .unwrap();
-    assert!(!dal.ensure_shard_table("TradeLog", "TradeLog_20260902").unwrap());
+    assert!(
+        !dal.ensure_shard_table("TradeLog", "TradeLog_20260902")
+            .unwrap()
+    );
 
     // On（缺省）：建表 + 幂等
     let dal = open_dal(&db);
-    assert!(dal.ensure_shard_table("TradeLog", "TradeLog_20260903").unwrap());
-    assert!(!dal.ensure_shard_table("TradeLog", "TradeLog_20260903").unwrap());
+    assert!(
+        dal.ensure_shard_table("TradeLog", "TradeLog_20260903")
+            .unwrap()
+    );
+    assert!(
+        !dal.ensure_shard_table("TradeLog", "TradeLog_20260903")
+            .unwrap()
+    );
     let mut session = dal.open_session().unwrap();
     assert!(session.table_exists("TradeLog_20260903").unwrap());
 
@@ -585,8 +617,14 @@ fn sharded_query_falls_back_to_base_table() {
 
     // 基础表（sync_schema 创建）写入一行：无分表条件查询应命中基础表
     let base = dal.table("TradeLog").unwrap();
-    base.insert(session.as_mut(), &[("CreateTime", day(2026, 9, 1).into()), ("Note", "base".into())])
-        .unwrap();
+    base.insert(
+        session.as_mut(),
+        &[
+            ("CreateTime", day(2026, 9, 1).into()),
+            ("Note", "base".into()),
+        ],
+    )
+    .unwrap();
 
     let rows = TradeLog::query_sharded(
         &dal,
@@ -760,7 +798,9 @@ fn cross_connection_shards_route_by_conn_name() {
     assert_eq!(found.note, "a");
     found.set_note("a2");
     assert_eq!(
-        found.update_sharded(&dal, session.as_mut(), &policy).unwrap(),
+        found
+            .update_sharded(&dal, session.as_mut(), &policy)
+            .unwrap(),
         1
     );
 
@@ -781,7 +821,11 @@ fn cross_connection_shards_route_by_conn_name() {
     let notes: Vec<String> = set
         .rows
         .iter()
-        .map(|r| r.get_by_name("Note").map(DbValue::to_text).unwrap_or_default())
+        .map(|r| {
+            r.get_by_name("Note")
+                .map(DbValue::to_text)
+                .unwrap_or_default()
+        })
         .collect();
     assert_eq!(notes, vec!["a2".to_string(), "b".to_string()]);
 
@@ -799,7 +843,11 @@ fn cross_connection_shards_route_by_conn_name() {
     let page2_notes: Vec<String> = page2
         .rows
         .iter()
-        .map(|r| r.get_by_name("Note").map(DbValue::to_text).unwrap_or_default())
+        .map(|r| {
+            r.get_by_name("Note")
+                .map(DbValue::to_text)
+                .unwrap_or_default()
+        })
         .collect();
     assert_eq!(page2_notes, vec!["b".to_string()]);
 
@@ -822,7 +870,9 @@ fn cross_connection_shards_route_by_conn_name() {
     // 跨库条件删除：只删 2027（注册库）那行
     let del = Where::new().eq("CreateTime", day(2027, 9, 1));
     assert_eq!(
-        table.delete_sharded(session.as_mut(), &policy, &del).unwrap(),
+        table
+            .delete_sharded(session.as_mut(), &policy, &del)
+            .unwrap(),
         1
     );
     assert_eq!(
@@ -881,7 +931,8 @@ fn sharded_dirty_tracking_and_batch_clear() {
     let key: DbValue = when.into();
 
     let mut seed = TradeLog::new(when, "A");
-    seed.insert_sharded(&dal, session.as_mut(), &policy).unwrap();
+    seed.insert_sharded(&dal, session.as_mut(), &policy)
+        .unwrap();
     assert!(!seed.has_dirty(), "插入后应清空脏数据");
 
     let loaded = TradeLog::find_sharded(&dal, session.as_mut(), &policy, &key, &[seed.id.into()])
@@ -901,7 +952,8 @@ fn sharded_dirty_tracking_and_batch_clear() {
         .unwrap();
     edit.set_note("B");
     assert_eq!(
-        edit.update_sharded(&dal, session.as_mut(), &policy).unwrap(),
+        edit.update_sharded(&dal, session.as_mut(), &policy)
+            .unwrap(),
         1
     );
     assert!(!edit.has_dirty(), "分表更新成功后应清空脏数据");

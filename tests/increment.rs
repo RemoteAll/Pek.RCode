@@ -115,7 +115,8 @@ fn temp_dir(name: &str) -> PathBuf {
         .format("%H%M%S%.9f")
         .to_string()
         .replace('.', "");
-    let dir = std::env::temp_dir().join(format!("rcode-inc-{}-{}-{name}", std::process::id(), stamp));
+    let dir =
+        std::env::temp_dir().join(format!("rcode-inc-{}-{}-{name}", std::process::id(), stamp));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -156,10 +157,7 @@ fn table_increment_is_atomic_and_accumulates() {
                 .increment_by_pk(
                     session.as_mut(),
                     &[DbValue::Int(1)],
-                    &[
-                        ("Count", DbValue::Int(2)),
-                        ("Flow", DbValue::Int(100)),
-                    ],
+                    &[("Count", DbValue::Int(2)), ("Flow", DbValue::Int(100)),],
                 )
                 .unwrap(),
             1
@@ -188,7 +186,11 @@ fn table_increment_is_atomic_and_accumulates() {
     );
 
     // 空累加列 → 参数错误
-    assert!(table.increment(session.as_mut(), &[], &Where::new()).is_err());
+    assert!(
+        table
+            .increment(session.as_mut(), &[], &Where::new())
+            .is_err()
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -227,7 +229,10 @@ fn table_increment_with_assigns_snapshot_in_one_statement() {
         1
     );
     let row = table
-        .query(session.as_mut(), &Query::new().filter(filter.clone()).take(1))
+        .query(
+            session.as_mut(),
+            &Query::new().filter(filter.clone()).take(1),
+        )
         .unwrap();
     let row = row.first().unwrap();
     assert_eq!(row.get_by_name("Count").and_then(DbValue::as_i64), Some(1));
@@ -326,7 +331,9 @@ fn increment_where_updates_multiple_rows() {
     for row in table
         .query(
             session.as_mut(),
-            &Query::new().filter(Where::new().like("Name", "%")).order_by("Id", false),
+            &Query::new()
+                .filter(Where::new().like("Name", "%"))
+                .order_by("Id", false),
         )
         .unwrap()
         .into_iter()

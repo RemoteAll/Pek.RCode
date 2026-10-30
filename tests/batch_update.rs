@@ -84,8 +84,12 @@ fn batch_update_writes_multiple_rows_in_one_statement() {
             .unwrap();
         let row = rs.first().expect("行存在");
         (
-            row.get_by_name("Memory").and_then(DbValue::as_i64).unwrap_or(-1),
-            row.get_by_name("Delay").and_then(DbValue::as_i64).unwrap_or(-1),
+            row.get_by_name("Memory")
+                .and_then(DbValue::as_i64)
+                .unwrap_or(-1),
+            row.get_by_name("Delay")
+                .and_then(DbValue::as_i64)
+                .unwrap_or(-1),
         )
     };
     assert_eq!(read(1), (1024, 12));
@@ -102,28 +106,36 @@ fn batch_update_validates_inputs() {
     let table = dal.table("DeviceOnline").unwrap();
     let mut session = dal.open_session().unwrap();
 
-    assert!(table
-        .update_batch_by_pk(session.as_mut(), &["Memory"], &[])
-        .is_err());
-    assert!(table
-        .update_batch_by_pk(session.as_mut(), &[], &[(DbValue::Int(1), vec![])])
-        .is_err());
+    assert!(
+        table
+            .update_batch_by_pk(session.as_mut(), &["Memory"], &[])
+            .is_err()
+    );
+    assert!(
+        table
+            .update_batch_by_pk(session.as_mut(), &[], &[(DbValue::Int(1), vec![])])
+            .is_err()
+    );
     // 值个数不匹配
-    assert!(table
-        .update_batch_by_pk(
-            session.as_mut(),
-            &["Memory", "Delay"],
-            &[(DbValue::Int(1), vec![DbValue::Int(1)])],
-        )
-        .is_err());
+    assert!(
+        table
+            .update_batch_by_pk(
+                session.as_mut(),
+                &["Memory", "Delay"],
+                &[(DbValue::Int(1), vec![DbValue::Int(1)])],
+            )
+            .is_err()
+    );
     // 列不存在
-    assert!(table
-        .update_batch_by_pk(
-            session.as_mut(),
-            &["NotExists"],
-            &[(DbValue::Int(1), vec![DbValue::Int(1)])],
-        )
-        .is_err());
+    assert!(
+        table
+            .update_batch_by_pk(
+                session.as_mut(),
+                &["NotExists"],
+                &[(DbValue::Int(1), vec![DbValue::Int(1)])],
+            )
+            .is_err()
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -155,7 +167,9 @@ fn batch_update_spans_rows_beyond_variable_limit() {
             ]
         })
         .collect();
-    table.insert_batch(session.as_mut(), &seed, Some(500)).unwrap();
+    table
+        .insert_batch(session.as_mut(), &seed, Some(500))
+        .unwrap();
 
     let data: Vec<(DbValue, Vec<DbValue>)> = (0..N)
         .map(|i| {

@@ -208,7 +208,8 @@ impl EntityCache {
                     u64::try_from(max_stale.as_nanos()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
                 );
-                self.consistency_mode.store(CONSISTENCY_SWR, Ordering::Relaxed);
+                self.consistency_mode
+                    .store(CONSISTENCY_SWR, Ordering::Relaxed);
             }
         }
     }
@@ -217,10 +218,7 @@ impl EntityCache {
     pub fn is_valid(&self) -> bool {
         let expire = self.expire();
         let state = self.read_state();
-        state
-            .loaded_at
-            .is_some_and(|at| at.elapsed() < expire)
-            && state.data.is_some()
+        state.loaded_at.is_some_and(|at| at.elapsed() < expire) && state.data.is_some()
     }
 
     /// 取得整表数据（按一致性模式处理过期，对应 C# `Meta.Cache.Entities`）。
@@ -462,9 +460,7 @@ impl FieldCache {
         Self {
             table: table.to_string(),
             column: column.to_string(),
-            expire_nanos: AtomicU64::new(
-                DEFAULT_FIELD_CACHE_EXPIRE_SECONDS * NANOS_PER_SECOND,
-            ),
+            expire_nanos: AtomicU64::new(DEFAULT_FIELD_CACHE_EXPIRE_SECONDS * NANOS_PER_SECOND),
             top: AtomicUsize::new(DEFAULT_FIELD_CACHE_TOP),
             state: RwLock::new(None),
         }
@@ -510,7 +506,11 @@ impl FieldCache {
     }
 
     /// 分组统计结果（值 + 计数，按计数降序），命中缓存时不查库。
-    pub fn items(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<Arc<Vec<(String, i64)>>> {
+    pub fn items(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+    ) -> Result<Arc<Vec<(String, i64)>>> {
         let expire = self.expire();
         {
             let state = self.read_state();
@@ -603,7 +603,10 @@ fn limit_suffix(kind: DatabaseKind, top: usize) -> Option<String> {
         DatabaseKind::Oracle | DatabaseKind::Db2 => format!(" FETCH FIRST {top} ROWS ONLY"),
         DatabaseKind::Firebird => format!(" ROWS {top}"),
         // 时序/文档库的 SQL 子集不支持该句式：不限制，由调用方内存截断
-        DatabaseKind::TDengine | DatabaseKind::InfluxDb | DatabaseKind::MongoDb | DatabaseKind::Access => {
+        DatabaseKind::TDengine
+        | DatabaseKind::InfluxDb
+        | DatabaseKind::MongoDb
+        | DatabaseKind::Access => {
             return None;
         }
     };
@@ -619,9 +622,9 @@ impl Dal {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let meta = self.table_meta(table)?;
         let physical_table = meta.effective_table_name();
-        let col = meta
-            .column(column)
-            .ok_or_else(|| crate::error::Error::Model(format!("表 {} 不存在列 {column}", meta.name)))?;
+        let col = meta.column(column).ok_or_else(|| {
+            crate::error::Error::Model(format!("表 {} 不存在列 {column}", meta.name))
+        })?;
         let physical_column = meta.effective_column_name(col);
 
         if let Some(cache) = read_lock(&self.field_caches)
@@ -806,10 +809,8 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-cache-{}-{stamp}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rcode-cache-{}-{stamp}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("cache.db");
         let model = EntityModel::parse(MODEL).expect("测试模型应可解析");
@@ -905,7 +906,11 @@ mod tests {
 
         // 表句柄更新 → 自动清空，重新查库拿到新值
         table
-            .update_by_pk(session.as_mut(), &[("Code", "Z".into())], &[DbValue::Int(id)])
+            .update_by_pk(
+                session.as_mut(),
+                &[("Code", "Z".into())],
+                &[DbValue::Int(id)],
+            )
             .unwrap();
         let fresh = cache
             .get(&dal, session.as_mut(), &[DbValue::Int(id)])

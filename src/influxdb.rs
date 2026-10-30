@@ -121,7 +121,9 @@ fn parse_settings(cs: &ConnectionString) -> Result<InfluxDbSettings> {
     let database = cs
         .get("database")
         .or(cs.get("db"))
-        .ok_or_else(|| Error::Model("InfluxDB 连接串缺少 Database（1.x 为 db 名，2.x 为 bucket）".into()))?
+        .ok_or_else(|| {
+            Error::Model("InfluxDB 连接串缺少 Database（1.x 为 db 名，2.x 为 bucket）".into())
+        })?
         .to_string();
     let user = cs
         .get("uid")
@@ -158,7 +160,16 @@ fn looks_like_sql(sql: &str) -> bool {
             .unwrap_or("")
             .to_ascii_uppercase()
             .as_str(),
-        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "ALTER" | "DROP" | "SHOW" | "GRANT" | "REVOKE"
+        "SELECT"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "CREATE"
+            | "ALTER"
+            | "DROP"
+            | "SHOW"
+            | "GRANT"
+            | "REVOKE"
     )
 }
 
@@ -177,11 +188,7 @@ fn normalize_order(sql: &str) -> String {
     }
     let desc = order.to_ascii_uppercase().contains("DESC");
     let replacement = if desc { "time DESC" } else { "time ASC" };
-    format!(
-        "{}ORDER BY {replacement}{}",
-        &sql[..pos + 1],
-        &rest[end..]
-    )
+    format!("{}ORDER BY {replacement}{}", &sql[..pos + 1], &rest[end..])
 }
 
 /// InfluxQL 查询结果 JSON → `RowSet`。
@@ -337,7 +344,9 @@ impl SqlSession for InfluxDbSession {
             if let Ok(set) = self.query(&sql, &[]) {
                 for row in &set.rows {
                     if let Some(name) = row.get(0).map(DbValue::to_text)
-                        && !columns.iter().any(|c: &String| c.eq_ignore_ascii_case(&name))
+                        && !columns
+                            .iter()
+                            .any(|c: &String| c.eq_ignore_ascii_case(&name))
                     {
                         columns.push(name);
                     }
@@ -369,7 +378,9 @@ mod tests {
     #[test]
     fn sql_detection_and_order_rewrite() {
         assert!(looks_like_sql("SELECT * FROM \"m\""));
-        assert!(!looks_like_sql("Temperature,device=d1 value=36.5 1730000000000000000"));
+        assert!(!looks_like_sql(
+            "Temperature,device=d1 value=36.5 1730000000000000000"
+        ));
 
         let sql = "SELECT * FROM \"m\" WHERE (\"k\" = 'v') ORDER BY \"Id\" LIMIT 10 OFFSET 0";
         assert_eq!(

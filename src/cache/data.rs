@@ -123,10 +123,8 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-datacache-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rcode-datacache-{}-{stamp}", std::process::id()));
         let file = dir.join("DataCache.json");
 
         // 不存在时为空

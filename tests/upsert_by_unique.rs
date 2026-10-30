@@ -117,12 +117,22 @@ fn upsert_batch_by_unique_inserts_then_updates() {
             .unwrap();
         let row = rs.first().expect("行存在");
         (
-            row.get_by_name("Memory").and_then(DbValue::as_i64).unwrap_or(-1),
-            row.get_by_name("Delay").and_then(DbValue::as_i64).unwrap_or(-1),
-            row.get_by_name("Pings").and_then(DbValue::as_i64).unwrap_or(-1),
+            row.get_by_name("Memory")
+                .and_then(DbValue::as_i64)
+                .unwrap_or(-1),
+            row.get_by_name("Delay")
+                .and_then(DbValue::as_i64)
+                .unwrap_or(-1),
+            row.get_by_name("Pings")
+                .and_then(DbValue::as_i64)
+                .unwrap_or(-1),
         )
     };
-    assert_eq!(read(10), (9999, 9, 2), "同 DeviceId 应更新且 Pings 累加为 2");
+    assert_eq!(
+        read(10),
+        (9999, 9, 2),
+        "同 DeviceId 应更新且 Pings 累加为 2"
+    );
     assert_eq!(read(11), (2048, 6, 1), "未列出的行保持原值");
     assert_eq!(read(12), (4096, 7, 1), "新设备应插入");
 
@@ -138,28 +148,50 @@ fn upsert_batch_by_unique_validates_inputs() {
     let one = vec![DbValue::Int(1)];
 
     // 空列
-    assert!(table
-        .upsert_batch_by_unique(session.as_mut(), &[], &["DeviceId"], &[], &[one.clone()], None)
-        .is_err());
+    assert!(
+        table
+            .upsert_batch_by_unique(
+                session.as_mut(),
+                &[],
+                &["DeviceId"],
+                &[],
+                &[one.clone()],
+                None
+            )
+            .is_err()
+    );
     // 空行
-    assert!(table
-        .upsert_batch_by_unique(session.as_mut(), &["DeviceId"], &["DeviceId"], &[], &[], None)
-        .is_err());
+    assert!(
+        table
+            .upsert_batch_by_unique(
+                session.as_mut(),
+                &["DeviceId"],
+                &["DeviceId"],
+                &[],
+                &[],
+                None
+            )
+            .is_err()
+    );
     // 值个数与列数不一致
-    assert!(table
-        .upsert_batch_by_unique(
-            session.as_mut(),
-            &["DeviceId", "Memory"],
-            &["DeviceId"],
-            &[],
-            &[one.clone()],
-            None,
-        )
-        .is_err());
+    assert!(
+        table
+            .upsert_batch_by_unique(
+                session.as_mut(),
+                &["DeviceId", "Memory"],
+                &["DeviceId"],
+                &[],
+                &[one.clone()],
+                None,
+            )
+            .is_err()
+    );
     // 未指定冲突列
-    assert!(table
-        .upsert_batch_by_unique(session.as_mut(), &["DeviceId"], &[], &[], &[one], None)
-        .is_err());
+    assert!(
+        table
+            .upsert_batch_by_unique(session.as_mut(), &["DeviceId"], &[], &[], &[one], None)
+            .is_err()
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

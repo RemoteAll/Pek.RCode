@@ -53,7 +53,13 @@ pub enum LoginResult {
 /// <param name="input">用户输入的密码</param>
 /// <param name="hash_times">哈希轮数</param>
 /// <returns>校验结果</returns>
-pub fn verify_login(account: &str, enable: bool, stored: &str, input: &str, hash_times: i32) -> LoginResult {
+pub fn verify_login(
+    account: &str,
+    enable: bool,
+    stored: &str,
+    input: &str,
+    hash_times: i32,
+) -> LoginResult {
     if !enable {
         return LoginResult::Error(format!("账号{account}被禁用！"));
     }
@@ -397,11 +403,17 @@ pub fn build_menu_tree_filtered(
 /// 单行转换为菜单节点（编号缺失或父级不匹配时返回 None）。
 fn row_to_menu(row: &DbRow, parent_id: i64, incl_invisible: bool) -> Option<MenuNode> {
     let id = row.get_by_name("ID")?.as_i64()?;
-    let pid = row.get_by_name("ParentID").and_then(DbValue::as_i64).unwrap_or(0);
+    let pid = row
+        .get_by_name("ParentID")
+        .and_then(DbValue::as_i64)
+        .unwrap_or(0);
     if pid != parent_id {
         return None;
     }
-    let visible = row.get_by_name("Visible").and_then(DbValue::as_bool).unwrap_or(true);
+    let visible = row
+        .get_by_name("Visible")
+        .and_then(DbValue::as_bool)
+        .unwrap_or(true);
     if !incl_invisible && !visible {
         return None;
     }
@@ -416,16 +428,25 @@ fn row_to_menu(row: &DbRow, parent_id: i64, incl_invisible: bool) -> Option<Menu
         name,
         display_name,
         url: text_of(row, "Url"),
-        sort: row.get_by_name("Sort").and_then(DbValue::as_i32).unwrap_or(0),
+        sort: row
+            .get_by_name("Sort")
+            .and_then(DbValue::as_i32)
+            .unwrap_or(0),
         visible,
-        enable: row.get_by_name("Enable").and_then(DbValue::as_bool).unwrap_or(true),
+        enable: row
+            .get_by_name("Enable")
+            .and_then(DbValue::as_bool)
+            .unwrap_or(true),
         children: Vec::new(),
     })
 }
 
 /// 读取文本列（缺列或空值返回空字符串）。
 fn text_of(row: &DbRow, name: &str) -> String {
-    row.get_by_name(name).and_then(DbValue::as_str).unwrap_or_default().to_string()
+    row.get_by_name(name)
+        .and_then(DbValue::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// 角色数据范围（对应 `IRole` 的可移植字段）。
@@ -490,8 +511,13 @@ impl DataScopeContext {
             return;
         };
         self.data_scope = scope;
-        self.accessible_department_ids =
-            accessible_department_ids(self.department_id, roles, Some(scope), dept_and_below, managed_dept_ids);
+        self.accessible_department_ids = accessible_department_ids(
+            self.department_id,
+            roles,
+            Some(scope),
+            dept_and_below,
+            managed_dept_ids,
+        );
     }
 }
 
@@ -587,7 +613,11 @@ pub fn department_and_children(root_id: i32, pairs: &[(i32, i32)]) -> Vec<i32> {
 
 /// 递归收集下级部门编号（对齐 `CollectChildDepartmentIds`，按编号去重防环）。
 fn collect_child_ids(parent_id: i32, pairs: &[(i32, i32)], ids: &mut Vec<i32>) {
-    let mut children: Vec<i32> = pairs.iter().filter(|(_, p)| *p == parent_id).map(|(c, _)| *c).collect();
+    let mut children: Vec<i32> = pairs
+        .iter()
+        .filter(|(_, p)| *p == parent_id)
+        .map(|(c, _)| *c)
+        .collect();
     children.sort_unstable();
     for child in children {
         if !ids.contains(&child) {
@@ -656,7 +686,11 @@ impl ScopeFilterExpression {
                 if values.is_empty() {
                     return None;
                 }
-                let list = values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+                let list = values
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 Some(format!("{column} IN ({list})"))
             }
             Self::Or(parts) => {
@@ -691,10 +725,16 @@ pub fn build_scope_filter(
     match context.data_scope {
         DataScope::SelfOnly => {
             if let Some(column) = user_column {
-                return ScopeFilterExpression::Equal { column: column.into(), value: context.user_id };
+                return ScopeFilterExpression::Equal {
+                    column: column.into(),
+                    value: context.user_id,
+                };
             }
             if let Some(column) = dept_column {
-                return ScopeFilterExpression::Equal { column: column.into(), value: context.department_id };
+                return ScopeFilterExpression::Equal {
+                    column: column.into(),
+                    value: context.department_id,
+                };
             }
             ScopeFilterExpression::None
         }
@@ -707,7 +747,10 @@ pub fn build_scope_filter(
             if let Some(column) = user_column {
                 return ScopeFilterExpression::Or(vec![
                     dept_filter,
-                    ScopeFilterExpression::Equal { column: column.into(), value: context.user_id },
+                    ScopeFilterExpression::Equal {
+                        column: column.into(),
+                        value: context.user_id,
+                    },
                 ]);
             }
             dept_filter
@@ -717,7 +760,10 @@ pub fn build_scope_filter(
 }
 
 /// 构建部门过滤条件（对齐 `BuildDepartmentFilter`）。
-fn build_department_filter(context: &DataScopeContext, dept_column: Option<&str>) -> ScopeFilterExpression {
+fn build_department_filter(
+    context: &DataScopeContext,
+    dept_column: Option<&str>,
+) -> ScopeFilterExpression {
     let Some(column) = dept_column else {
         return ScopeFilterExpression::None;
     };
@@ -725,9 +771,18 @@ fn build_department_filter(context: &DataScopeContext, dept_column: Option<&str>
         return ScopeFilterExpression::None; // None 表示不限制
     };
     match ids.len() {
-        0 => ScopeFilterExpression::Equal { column: column.into(), value: -1 }, // 空数组表示无权限，恒假条件
-        1 => ScopeFilterExpression::Equal { column: column.into(), value: ids[0] },
-        _ => ScopeFilterExpression::In { column: column.into(), values: ids.clone() },
+        0 => ScopeFilterExpression::Equal {
+            column: column.into(),
+            value: -1,
+        }, // 空数组表示无权限，恒假条件
+        1 => ScopeFilterExpression::Equal {
+            column: column.into(),
+            value: ids[0],
+        },
+        _ => ScopeFilterExpression::In {
+            column: column.into(),
+            values: ids.clone(),
+        },
     }
 }
 
@@ -737,13 +792,19 @@ fn build_department_filter(context: &DataScopeContext, dept_column: Option<&str>
 /// <param name="context">数据权限上下文</param>
 /// <param name="dept_column">部门列名</param>
 /// <returns>过滤表达式</returns>
-pub fn build_department_scope_filter(context: &DataScopeContext, dept_column: Option<&str>) -> ScopeFilterExpression {
+pub fn build_department_scope_filter(
+    context: &DataScopeContext,
+    dept_column: Option<&str>,
+) -> ScopeFilterExpression {
     if context.is_system || context.data_scope == DataScope::All {
         return ScopeFilterExpression::None;
     }
     if context.data_scope == DataScope::SelfOnly {
         return match dept_column {
-            Some(column) => ScopeFilterExpression::Equal { column: column.into(), value: context.department_id },
+            Some(column) => ScopeFilterExpression::Equal {
+                column: column.into(),
+                value: context.department_id,
+            },
             None => ScopeFilterExpression::None,
         };
     }
@@ -755,7 +816,11 @@ pub fn build_department_scope_filter(context: &DataScopeContext, dept_column: Op
 /// <param name="row_user_id">数据行的用户编号</param>
 /// <param name="row_department_id">数据行的部门编号</param>
 /// <returns>是否有权访问</returns>
-pub fn can_access_scope_row(context: &DataScopeContext, row_user_id: i32, row_department_id: i32) -> bool {
+pub fn can_access_scope_row(
+    context: &DataScopeContext,
+    row_user_id: i32,
+    row_department_id: i32,
+) -> bool {
     if context.is_system {
         return true;
     }
@@ -814,10 +879,19 @@ mod tests {
     fn menu_row(id: i64, parent_id: i64, name: &str, sort: i64, visible: i64) -> DbRow {
         DbRow::new(
             Arc::new(
-                ["ID", "ParentID", "Name", "DisplayName", "Url", "Sort", "Visible", "Enable"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
+                [
+                    "ID",
+                    "ParentID",
+                    "Name",
+                    "DisplayName",
+                    "Url",
+                    "Sort",
+                    "Visible",
+                    "Enable",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             ),
             vec![
                 DbValue::Int(id),
@@ -844,14 +918,20 @@ mod tests {
     fn verify_login_matches_csharp_semantics() {
         let stored = md5_hex("123456");
         // 正常登录
-        assert_eq!(verify_login("admin", true, &stored, "123456", 1), LoginResult::Ok);
+        assert_eq!(
+            verify_login("admin", true, &stored, "123456", 1),
+            LoginResult::Ok
+        );
         // 密码错误
         assert_eq!(
             verify_login("admin", true, &stored, "654321", 1),
             LoginResult::Error("密码不正确！".into())
         );
         // 存储值大小写不敏感
-        assert_eq!(verify_login("admin", true, &stored.to_uppercase(), "123456", 1), LoginResult::Ok);
+        assert_eq!(
+            verify_login("admin", true, &stored.to_uppercase(), "123456", 1),
+            LoginResult::Ok
+        );
         // 账号被禁用
         assert_eq!(
             verify_login("admin", false, &stored, "123456", 1),
@@ -863,7 +943,10 @@ mod tests {
             LoginResult::NeedsHash(stored.clone())
         );
         // 自动登录分支（hashTimes=-1）：对存储值再哈希一轮后与输入比较
-        assert_eq!(verify_login("admin", true, "abc", &md5_hex("abc"), -1), LoginResult::Ok);
+        assert_eq!(
+            verify_login("admin", true, "abc", &md5_hex("abc"), -1),
+            LoginResult::Ok
+        );
         assert_eq!(
             verify_login("admin", true, "abc", "abc", -1),
             LoginResult::Error("密 码不正确！".into())
@@ -942,27 +1025,57 @@ mod tests {
     #[test]
     fn accessible_department_ids_rules() {
         // 系统角色不受限制
-        assert_eq!(accessible_department_ids(5, &[role(DataScope::SelfOnly, true, &[])], None, &[], &[]), None);
+        assert_eq!(
+            accessible_department_ids(5, &[role(DataScope::SelfOnly, true, &[])], None, &[], &[]),
+            None
+        );
         // 角色为空：无权限
-        assert_eq!(accessible_department_ids(5, &[], None, &[], &[]), Some(vec![]));
+        assert_eq!(
+            accessible_department_ids(5, &[], None, &[], &[]),
+            Some(vec![])
+        );
         // 全部：不限制
-        assert_eq!(accessible_department_ids(5, &[role(DataScope::All, false, &[])], None, &[], &[]), None);
+        assert_eq!(
+            accessible_department_ids(5, &[role(DataScope::All, false, &[])], None, &[], &[]),
+            None
+        );
         // 多角色取数值最小（权限最大）
-        let roles = [role(DataScope::Department, false, &[]), role(DataScope::All, false, &[])];
+        let roles = [
+            role(DataScope::Department, false, &[]),
+            role(DataScope::All, false, &[]),
+        ];
         assert_eq!(accessible_department_ids(5, &roles, None, &[], &[]), None);
         // 本部门
         assert_eq!(
-            accessible_department_ids(5, &[role(DataScope::Department, false, &[])], None, &[], &[]),
+            accessible_department_ids(
+                5,
+                &[role(DataScope::Department, false, &[])],
+                None,
+                &[],
+                &[]
+            ),
             Some(vec![5])
         );
         // 本部门及下级：使用预计算集合
         assert_eq!(
-            accessible_department_ids(5, &[role(DataScope::DepartmentAndBelow, false, &[])], None, &[5, 6, 7], &[]),
+            accessible_department_ids(
+                5,
+                &[role(DataScope::DepartmentAndBelow, false, &[])],
+                None,
+                &[5, 6, 7],
+                &[]
+            ),
             Some(vec![5, 6, 7])
         );
         // 仅本人：空集合，且不并入管理范围
         assert_eq!(
-            accessible_department_ids(5, &[role(DataScope::SelfOnly, false, &[])], None, &[], &[99]),
+            accessible_department_ids(
+                5,
+                &[role(DataScope::SelfOnly, false, &[])],
+                None,
+                &[],
+                &[99]
+            ),
             Some(vec![])
         );
         // 自定义：合并自定义部门；管理范围并入（非仅本人）
@@ -978,7 +1091,13 @@ mod tests {
         );
         // 指定范围优先于角色计算
         assert_eq!(
-            accessible_department_ids(5, &[role(DataScope::All, false, &[])], Some(DataScope::Department), &[], &[]),
+            accessible_department_ids(
+                5,
+                &[role(DataScope::All, false, &[])],
+                Some(DataScope::Department),
+                &[],
+                &[]
+            ),
             Some(vec![5])
         );
     }
@@ -1009,24 +1128,42 @@ mod tests {
         };
         // 本部门 + 用户列：或组合（本人数据始终可见）
         let f = build_scope_filter(&ctx, Some("CreateUserID"), Some("DepartmentID"));
-        assert_eq!(f.to_sql().as_deref(), Some("(DepartmentID = 5 OR CreateUserID = 7)"));
+        assert_eq!(
+            f.to_sql().as_deref(),
+            Some("(DepartmentID = 5 OR CreateUserID = 7)")
+        );
         // 无用户列：仅部门过滤
         let f = build_scope_filter(&ctx, None, Some("DepartmentID"));
         assert_eq!(f.to_sql().as_deref(), Some("DepartmentID = 5"));
         // 多部门：IN
-        let ctx2 = DataScopeContext { accessible_department_ids: Some(vec![5, 6, 7]), ..ctx.clone() };
+        let ctx2 = DataScopeContext {
+            accessible_department_ids: Some(vec![5, 6, 7]),
+            ..ctx.clone()
+        };
         let f = build_scope_filter(&ctx2, None, Some("DepartmentID"));
         assert_eq!(f.to_sql().as_deref(), Some("DepartmentID IN (5,6,7)"));
         // 空集合：恒假
-        let ctx3 = DataScopeContext { accessible_department_ids: Some(vec![]), ..ctx.clone() };
+        let ctx3 = DataScopeContext {
+            accessible_department_ids: Some(vec![]),
+            ..ctx.clone()
+        };
         let f = build_scope_filter(&ctx3, Some("CreateUserID"), Some("DepartmentID"));
-        assert_eq!(f.to_sql().as_deref(), Some("(DepartmentID = -1 OR CreateUserID = 7)"));
+        assert_eq!(
+            f.to_sql().as_deref(),
+            Some("(DepartmentID = -1 OR CreateUserID = 7)")
+        );
         // 仅本人：按用户列
-        let ctx4 = DataScopeContext { data_scope: DataScope::SelfOnly, ..ctx.clone() };
+        let ctx4 = DataScopeContext {
+            data_scope: DataScope::SelfOnly,
+            ..ctx.clone()
+        };
         let f = build_scope_filter(&ctx4, Some("CreateUserID"), Some("DepartmentID"));
         assert_eq!(f.to_sql().as_deref(), Some("CreateUserID = 7"));
         // 全部：不过滤
-        let ctx5 = DataScopeContext { data_scope: DataScope::All, ..ctx.clone() };
+        let ctx5 = DataScopeContext {
+            data_scope: DataScope::All,
+            ..ctx.clone()
+        };
         assert!(build_scope_filter(&ctx5, Some("CreateUserID"), Some("DepartmentID")).is_none());
         // 纯部门实体：仅本人退化为"当前用户所在部门"
         let f = build_department_scope_filter(&ctx4, Some("ID"));

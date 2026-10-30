@@ -247,7 +247,9 @@ mod tests {
         let expected_ms = (time - start).num_milliseconds();
         assert_eq!(snow.id_at(time), expected_ms << TIMESTAMP_SHIFT);
         let utc_ms = time.and_local_timezone(Local).unwrap().timestamp_millis();
-        let epoch_ms = chrono::DateTime::from_timestamp(0, 0).unwrap().timestamp_millis();
+        let epoch_ms = chrono::DateTime::from_timestamp(0, 0)
+            .unwrap()
+            .timestamp_millis();
         assert_eq!(expected_ms, utc_ms - epoch_ms);
     }
 
@@ -284,7 +286,11 @@ mod tests {
         let mut ids: Vec<i64> = (0..4000).map(|_| snow.new_id_at(time)).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 4000, "同一毫秒内 4000 个 Id 不应重复（序列号 12 位）");
+        assert_eq!(
+            ids.len(),
+            4000,
+            "同一毫秒内 4000 个 Id 不应重复（序列号 12 位）"
+        );
     }
 
     #[test]

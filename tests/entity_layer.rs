@@ -72,15 +72,28 @@ impl Entity for Order {
 
     fn from_row(row: &DbRow) -> Result<Self> {
         Ok(Self {
-            id: row.get_by_name("Id").and_then(DbValue::as_i32).unwrap_or_default(),
-            code: row.get_by_name("Code").and_then(|v| (!v.is_null()).then(|| v.to_text())),
-            amount: row.get_by_name("Amount").and_then(DbValue::as_decimal).unwrap_or_default(),
-            ok: row.get_by_name("Ok").and_then(DbValue::as_bool).unwrap_or_default(),
+            id: row
+                .get_by_name("Id")
+                .and_then(DbValue::as_i32)
+                .unwrap_or_default(),
+            code: row
+                .get_by_name("Code")
+                .and_then(|v| (!v.is_null()).then(|| v.to_text())),
+            amount: row
+                .get_by_name("Amount")
+                .and_then(DbValue::as_decimal)
+                .unwrap_or_default(),
+            ok: row
+                .get_by_name("Ok")
+                .and_then(DbValue::as_bool)
+                .unwrap_or_default(),
             create_time: row
                 .get_by_name("CreateTime")
                 .and_then(DbValue::as_datetime)
                 .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc()),
-            data: row.get_by_name("Data").and_then(|v| v.as_blob().map(<[u8]>::to_vec)),
+            data: row
+                .get_by_name("Data")
+                .and_then(|v| v.as_blob().map(<[u8]>::to_vec)),
         })
     }
 
@@ -88,7 +101,10 @@ impl Entity for Order {
     /// 既有的 query/find 用例因此全部覆盖该路径。
     fn from_row_owned(mut row: DbRow) -> Result<Self> {
         Ok(Self {
-            id: row.take_by_name("Id").and_then(|v| DbValue::as_i32(&v)).unwrap_or_default(),
+            id: row
+                .take_by_name("Id")
+                .and_then(|v| DbValue::as_i32(&v))
+                .unwrap_or_default(),
             code: row
                 .take_by_name("Code")
                 .and_then(|v| (!v.is_null()).then(|| v.into_text())),
@@ -96,7 +112,10 @@ impl Entity for Order {
                 .take_by_name("Amount")
                 .and_then(|v| DbValue::as_decimal(&v))
                 .unwrap_or_default(),
-            ok: row.take_by_name("Ok").and_then(|v| DbValue::as_bool(&v)).unwrap_or_default(),
+            ok: row
+                .take_by_name("Ok")
+                .and_then(|v| DbValue::as_bool(&v))
+                .unwrap_or_default(),
             create_time: row
                 .take_by_name("CreateTime")
                 .and_then(|v| DbValue::as_datetime(&v))
@@ -199,15 +218,28 @@ impl Entity for TrackedOrder {
 
     fn from_row(row: &DbRow) -> Result<Self> {
         Ok(Self {
-            id: row.get_by_name("Id").and_then(DbValue::as_i32).unwrap_or_default(),
-            code: row.get_by_name("Code").and_then(|v| (!v.is_null()).then(|| v.to_text())),
-            amount: row.get_by_name("Amount").and_then(DbValue::as_decimal).unwrap_or_default(),
-            ok: row.get_by_name("Ok").and_then(DbValue::as_bool).unwrap_or_default(),
+            id: row
+                .get_by_name("Id")
+                .and_then(DbValue::as_i32)
+                .unwrap_or_default(),
+            code: row
+                .get_by_name("Code")
+                .and_then(|v| (!v.is_null()).then(|| v.to_text())),
+            amount: row
+                .get_by_name("Amount")
+                .and_then(DbValue::as_decimal)
+                .unwrap_or_default(),
+            ok: row
+                .get_by_name("Ok")
+                .and_then(DbValue::as_bool)
+                .unwrap_or_default(),
             create_time: row
                 .get_by_name("CreateTime")
                 .and_then(DbValue::as_datetime)
                 .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc()),
-            data: row.get_by_name("Data").and_then(|v| v.as_blob().map(<[u8]>::to_vec)),
+            data: row
+                .get_by_name("Data")
+                .and_then(|v| v.as_blob().map(<[u8]>::to_vec)),
             dirty: pek_rcode::dirty::DirtyState::new(),
         })
     }
@@ -239,7 +271,8 @@ fn temp_dir(name: &str) -> PathBuf {
         .format("%H%M%S%.9f")
         .to_string()
         .replace('.', "");
-    let dir = std::env::temp_dir().join(format!("rcode-ent-{}-{}-{name}", std::process::id(), stamp));
+    let dir =
+        std::env::temp_dir().join(format!("rcode-ent-{}-{}-{name}", std::process::id(), stamp));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -255,7 +288,10 @@ fn setup(name: &str) -> (PathBuf, Dal) {
     // 生成的表应包含全部列
     let mut session = dal.open_session().unwrap();
     let columns = session.table_columns("DH_Order").unwrap();
-    assert_eq!(columns, vec!["Id", "Code", "Amount", "Ok", "CreateTime", "Data"]);
+    assert_eq!(
+        columns,
+        vec!["Id", "Code", "Amount", "Ok", "CreateTime", "Data"]
+    );
 
     (dir, dal)
 }
@@ -290,7 +326,9 @@ fn object_crud_roundtrip() {
     let mut edit = found.clone();
     edit.code = Some("HLT-2".into());
     assert_eq!(edit.save(&dal, session.as_mut()).unwrap(), 1);
-    let reloaded = Order::find(&dal, session.as_mut(), &[1.into()]).unwrap().unwrap();
+    let reloaded = Order::find(&dal, session.as_mut(), &[1.into()])
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded.code.as_deref(), Some("HLT-2"));
 
     // save（新对象 Id = 0）→ 插入
@@ -310,11 +348,18 @@ fn object_crud_roundtrip() {
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].code.as_deref(), Some("HLT-2"));
     assert_eq!(Order::all(&dal, session.as_mut()).unwrap().len(), 2);
-    assert_eq!(Order::count(&dal, session.as_mut(), Some(&filter)).unwrap(), 2);
+    assert_eq!(
+        Order::count(&dal, session.as_mut(), Some(&filter)).unwrap(),
+        2
+    );
 
     // delete
     assert_eq!(reloaded.delete(&dal, session.as_mut()).unwrap(), 1);
-    assert!(Order::find(&dal, session.as_mut(), &[1.into()]).unwrap().is_none());
+    assert!(
+        Order::find(&dal, session.as_mut(), &[1.into()])
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(Order::count(&dal, session.as_mut(), None).unwrap(), 1);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -329,7 +374,9 @@ fn null_and_default_values() {
     let mut order = Order::new();
     order.insert(&dal, session.as_mut()).unwrap();
 
-    let found = Order::find(&dal, session.as_mut(), &[order.id.into()]).unwrap().unwrap();
+    let found = Order::find(&dal, session.as_mut(), &[order.id.into()])
+        .unwrap()
+        .unwrap();
     assert_eq!(found.code, None);
     assert_eq!(found.data, None);
     assert_eq!(found.amount.to_string(), "0");
@@ -351,7 +398,10 @@ fn update_skips_pk_and_identity() {
     order.id = 999;
     order.code = Some("X".into());
     let affected = order.save(&dal, session.as_mut()).unwrap();
-    assert_eq!(affected, 0, "主键被改动后更新不到任何行（符合预期，避免误写）");
+    assert_eq!(
+        affected, 0,
+        "主键被改动后更新不到任何行（符合预期，避免误写）"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -506,16 +556,23 @@ fn db_row_name_lookup_is_case_insensitive_and_cached() {
             .map(|s| s.to_string())
             .collect(),
     );
-    let row = pek_rcode::session::DbRow::new(
-        columns,
-        vec![1i64.into(), "abc".into(), 2.5f64.into()],
-    );
+    let row =
+        pek_rcode::session::DbRow::new(columns, vec![1i64.into(), "abc".into(), 2.5f64.into()]);
     assert_eq!(row.get_by_name("id").and_then(DbValue::as_i64), Some(1));
-    assert_eq!(row.get_by_name("CODE").map(DbValue::to_text), Some("abc".to_string()));
-    assert_eq!(row.get_by_name("amount").and_then(DbValue::as_f64), Some(2.5));
+    assert_eq!(
+        row.get_by_name("CODE").map(DbValue::to_text),
+        Some("abc".to_string())
+    );
+    assert_eq!(
+        row.get_by_name("amount").and_then(DbValue::as_f64),
+        Some(2.5)
+    );
     assert!(row.get_by_name("Missing").is_none());
     // 重复取值走索引缓存
-    assert_eq!(row.get_by_name("Code").map(DbValue::to_text), Some("abc".to_string()));
+    assert_eq!(
+        row.get_by_name("Code").map(DbValue::to_text),
+        Some("abc".to_string())
+    );
 }
 
 /// `SaveAsync` 等价（`enqueue_save` + `EntityQueue`）：更新分支只写脏列，无脏不入队。
@@ -561,7 +618,9 @@ fn enqueue_save_writes_only_dirty_columns() {
         .unwrap()
         .unwrap();
     let before = queue.len();
-    clean.enqueue_save(&mut queue, &dal, session.as_mut()).unwrap();
+    clean
+        .enqueue_save(&mut queue, &dal, session.as_mut())
+        .unwrap();
     assert_eq!(queue.len(), before, "无脏数据不应入队");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -628,15 +687,28 @@ impl Entity for LogRow {
 
     fn from_row(row: &DbRow) -> Result<Self> {
         Ok(Self {
-            id: row.get_by_name("Id").and_then(DbValue::as_i32).unwrap_or_default(),
-            code: row.get_by_name("Code").and_then(|v| (!v.is_null()).then(|| v.to_text())),
-            amount: row.get_by_name("Amount").and_then(DbValue::as_decimal).unwrap_or_default(),
-            ok: row.get_by_name("Ok").and_then(DbValue::as_bool).unwrap_or_default(),
+            id: row
+                .get_by_name("Id")
+                .and_then(DbValue::as_i32)
+                .unwrap_or_default(),
+            code: row
+                .get_by_name("Code")
+                .and_then(|v| (!v.is_null()).then(|| v.to_text())),
+            amount: row
+                .get_by_name("Amount")
+                .and_then(DbValue::as_decimal)
+                .unwrap_or_default(),
+            ok: row
+                .get_by_name("Ok")
+                .and_then(DbValue::as_bool)
+                .unwrap_or_default(),
             create_time: row
                 .get_by_name("CreateTime")
                 .and_then(DbValue::as_datetime)
                 .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc()),
-            data: row.get_by_name("Data").and_then(|v| v.as_blob().map(<[u8]>::to_vec)),
+            data: row
+                .get_by_name("Data")
+                .and_then(|v| v.as_blob().map(<[u8]>::to_vec)),
         })
     }
 
@@ -675,7 +747,11 @@ fn insert_only_entity_rejects_update_and_delete_but_saves_directly() {
     assert_eq!(second.save(&dal, session.as_mut()).unwrap(), 1);
     let mut third = LogRow::new();
     third.set_code(Some("L4".into()));
-    assert_eq!(third.save(&dal, session.as_mut()).unwrap(), 1, "只插入表 save 一律插入");
+    assert_eq!(
+        third.save(&dal, session.as_mut()).unwrap(),
+        1,
+        "只插入表 save 一律插入"
+    );
 
     let total = LogRow::count(&dal, session.as_mut(), None).unwrap();
     assert_eq!(total, 3, "三行都应存在（没有更新覆盖）");
@@ -703,42 +779,30 @@ fn find_cached_by_uses_entity_cache_for_small_tables() {
     a.insert(&dal, s.as_mut()).unwrap();
 
     // 小表（1 行 < MaxCacheCount 默认 1000）→ 走整表实体缓存
-    let found = TrackedOrder::find_cached_by(
-        &dal,
-        s.as_mut(),
-        &[("Code", DbValue::Text("A".into()))],
-    )
-    .unwrap();
+    let found =
+        TrackedOrder::find_cached_by(&dal, s.as_mut(), &[("Code", DbValue::Text("A".into()))])
+            .unwrap();
     assert!(found.is_some(), "小表应命中实体缓存");
 
     // 缓存内匹配忽略大小写（与 SQLite COLLATE NOCASE / C# EqualIgnoreCase 一致）
-    let found = TrackedOrder::find_cached_by(
-        &dal,
-        s.as_mut(),
-        &[("Code", DbValue::Text("a".into()))],
-    )
-    .unwrap();
+    let found =
+        TrackedOrder::find_cached_by(&dal, s.as_mut(), &[("Code", DbValue::Text("a".into()))])
+            .unwrap();
     assert!(found.is_some(), "字符串匹配应忽略大小写");
 
     // 写入使实体缓存失效后，新行仍能查到（不能读到旧快照）
     let mut b = TrackedOrder::new();
     b.set_code(Some("B".into()));
     b.insert(&dal, s.as_mut()).unwrap();
-    let found = TrackedOrder::find_cached_by(
-        &dal,
-        s.as_mut(),
-        &[("Code", DbValue::Text("B".into()))],
-    )
-    .unwrap();
+    let found =
+        TrackedOrder::find_cached_by(&dal, s.as_mut(), &[("Code", DbValue::Text("B".into()))])
+            .unwrap();
     assert!(found.is_some(), "写入后缓存失效，应能查到新行");
 
     // 不存在的键返回 None
-    let missing = TrackedOrder::find_cached_by(
-        &dal,
-        s.as_mut(),
-        &[("Code", DbValue::Text("Z".into()))],
-    )
-    .unwrap();
+    let missing =
+        TrackedOrder::find_cached_by(&dal, s.as_mut(), &[("Code", DbValue::Text("Z".into()))])
+            .unwrap();
     assert!(missing.is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -767,12 +831,9 @@ fn max_cache_count_zero_uses_sql_path() {
     a.set_code(Some("A".into()));
     a.insert(&dal, s.as_mut()).unwrap();
 
-    let found = TrackedOrder::find_cached_by(
-        &dal,
-        s.as_mut(),
-        &[("Code", DbValue::Text("A".into()))],
-    )
-    .unwrap();
+    let found =
+        TrackedOrder::find_cached_by(&dal, s.as_mut(), &[("Code", DbValue::Text("A".into()))])
+            .unwrap();
     assert!(found.is_some(), "禁用缓存时仍应查到（走 SQL）");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -793,7 +854,10 @@ fn update_where_changes_many_rows_in_one_statement() {
     let affected = TrackedOrder::update_where(
         &dal,
         s.as_mut(),
-        &[("Amount", DbValue::from("9".parse::<rust_decimal::Decimal>().unwrap()))],
+        &[(
+            "Amount",
+            DbValue::from("9".parse::<rust_decimal::Decimal>().unwrap()),
+        )],
         &Where::new().eq("Code", "A"),
     )
     .unwrap();
@@ -810,7 +874,11 @@ fn update_where_changes_many_rows_in_one_statement() {
     assert_eq!(affected, 3, "空条件更新全部行（与 delete_where 同规矩）");
 
     let all = TrackedOrder::all(&dal, s.as_mut()).unwrap();
-    assert!(all.iter().all(|row| *row.amount() == "9".parse().unwrap() || *row.amount() == "1".parse().unwrap()));
+    assert!(
+        all.iter()
+            .all(|row| *row.amount() == "9".parse().unwrap()
+                || *row.amount() == "1".parse().unwrap())
+    );
     assert!(all.len() == 3);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -855,7 +923,9 @@ fn take_by_name_moves_value_and_clears_slot() {
     // 移动取值：拿到所有权，原位置置为 Null
     assert_eq!(row.take_by_name("Code"), Some(DbValue::Text("A".into())));
     assert!(
-        row.get_by_name("Code").map(DbValue::is_null).unwrap_or(false),
+        row.get_by_name("Code")
+            .map(DbValue::is_null)
+            .unwrap_or(false),
         "取出后该列应为 Null"
     );
     // 大小写不敏感（与 get_by_name 一致）

@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use chrono::NaiveDate;
-use pek_rcode::{DatabaseKind, Dal, DbValue, EntityModel, Query, Where, dal::ConnectionString};
+use pek_rcode::{Dal, DatabaseKind, DbValue, EntityModel, Query, Where, dal::ConnectionString};
 
 /// 测试模型（与 dal.rs 单测的 XML 结构一致）。
 const MODEL: &str = r#"<EntityModel><Tables>
@@ -123,7 +123,10 @@ fn entity_crud_roundtrip() {
             session.as_mut(),
             &[
                 ("Code", "A-001".into()),
-                ("Amount", "12.50".parse::<rust_decimal::Decimal>().unwrap().into()),
+                (
+                    "Amount",
+                    "12.50".parse::<rust_decimal::Decimal>().unwrap().into(),
+                ),
                 ("Payload", vec![0x10, 0x20].into()),
                 ("CreateTime", now.into()),
             ],
@@ -135,7 +138,10 @@ fn entity_crud_roundtrip() {
             session.as_mut(),
             &[
                 ("Code", "B-001".into()),
-                ("Amount", "7".parse::<rust_decimal::Decimal>().unwrap().into()),
+                (
+                    "Amount",
+                    "7".parse::<rust_decimal::Decimal>().unwrap().into(),
+                ),
                 ("Payload", DbValue::Null),
                 ("CreateTime", now.into()),
             ],
@@ -232,7 +238,10 @@ fn transaction_rollback() {
         session.as_mut(),
         &[
             ("Code", "R-001".into()),
-            ("Amount", "1".parse::<rust_decimal::Decimal>().unwrap().into()),
+            (
+                "Amount",
+                "1".parse::<rust_decimal::Decimal>().unwrap().into(),
+            ),
             ("CreateTime", now.into()),
         ],
     )

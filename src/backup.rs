@@ -603,7 +603,10 @@ mod tests {
         assert!(dbtable::is_dbtable(&bytes));
         let set = dbtable::decode_rowset(&bytes).unwrap();
         let columns: Vec<String> = set.columns.as_ref().clone();
-        assert_eq!(columns, vec!["Id", "Name", "Amount", "Ok", "CreateTime", "SId"]);
+        assert_eq!(
+            columns,
+            vec!["Id", "Name", "Amount", "Ok", "CreateTime", "SId"]
+        );
 
         // 清空后恢复：行数与主键值均应还原
         {
@@ -615,7 +618,10 @@ mod tests {
 
         let mut session = dal.open_session().unwrap();
         let set = session
-            .query("SELECT Id, Name, Amount, dh_sid FROM DH_Item ORDER BY Id", &[])
+            .query(
+                "SELECT Id, Name, Amount, dh_sid FROM DH_Item ORDER BY Id",
+                &[],
+            )
             .unwrap();
         assert_eq!(set.rows[0].get(0).unwrap().as_i64(), Some(1));
         assert_eq!(set.rows[0].get(1).unwrap().as_str(), Some("中文名称"));
@@ -683,7 +689,11 @@ mod tests {
         assert_eq!(count(&dal, "DH_Key"), 1);
 
         // 文件不存在：返回空
-        assert!(dal.restore_all(dir.join("none.zip"), None, true).unwrap().is_empty());
+        assert!(
+            dal.restore_all(dir.join("none.zip"), None, true)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// 跨语言互认（C# `DbPackage` 备份文件 → Rust 恢复）：
@@ -752,7 +762,10 @@ mod tests {
         let (target, dir2) = temp_dal("dst");
         insert_items(
             &source,
-            &[item_row("a", "1.0", true, None), item_row("b", "2.0", false, Some(5))],
+            &[
+                item_row("a", "1.0", true, None),
+                item_row("b", "2.0", false, Some(5)),
+            ],
         );
         {
             let mut session = source.open_session().unwrap();

@@ -114,7 +114,10 @@ mod tests {
         assert!(!strategy.allows_replica("DH_Stock"));
 
         strategy.set_primary_only(true);
-        assert!(!strategy.allows_replica("DH_User"), "全局切主库后一律走主库");
+        assert!(
+            !strategy.allows_replica("DH_User"),
+            "全局切主库后一律走主库"
+        );
         strategy.set_primary_only(false);
         assert!(strategy.allows_replica("DH_User"));
     }

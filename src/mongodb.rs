@@ -103,7 +103,9 @@ fn parse_settings(cs: &ConnectionString) -> Result<MongoSettings> {
     let uri = match user {
         Some(user) => {
             let source = cs.get("authsource").unwrap_or("admin");
-            format!("mongodb://{user}:{password}@{host}:{port}/?authSource={source}&appName=Pek.RCode")
+            format!(
+                "mongodb://{user}:{password}@{host}:{port}/?authSource={source}&appName=Pek.RCode"
+            )
         }
         None => format!("mongodb://{host}:{port}/?appName=Pek.RCode"),
     };
@@ -259,21 +261,24 @@ fn tokenize(sql: &str) -> Result<Vec<Tok>> {
                 i += 1;
                 tokens.push(Tok::Literal(DbValue::Text(text)));
             }
-            c if c.is_ascii_digit() || (c == '-' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) => {
+            c if c.is_ascii_digit()
+                || (c == '-' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) =>
+            {
                 let mut text = String::new();
                 while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                     text.push(chars[i]);
                     i += 1;
                 }
-                let value = if text.contains('.') {
-                    DbValue::Float(text.parse().map_err(|e| {
-                        Error::Db(format!("Mongo 翻译：无法解析数字 {text}：{e}"))
-                    })?)
-                } else {
-                    DbValue::Int(text.parse().map_err(|e| {
-                        Error::Db(format!("Mongo 翻译：无法解析数字 {text}：{e}"))
-                    })?)
-                };
+                let value =
+                    if text.contains('.') {
+                        DbValue::Float(text.parse().map_err(|e| {
+                            Error::Db(format!("Mongo 翻译：无法解析数字 {text}：{e}"))
+                        })?)
+                    } else {
+                        DbValue::Int(text.parse().map_err(|e| {
+                            Error::Db(format!("Mongo 翻译：无法解析数字 {text}：{e}"))
+                        })?)
+                    };
                 tokens.push(Tok::Literal(value));
             }
             c if c.is_alphanumeric() || c == '_' || c == '$' => {
@@ -392,9 +397,7 @@ impl<'a> Parser<'a> {
     fn expect_ident(&mut self) -> Result<String> {
         match self.bump() {
             Some(Tok::Ident(name)) => Ok(name),
-            other => Err(Error::Db(format!(
-                "Mongo 翻译：期待标识符，实际 {other:?}"
-            ))),
+            other => Err(Error::Db(format!("Mongo 翻译：期待标识符，实际 {other:?}"))),
         }
     }
 
@@ -552,7 +555,10 @@ fn merge_filter(left: Document, right: Document, combinator: &str) -> Document {
             return merged;
         }
     }
-    doc_kv(combinator, vec![Bson::Document(left), Bson::Document(right)])
+    doc_kv(
+        combinator,
+        vec![Bson::Document(left), Bson::Document(right)],
+    )
 }
 
 /// SQL LIKE 模式 → 正则（`%`→`.*`、`_`→`.`，其余转义）。
@@ -766,7 +772,11 @@ fn translate(sql: &str, params: &[DbValue]) -> Result<Statement> {
             if parser.eat_word("WHERE") {
                 filter = parser.filter()?;
             }
-            Ok(Statement::Update(UpdatePlan { table, sets, filter }))
+            Ok(Statement::Update(UpdatePlan {
+                table,
+                sets,
+                filter,
+            }))
         }
         "DELETE" => {
             parser.bump();
@@ -789,7 +799,11 @@ fn document_to_row(document: &Document, columns: &[String]) -> Vec<DbValue> {
     columns
         .iter()
         .map(|column| {
-            let key = if column == "Id" { "_id" } else { column.as_str() };
+            let key = if column == "Id" {
+                "_id"
+            } else {
+                column.as_str()
+            };
             document
                 .get(key)
                 .map(bson_to_dbvalue)
@@ -1022,18 +1036,12 @@ mod tests {
     #[test]
     fn select_translation_with_filter_sort_paging() {
         let sql = "SELECT * FROM \"DH_Order\" WHERE ((\"Code\" = ?) AND (\"Amount\" > ?)) ORDER BY \"Id\" DESC LIMIT 10 OFFSET 20";
-        let values = params(&[
-            DbValue::Text("A-001".into()),
-            DbValue::Int(3),
-        ]);
+        let values = params(&[DbValue::Text("A-001".into()), DbValue::Int(3)]);
         match translate(sql, &values).unwrap() {
             Statement::Select(plan) => {
                 assert_eq!(plan.table, "DH_Order");
                 assert_eq!(plan.filter.len(), 2);
-                assert_eq!(
-                    plan.filter.get("Code"),
-                    Some(&Bson::String("A-001".into()))
-                );
+                assert_eq!(plan.filter.get("Code"), Some(&Bson::String("A-001".into())));
                 assert_eq!(plan.limit, Some(10));
                 assert_eq!(plan.skip, Some(20));
                 assert_eq!(plan.sort, Some(("Id".to_string(), true)));
@@ -1051,10 +1059,7 @@ mod tests {
                 assert!(plan.count);
                 let code = plan.filter.get("Code").unwrap();
                 let doc = code.as_document().unwrap();
-                assert_eq!(
-                    doc.get("$regex"),
-                    Some(&Bson::String("^A-.*$".into()))
-                );
+                assert_eq!(doc.get("$regex"), Some(&Bson::String("^A-.*$".into())));
             }
             _ => panic!("应为 SELECT COUNT"),
         }

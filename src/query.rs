@@ -244,7 +244,11 @@ impl Where {
                         out.push_str(if cond.op == Op::In { "1 = 0" } else { "1 = 1" });
                     } else {
                         push_quoted_or_raw(kind, out, &cond.column);
-                        out.push_str(if cond.op == Op::In { " IN (" } else { " NOT IN (" });
+                        out.push_str(if cond.op == Op::In {
+                            " IN ("
+                        } else {
+                            " NOT IN ("
+                        });
                         for (position, value) in cond.values.iter().enumerate() {
                             if position > 0 {
                                 out.push_str(", ");
@@ -460,7 +464,9 @@ mod tests {
         let mut params = Vec::new();
         let empty: Vec<i32> = vec![];
         assert_eq!(
-            Where::new().in_("A", empty).render(DatabaseKind::Sqlite, &mut params),
+            Where::new()
+                .in_("A", empty)
+                .render(DatabaseKind::Sqlite, &mut params),
             "(1 = 0)"
         );
         let mut params = Vec::new();
@@ -517,7 +523,12 @@ mod tests {
 
         // 空列集合不生成条件（避免恒假/恒真）
         let mut params = Vec::new();
-        assert_eq!(Where::new().any_like(&[], "%x%").render(DatabaseKind::Sqlite, &mut params), "");
+        assert_eq!(
+            Where::new()
+                .any_like(&[], "%x%")
+                .render(DatabaseKind::Sqlite, &mut params),
+            ""
+        );
         assert!(params.is_empty());
     }
 
@@ -541,8 +552,11 @@ mod tests {
         );
         let dal = Dal::open(&conn).expect("打开 SQLite");
         let mut s = dal.open_session().expect("会话");
-        s.execute("create table T (Id integer primary key, Name text, Code text, Remark text)", &[])
-            .expect("建表");
+        s.execute(
+            "create table T (Id integer primary key, Name text, Code text, Remark text)",
+            &[],
+        )
+        .expect("建表");
         for (id, name, code, remark) in [
             (1, "alpha", "A1", ""),
             (2, "beta", "HLK-9", ""),
@@ -561,11 +575,15 @@ mod tests {
                 .query(
                     &format!(
                         "select Id from T where {} order by Id",
-                        Where::new().any_like(list, pat).render(DatabaseKind::Sqlite, &mut Vec::new())
+                        Where::new()
+                            .any_like(list, pat)
+                            .render(DatabaseKind::Sqlite, &mut Vec::new())
                     ),
                     &{
                         let mut p = Vec::new();
-                        Where::new().any_like(list, pat).render(DatabaseKind::Sqlite, &mut p);
+                        Where::new()
+                            .any_like(list, pat)
+                            .render(DatabaseKind::Sqlite, &mut p);
                         p
                     },
                 )
@@ -576,7 +594,11 @@ mod tests {
                 .collect()
         };
 
-        assert_eq!(hit(&["Name", "Code", "Remark"], "%hlk%"), vec![2, 3], "Code 与 Remark 任一命中");
+        assert_eq!(
+            hit(&["Name", "Code", "Remark"], "%hlk%"),
+            vec![2, 3],
+            "Code 与 Remark 任一命中"
+        );
         assert_eq!(hit(&["Name"], "%ta"), vec![2, 4], "只有 beta/delta 命中");
         assert!(hit(&["Code"], "%zzz%").is_empty());
 

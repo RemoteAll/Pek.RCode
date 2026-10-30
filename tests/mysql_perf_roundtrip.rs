@@ -174,7 +174,12 @@ fn bench_mysql_roundtrip_paths() {
         for item in &items {
             let fields = item.to_fields();
             queue
-                .upsert(&dal, session.as_mut(), &[DbValue::Int(i64::from(item.id))], &fields)
+                .upsert(
+                    &dal,
+                    session.as_mut(),
+                    &[DbValue::Int(i64::from(item.id))],
+                    &fields,
+                )
                 .unwrap();
         }
         queue.flush(&dal, session.as_mut()).unwrap();
@@ -198,7 +203,11 @@ fn bench_mysql_roundtrip_paths() {
         RtItem::upsert_batch(&dal, session.as_mut(), &items, None).unwrap();
         let elapsed = t.elapsed();
         session.commit().unwrap();
-        report("② Entity::upsert_batch（多行 ON DUPLICATE KEY）", N, elapsed);
+        report(
+            "② Entity::upsert_batch（多行 ON DUPLICATE KEY）",
+            N,
+            elapsed,
+        );
     }
 
     // ③ save_batch（当前：已存在行逐条 update → N 次往返 + 1 次批量 IN 查询）

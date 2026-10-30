@@ -4,9 +4,9 @@
 
 use std::path::PathBuf;
 
+use pek_rcode::Dal;
 use pek_rcode::model::EntityModel;
 use pek_rcode::value::DbValue;
-use pek_rcode::Dal;
 
 const MODEL: &str = r#"<EntityModel><Tables>
 <Table Name="Article" TableName="DH_Article" Description="文章">
@@ -22,10 +22,8 @@ const MODEL: &str = r#"<EntityModel><Tables>
 </Tables></EntityModel>"#;
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "pek-rcode-fieldcache-{tag}-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("pek-rcode-fieldcache-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -131,12 +129,19 @@ fn table_find_cached_by_uses_entity_cache_and_invalidates() {
     let mut session = dal.open_session().unwrap();
 
     table
-        .insert(session.as_mut(), &[("Category", DbValue::Text("Redis".into()))])
+        .insert(
+            session.as_mut(),
+            &[("Category", DbValue::Text("Redis".into()))],
+        )
         .unwrap();
 
     // 首次命中（此时可能走 SQL），字符串忽略大小写
     let row = table
-        .find_cached_by(&dal, session.as_mut(), &[("Category", DbValue::Text("redis".into()))])
+        .find_cached_by(
+            &dal,
+            session.as_mut(),
+            &[("Category", DbValue::Text("redis".into()))],
+        )
         .unwrap()
         .expect("应能按唯一键查到");
     assert_eq!(
@@ -146,7 +151,11 @@ fn table_find_cached_by_uses_entity_cache_and_invalidates() {
 
     // 再查一次：应命中缓存（行数 < MaxCacheCount），结果一致
     let again = table
-        .find_cached_by(&dal, session.as_mut(), &[("Category", DbValue::Text("REDIS".into()))])
+        .find_cached_by(
+            &dal,
+            session.as_mut(),
+            &[("Category", DbValue::Text("REDIS".into()))],
+        )
         .unwrap()
         .expect("缓存命中");
     assert_eq!(
@@ -157,29 +166,36 @@ fn table_find_cached_by_uses_entity_cache_and_invalidates() {
     // 未命中
     assert!(
         table
-            .find_cached_by(&dal, session.as_mut(), &[("Category", DbValue::Text("Nope".into()))])
+            .find_cached_by(
+                &dal,
+                session.as_mut(),
+                &[("Category", DbValue::Text("Nope".into()))]
+            )
             .unwrap()
             .is_none()
     );
 
     // 写入后缓存失效：新行立即可查
     table
-        .insert(session.as_mut(), &[("Category", DbValue::Text("Kafka".into()))])
+        .insert(
+            session.as_mut(),
+            &[("Category", DbValue::Text("Kafka".into()))],
+        )
         .unwrap();
     assert!(
         table
-            .find_cached_by(&dal, session.as_mut(), &[("Category", DbValue::Text("Kafka".into()))])
+            .find_cached_by(
+                &dal,
+                session.as_mut(),
+                &[("Category", DbValue::Text("Kafka".into()))]
+            )
             .unwrap()
             .is_some(),
         "写入后缓存应失效，新行立即可查"
     );
 
     // 空键拒绝（避免退化为"取首行"的危险语义）
-    assert!(
-        table
-            .find_cached_by(&dal, session.as_mut(), &[])
-            .is_err()
-    );
+    assert!(table.find_cached_by(&dal, session.as_mut(), &[]).is_err());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

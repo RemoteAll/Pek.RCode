@@ -125,8 +125,21 @@ fn agent(timeout: Duration) -> ureq::Agent {
 }
 
 /// 发送 HTTP 请求（POST 文本），返回响应体文本；非 2xx 时给出带响应体的错误。
-pub fn post_text(url: &str, body: &str, auth: Option<(&str, &str)>, timeout: Duration) -> Result<String> {
-    send_post(url, body, "text/plain; charset=utf-8", auth, None, timeout, None)
+pub fn post_text(
+    url: &str,
+    body: &str,
+    auth: Option<(&str, &str)>,
+    timeout: Duration,
+) -> Result<String> {
+    send_post(
+        url,
+        body,
+        "text/plain; charset=utf-8",
+        auth,
+        None,
+        timeout,
+        None,
+    )
 }
 
 /// 同 [`post_text`]，可携带 `User-Agent`（`None` = 不发送该头）。
@@ -137,12 +150,33 @@ pub fn post_text_ua(
     timeout: Duration,
     user_agent: Option<&str>,
 ) -> Result<String> {
-    send_post(url, body, "text/plain; charset=utf-8", auth, None, timeout, user_agent)
+    send_post(
+        url,
+        body,
+        "text/plain; charset=utf-8",
+        auth,
+        None,
+        timeout,
+        user_agent,
+    )
 }
 
 /// 发送 HTTP 请求（POST JSON），返回响应体文本；非 2xx 时给出带响应体的错误。
-pub fn post_json(url: &str, body: &str, auth: Option<(&str, &str)>, timeout: Duration) -> Result<String> {
-    send_post(url, body, "application/json; charset=utf-8", auth, None, timeout, None)
+pub fn post_json(
+    url: &str,
+    body: &str,
+    auth: Option<(&str, &str)>,
+    timeout: Duration,
+) -> Result<String> {
+    send_post(
+        url,
+        body,
+        "application/json; charset=utf-8",
+        auth,
+        None,
+        timeout,
+        None,
+    )
 }
 
 /// 同 [`post_json`]，可携带 `User-Agent`（`None` = 不发送该头）。
@@ -153,7 +187,15 @@ pub fn post_json_ua(
     timeout: Duration,
     user_agent: Option<&str>,
 ) -> Result<String> {
-    send_post(url, body, "application/json; charset=utf-8", auth, None, timeout, user_agent)
+    send_post(
+        url,
+        body,
+        "application/json; charset=utf-8",
+        auth,
+        None,
+        timeout,
+        user_agent,
+    )
 }
 
 /// 同 [`post_json`]，可携带 **Bearer 令牌**（代理按用户身份放行）与 `User-Agent`。
@@ -201,7 +243,15 @@ pub fn post_bytes_ua(
     timeout: Duration,
     user_agent: Option<&str>,
 ) -> Result<Vec<u8>> {
-    post_bytes_auth(url, body, accept_octet_stream, auth, None, timeout, user_agent)
+    post_bytes_auth(
+        url,
+        body,
+        accept_octet_stream,
+        auth,
+        None,
+        timeout,
+        user_agent,
+    )
 }
 
 /// 同 [`post_bytes`]，可携带 **Bearer 令牌**与 `User-Agent`。
@@ -243,7 +293,11 @@ pub fn post_bytes_auth(
         .map_err(|e| Error::Db(format!("读取 HTTP 响应失败：{e}")))?;
     if !status.is_success() {
         let text = String::from_utf8_lossy(&bytes);
-        return Err(Error::Db(format!("HTTP {}：{}", status.as_u16(), text.trim())));
+        return Err(Error::Db(format!(
+            "HTTP {}：{}",
+            status.as_u16(),
+            text.trim()
+        )));
     }
     Ok(bytes)
 }
@@ -281,7 +335,11 @@ fn send_post(
         .read_to_string()
         .map_err(|e| Error::Db(format!("读取 HTTP 响应失败：{e}")))?;
     if !status.is_success() {
-        return Err(Error::Db(format!("HTTP {}：{}", status.as_u16(), text.trim())));
+        return Err(Error::Db(format!(
+            "HTTP {}：{}",
+            status.as_u16(),
+            text.trim()
+        )));
     }
     Ok(text)
 }
@@ -314,11 +372,7 @@ pub fn get_text_auth(
 }
 
 /// 发送 HTTP GET，返回响应体**原始字节**（下载升级包/图片等二进制内容）。
-pub fn get_bytes(
-    url: &str,
-    auth: Option<(&str, &str)>,
-    timeout: Duration,
-) -> Result<Vec<u8>> {
+pub fn get_bytes(url: &str, auth: Option<(&str, &str)>, timeout: Duration) -> Result<Vec<u8>> {
     get_bytes_auth(url, auth, None, timeout, None)
 }
 
@@ -354,7 +408,11 @@ pub fn get_bytes_auth(
         .map_err(|e| Error::Db(format!("读取 HTTP 响应失败：{e}")))?;
     if !status.is_success() {
         let text = String::from_utf8_lossy(&bytes);
-        return Err(Error::Db(format!("HTTP {}：{}", status.as_u16(), text.trim())));
+        return Err(Error::Db(format!(
+            "HTTP {}：{}",
+            status.as_u16(),
+            text.trim()
+        )));
     }
     Ok(bytes)
 }
@@ -384,9 +442,18 @@ mod tests {
 
     #[test]
     fn literal_rendering() {
-        assert_eq!(render_literal(&DbValue::Null, LiteralStyle::ClickHouse), "NULL");
-        assert_eq!(render_literal(&DbValue::Bool(true), LiteralStyle::Influx), "true");
-        assert_eq!(render_literal(&DbValue::Bool(true), LiteralStyle::ClickHouse), "1");
+        assert_eq!(
+            render_literal(&DbValue::Null, LiteralStyle::ClickHouse),
+            "NULL"
+        );
+        assert_eq!(
+            render_literal(&DbValue::Bool(true), LiteralStyle::Influx),
+            "true"
+        );
+        assert_eq!(
+            render_literal(&DbValue::Bool(true), LiteralStyle::ClickHouse),
+            "1"
+        );
         assert_eq!(
             render_literal(&DbValue::Text("it's".into()), LiteralStyle::TDengine),
             "'it\\'s'"

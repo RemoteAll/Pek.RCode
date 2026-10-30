@@ -48,12 +48,7 @@ impl DuckDbSession {
             DuckDbTarget::Memory => Connection::open_in_memory(),
             DuckDbTarget::File(path) => Connection::open(path),
         }
-        .map_err(|e| {
-            Error::Db(format!(
-                "打开 DuckDB 失败（{}）：{e}",
-                settings.describe()
-            ))
-        })?;
+        .map_err(|e| Error::Db(format!("打开 DuckDB 失败（{}）：{e}", settings.describe())))?;
 
         Ok(Self { conn })
     }
@@ -260,9 +255,7 @@ impl SqlSession for DuckDbSession {
         while let Some(row) = rows.next().map_err(map_err)? {
             let mut values = Vec::with_capacity(width);
             for index in 0..width {
-                values.push(duckdb_cell_to_dbvalue(
-                    row.get_ref(index).map_err(map_err)?,
-                ));
+                values.push(duckdb_cell_to_dbvalue(row.get_ref(index).map_err(map_err)?));
             }
             set.push(values);
         }
@@ -440,28 +433,34 @@ mod tests {
             row.get_by_name("Payload").unwrap(),
             &DbValue::Blob(vec![0x10, 0x20])
         );
-        assert_eq!(row.get_by_name("CreateTime").unwrap(), &DbValue::DateTime(now));
+        assert_eq!(
+            row.get_by_name("CreateTime").unwrap(),
+            &DbValue::DateTime(now)
+        );
 
         // 结构探测
         assert!(session.table_exists("DH_Item").unwrap());
         assert!(!session.table_exists("DH_NotFound").unwrap());
         let columns = session.table_columns("DH_Item").unwrap();
-        assert_eq!(columns, vec!["Id", "Code", "Amount", "Payload", "CreateTime"]);
+        assert_eq!(
+            columns,
+            vec!["Id", "Code", "Amount", "Payload", "CreateTime"]
+        );
 
         // 更新 / 删除
         let affected = session
             .execute(
                 "UPDATE \"DH_Item\" SET \"Code\" = ? WHERE \"Code\" = ?",
-                &[
-                    DbValue::Text("B-001".into()),
-                    DbValue::Text("A-001".into()),
-                ],
+                &[DbValue::Text("B-001".into()), DbValue::Text("A-001".into())],
             )
             .unwrap();
         assert_eq!(affected, 1);
         assert_eq!(
             session
-                .execute("DELETE FROM \"DH_Item\" WHERE \"Code\" = ?", &[DbValue::Text("B-001".into())])
+                .execute(
+                    "DELETE FROM \"DH_Item\" WHERE \"Code\" = ?",
+                    &[DbValue::Text("B-001".into())]
+                )
                 .unwrap(),
             1
         );
@@ -475,9 +474,7 @@ mod tests {
             )
             .unwrap();
         session.rollback().unwrap();
-        let set = session
-            .query("SELECT * FROM \"DH_Item\"", &[])
-            .unwrap();
+        let set = session.query("SELECT * FROM \"DH_Item\"", &[]).unwrap();
         assert!(set.is_empty());
     }
 }

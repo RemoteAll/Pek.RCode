@@ -12,8 +12,7 @@
 use std::path::PathBuf;
 
 use pek_rcode::{
-    DatabaseKind, Dal, DbValue, EntityModel, Query, Where,
-    codegen, dal::ConnectionString,
+    Dal, DatabaseKind, DbValue, EntityModel, Query, Where, codegen, dal::ConnectionString,
 };
 
 /// 测试固件：生产 WMS 模型快照样本（7 张真实表，覆盖全部 8 种数据类型）
@@ -25,7 +24,8 @@ fn temp_dir(name: &str) -> PathBuf {
         .format("%H%M%S%.9f")
         .to_string()
         .replace('.', "");
-    let dir = std::env::temp_dir().join(format!("rcode-e2e-{}-{}-{name}", std::process::id(), stamp));
+    let dir =
+        std::env::temp_dir().join(format!("rcode-e2e-{}-{}-{name}", std::process::id(), stamp));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -38,14 +38,23 @@ fn model_ddl_for_all_dialects() {
     let table = model.table("JiLiYu").expect("应存在 JiLiYu 表");
 
     let sqlite = DatabaseKind::Sqlite.create_table_sql(table).remove(0);
-    assert!(sqlite.contains("\"Id\" integer PRIMARY KEY AUTOINCREMENT"), "{sqlite}");
+    assert!(
+        sqlite.contains("\"Id\" integer PRIMARY KEY AUTOINCREMENT"),
+        "{sqlite}"
+    );
 
     let mysql = DatabaseKind::MySql.create_table_sql(table).remove(0);
-    assert!(mysql.contains("`Id` int AUTO_INCREMENT NOT NULL"), "{mysql}");
+    assert!(
+        mysql.contains("`Id` int AUTO_INCREMENT NOT NULL"),
+        "{mysql}"
+    );
     assert!(mysql.contains("PRIMARY KEY (`Id`)"), "{mysql}");
 
     let sqlserver = DatabaseKind::SqlServer.create_table_sql(table).remove(0);
-    assert!(sqlserver.contains("[Id] int IDENTITY(1,1) NOT NULL"), "{sqlserver}");
+    assert!(
+        sqlserver.contains("[Id] int IDENTITY(1,1) NOT NULL"),
+        "{sqlserver}"
+    );
 
     let pg = DatabaseKind::PostgreSql.create_table_sql(table).remove(0);
     // 与 DH.NCode 对齐：PostgreSQL 自增使用 serial/serial8（伪类型，替换原类型）
@@ -133,14 +142,28 @@ fn model_end_to_end_on_sqlite() {
 
     // 主键更新与删除（主键为字符串 Key）
     let affected = vc
-        .update_by_pk(session.as_mut(), &[("Code", "654321".into())], &["k-001".into()])
+        .update_by_pk(
+            session.as_mut(),
+            &[("Code", "654321".into())],
+            &["k-001".into()],
+        )
         .unwrap();
     assert_eq!(affected, 1);
-    let row = vc.find_by_pk(session.as_mut(), &["k-001".into()]).unwrap().unwrap();
+    let row = vc
+        .find_by_pk(session.as_mut(), &["k-001".into()])
+        .unwrap()
+        .unwrap();
     assert_eq!(row.get_by_name("Code").unwrap().as_str(), Some("654321"));
 
-    assert_eq!(vc.delete_by_pk(session.as_mut(), &["k-001".into()]).unwrap(), 1);
-    assert!(!vc.exists_by_pk(session.as_mut(), &["k-001".into()]).unwrap());
+    assert_eq!(
+        vc.delete_by_pk(session.as_mut(), &["k-001".into()])
+            .unwrap(),
+        1
+    );
+    assert!(
+        !vc.exists_by_pk(session.as_mut(), &["k-001".into()])
+            .unwrap()
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -154,7 +177,10 @@ fn model_codegen_output() {
     assert!(code.contains("pub struct HardwareDevices {"), "{code}");
     assert!(code.contains("    mac: String,"), "字段私有：{code}");
     assert!(code.contains("    h_type: i16,"), "{code}");
-    assert!(code.contains("pub fn set_mac(&mut self, value: String)"), "{code}");
+    assert!(
+        code.contains("pub fn set_mac(&mut self, value: String)"),
+        "{code}"
+    );
     assert!(code.contains("self.dirty.mark_static(\"Mac\");"), "{code}");
     assert!(
         code.contains("pub const TABLE_NAME: &'static str = \"DH_HardwareDevices\";"),
@@ -164,7 +190,11 @@ fn model_codegen_output() {
     // 全量生成：176 张表各自一个文件
     let files = codegen::generate_all(&model);
     assert_eq!(files.len(), model.tables.len());
-    assert!(files.iter().all(|(name, code)| name.ends_with(".rs") && code.contains("pub struct")));
+    assert!(
+        files
+            .iter()
+            .all(|(name, code)| name.ends_with(".rs") && code.contains("pub struct"))
+    );
 }
 
 #[test]
@@ -221,9 +251,15 @@ fn unique_index_generates_cached_find_method() {
     // 单列唯一索引
     assert!(code.contains("pub fn find_by_code("), "{code}");
     // 多列唯一索引 → find_by_a_and_b
-    assert!(code.contains("pub fn find_by_tenant_id_and_code("), "{code}");
+    assert!(
+        code.contains("pub fn find_by_tenant_id_and_code("),
+        "{code}"
+    );
     // 统一走 find_cached_by（MaxCacheCount 自动判定）
-    assert!(code.contains("Self::find_cached_by(dal, session, &["), "{code}");
+    assert!(
+        code.contains("Self::find_cached_by(dal, session, &["),
+        "{code}"
+    );
     // 可空列的唯一索引不生成（参数无法表达 NULL 语义）
     assert!(!code.contains("find_by_memo"), "{code}");
 
@@ -235,11 +271,20 @@ fn unique_index_generates_cached_find_method() {
 
     // 结构护栏：`find_by_xxx` / `xxx_list` 是**固有方法**，绝不能落进 `impl Entity for ...`
     // （落进去会变成 trait 方法 → 生成代码无法编译；曾因此漏过一次）
-    let entity_start = code.find("impl Entity for DhUser").expect("应生成 trait impl");
+    let entity_start = code
+        .find("impl Entity for DhUser")
+        .expect("应生成 trait impl");
     let tail = &code[entity_start..];
-    let body_end = tail.find("\n}\n").map(|i| entity_start + i).unwrap_or(code.len());
+    let body_end = tail
+        .find("\n}\n")
+        .map(|i| entity_start + i)
+        .unwrap_or(code.len());
     let entity_block = &code[entity_start..body_end];
-    for needle in ["pub fn find_by_code(", "pub fn code_list(", "pub fn memo_list("] {
+    for needle in [
+        "pub fn find_by_code(",
+        "pub fn code_list(",
+        "pub fn memo_list(",
+    ] {
         assert!(code.contains(needle), "缺少 {needle}");
         assert!(
             !entity_block.contains(needle),
@@ -269,7 +314,10 @@ fn codegen_generates_validate_for_required_columns() {
     let model = EntityModel::parse(xml).unwrap();
     let code = codegen::generate(model.table("DhOrder").unwrap());
 
-    assert!(code.contains("fn validate(&self) -> pek_rcode::Result<()> {"), "{code}");
+    assert!(
+        code.contains("fn validate(&self) -> pek_rcode::Result<()> {"),
+        "{code}"
+    );
     // 必填列 Code → 校验（提示用 Description）
     assert!(
         code.contains("if self.code.trim().is_empty()"),
@@ -307,7 +355,11 @@ fn max_cache_count_defaults_and_time_scale_disables_cache() {
 </EntityModel>"#;
     let model = EntityModel::parse(xml).unwrap();
     assert_eq!(model.table("A").unwrap().max_cache_count, 1000, "缺省 1000");
-    assert_eq!(model.table("B").unwrap().max_cache_count, 5000, "显式值生效");
+    assert_eq!(
+        model.table("B").unwrap().max_cache_count,
+        5000,
+        "显式值生效"
+    );
     assert_eq!(
         model.table("C").unwrap().max_cache_count,
         0,
@@ -324,7 +376,8 @@ fn max_cache_count_defaults_and_time_scale_disables_cache() {
 
 #[test]
 fn connection_string_accepts_wms_configs() {
-    let sqlite = ConnectionString::parse("Data Source=..\\..\\Data\\DG.db;ShowSql=false;Provider=SQLite");
+    let sqlite =
+        ConnectionString::parse("Data Source=..\\..\\Data\\DG.db;ShowSql=false;Provider=SQLite");
     assert_eq!(sqlite.kind().unwrap(), DatabaseKind::Sqlite);
     assert!(!sqlite.show_sql());
 
@@ -353,7 +406,11 @@ fn full_model_sync_schema_when_configured() {
 
     // 全部表建到临时库（验证所有表的 DDL 均可执行），重复执行应幂等
     let report = dal.sync_schema().unwrap();
-    assert_eq!(report.created_tables.len(), table_count, "应建出全部表：{report}");
+    assert_eq!(
+        report.created_tables.len(),
+        table_count,
+        "应建出全部表：{report}"
+    );
     assert!(dal.sync_schema().unwrap().is_empty(), "重复同步应无变更");
     eprintln!("全量建表回归通过：{table_count} 张表");
 

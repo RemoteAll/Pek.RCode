@@ -29,7 +29,11 @@ impl IdCursor {
     pub fn new(batch_size: i32) -> Self {
         Self {
             row: 0,
-            batch_size: if batch_size > 0 { batch_size } else { DEFAULT_BATCH_SIZE },
+            batch_size: if batch_size > 0 {
+                batch_size
+            } else {
+                DEFAULT_BATCH_SIZE
+            },
             total_count: 0,
         }
     }
@@ -84,7 +88,11 @@ impl TimeCursor {
     pub fn new(start_time: NaiveDateTime, batch_size: i32) -> Self {
         Self {
             start_time,
-            batch_size: if batch_size > 0 { batch_size } else { DEFAULT_BATCH_SIZE },
+            batch_size: if batch_size > 0 {
+                batch_size
+            } else {
+                DEFAULT_BATCH_SIZE
+            },
             total_count: 0,
             step: Self::MIN_STEP,
         }
@@ -152,7 +160,11 @@ impl PagingCursor {
     pub fn new(batch_size: i32) -> Self {
         Self {
             row: 0,
-            batch_size: if batch_size > 0 { batch_size } else { DEFAULT_BATCH_SIZE },
+            batch_size: if batch_size > 0 {
+                batch_size
+            } else {
+                DEFAULT_BATCH_SIZE
+            },
         }
     }
 
@@ -182,7 +194,10 @@ mod tests {
 
     /// 构造时间。
     fn dt(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, mi, s).unwrap()
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, mi, s)
+            .unwrap()
     }
 
     #[test]

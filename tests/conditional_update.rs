@@ -139,11 +139,7 @@ fn other_app(conn: &str) -> Dal {
     Dal::open_with_model(conn, EntityModel::parse(MODEL).unwrap()).unwrap()
 }
 
-fn find_row(
-    dal: &Dal,
-    session: &mut dyn pek_rcode::SqlSession,
-    id: i64,
-) -> DbRow {
+fn find_row(dal: &Dal, session: &mut dyn pek_rcode::SqlSession, id: i64) -> DbRow {
     dal.table("Account")
         .unwrap()
         .find_by_pk(session, &[DbValue::Int(id)])
@@ -166,7 +162,10 @@ fn insert_and_read_back() {
 
     let row = find_row(&dal, session.as_mut(), id);
     assert_eq!(row.get_by_name("Name").and_then(DbValue::as_str), Some("A"));
-    assert_eq!(row.get_by_name("Balance").and_then(DbValue::as_i32), Some(100));
+    assert_eq!(
+        row.get_by_name("Balance").and_then(DbValue::as_i32),
+        Some(100)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -368,9 +367,10 @@ fn conflict_invalidates_entity_cache() {
     // 显式加载整表缓存
     let cache = dal.entity_cache("Account").unwrap();
     let rows = cache.entities(&dal, session.as_mut()).unwrap();
-    assert!(rows.iter().any(|row| {
-        row.get_by_name("Balance").and_then(DbValue::as_i32) == Some(100)
-    }));
+    assert!(
+        rows.iter()
+            .any(|row| { row.get_by_name("Balance").and_then(DbValue::as_i32) == Some(100) })
+    );
 
     // 另一个应用改库：本进程缓存不会自动失效
     let other = other_app(&conn);

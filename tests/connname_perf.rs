@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use pek_rcode::{shards, Dal, EntityModel, Query};
+use pek_rcode::{Dal, EntityModel, Query, shards};
 
 const MODEL: &str = r#"
 <EntityModel>
@@ -71,29 +71,53 @@ fn routing_overhead_baseline() {
     bench("① Dal::table（既有路径，未改动）", n, || {
         let _ = dal.table("LocalTable");
     });
-    bench("② table_conn_dal（无 ConnName → 快速返回）", n, || {
-        let _ = dal.table_conn_dal("LocalTable");
-    });
-    bench("③ table_conn_dal（有 ConnName → 命中注册表）", n, || {
-        let _ = dal.table_conn_dal("RemoteTable");
-    });
+    bench(
+        "② table_conn_dal（无 ConnName → 快速返回）",
+        n,
+        || {
+            let _ = dal.table_conn_dal("LocalTable");
+        },
+    );
+    bench(
+        "③ table_conn_dal（有 ConnName → 命中注册表）",
+        n,
+        || {
+            let _ = dal.table_conn_dal("RemoteTable");
+        },
+    );
     bench("④ open_session 借还（既有连接池）", n, || {
         let s = dal.open_session().expect("会话");
         drop(s);
     });
-    bench("⑤ with_table_session（无 ConnName 表，空闭包）", n, || {
-        dal.with_table_session("LocalTable", |_d, _t, _s| Ok(())).expect("with_table_session");
-    });
-    bench("⑥ with_table_session（ConnName 表，空闭包）", n, || {
-        dal.with_table_session("RemoteTable", |_d, _t, _s| Ok(())).expect("with_table_session");
-    });
+    bench(
+        "⑤ with_table_session（无 ConnName 表，空闭包）",
+        n,
+        || {
+            dal.with_table_session("LocalTable", |_d, _t, _s| Ok(()))
+                .expect("with_table_session");
+        },
+    );
+    bench(
+        "⑥ with_table_session（ConnName 表，空闭包）",
+        n,
+        || {
+            dal.with_table_session("RemoteTable", |_d, _t, _s| Ok(()))
+                .expect("with_table_session");
+        },
+    );
 
     // 一次真实查询（含 SQL），看端到端量级
     let mut session = dal.open_session().expect("会话");
     let t = dal.table("LocalTable").expect("取表");
-    bench("⑦ TableRef::query（LocalTable，空表）", 20_000, || {
-        let _ = t.query(session.as_mut(), &Query::new().column("Id")).expect("查询");
-    });
+    bench(
+        "⑦ TableRef::query（LocalTable，空表）",
+        20_000,
+        || {
+            let _ = t
+                .query(session.as_mut(), &Query::new().column("Id"))
+                .expect("查询");
+        },
+    );
 
     shards::clear_connections();
     let _ = std::fs::remove_dir_all(&dir);

@@ -153,5 +153,9 @@ fn bench_coarse_clock_concurrent() {
     for h in handles {
         assert!(h.join().unwrap() < u64::MAX);
     }
-    report(&format!("GetTickCount64（{THREADS} 线程）"), THREADS * N, start.elapsed());
+    report(
+        &format!("GetTickCount64（{THREADS} 线程）"),
+        THREADS * N,
+        start.elapsed(),
+    );
 }

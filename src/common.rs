@@ -51,7 +51,9 @@ impl KeyedLocker {
     /// <param name="key">锁键</param>
     /// <returns>锁守卫，作用域结束自动释放</returns>
     pub fn lock(&self, key: &str) -> MutexGuard<'_, ()> {
-        self.shared_lock(key).lock().unwrap_or_else(|e| e.into_inner())
+        self.shared_lock(key)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 }
 

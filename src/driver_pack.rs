@@ -393,7 +393,9 @@ impl DriverManager {
         let mut stop_keys: Vec<String> = Vec::new();
         for (key, host) in hosts.iter_mut() {
             let dead = !matches!(host.child.try_wait(), Ok(None));
-            let idle = timeout.map(|t| host.last_used.elapsed() >= t).unwrap_or(false);
+            let idle = timeout
+                .map(|t| host.last_used.elapsed() >= t)
+                .unwrap_or(false);
             if dead || idle {
                 stop_keys.push(key.clone());
             }
@@ -449,9 +451,7 @@ impl DriverManager {
     /// 解析可用驱动版本与本地目录：本地缓存优先 / 联网取目录并校验下载。
     fn resolve_driver(&self, component: &str, update: bool) -> Result<(String, PathBuf)> {
         let local = self.local_versions(component);
-        if !update
-            && let Some((version, dir)) = local.last()
-        {
+        if !update && let Some((version, dir)) = local.last() {
             return Ok((version.clone(), dir.clone()));
         }
         // 未配置组件源：仅本地缓存模式（消费方可预先从本机组件库等来源安装）
@@ -553,8 +553,11 @@ impl DriverManager {
             .http_status_as_error(false);
         if let Some(roots) = &self.ca_certs {
             // 自签/内网 CA：以配置的根证书集合替换 WebPki 默认根
-            builder = builder
-                .tls_config(ureq::tls::TlsConfig::builder().root_certs(roots.clone()).build());
+            builder = builder.tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .root_certs(roots.clone())
+                    .build(),
+            );
         }
         let agent = ureq::Agent::new_with_config(builder.build());
         let mut resp = agent
@@ -852,11 +855,10 @@ fn version_cmp(a: &str, b: &str) -> Ordering {
     for i in 0..sa.len().max(sb.len()) {
         let ka = key(sa.get(i).copied());
         let kb = key(sb.get(i).copied());
-        let ord = ka
-            .0
-            .cmp(&kb.0)
-            .then_with(|| ka.1.cmp(&kb.1))
-            .then_with(|| ka.2.cmp(&kb.2));
+        let ord =
+            ka.0.cmp(&kb.0)
+                .then_with(|| ka.1.cmp(&kb.1))
+                .then_with(|| ka.2.cmp(&kb.2));
         if ord != Ordering::Equal {
             return ord;
         }
@@ -995,7 +997,10 @@ fn live_host<'a>(
         hosts.remove(key);
         return None;
     }
-    let stale = hosts.get(key).map(|h| h.version != version).unwrap_or(false);
+    let stale = hosts
+        .get(key)
+        .map(|h| h.version != version)
+        .unwrap_or(false);
     if stale {
         if let Some(mut old) = hosts.remove(key) {
             kill_host(&mut old);
@@ -1024,9 +1029,7 @@ fn read_until_ready(
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {
-                if !sent
-                    && let Some(ready) = parse_ready_line(&line)
-                {
+                if !sent && let Some(ready) = parse_ready_line(&line) {
                     sent = true;
                     let _ = tx.send(Ok(ready));
                 }
@@ -1097,7 +1100,10 @@ pub fn normalize_store_url(url: &str) -> String {
 /// # 返回值
 /// 关闭为 `true`。
 pub fn store_disabled(url: &str) -> bool {
-    matches!(url.trim().to_ascii_lowercase().as_str(), "off" | "none" | "-")
+    matches!(
+        url.trim().to_ascii_lowercase().as_str(),
+        "off" | "none" | "-"
+    )
 }
 
 /// 解析最终生效的组件源地址：空 = 官方默认源；`off` = 关闭（仅本地缓存）。
@@ -1244,7 +1250,9 @@ mod tests {
         let handle = std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
             for _ in 0..accepts {
-                let Ok((tcp, _)) = listener.accept() else { break };
+                let Ok((tcp, _)) = listener.accept() else {
+                    break;
+                };
                 let Ok(conn) = rustls::ServerConnection::new(cfg.clone()) else {
                     continue;
                 };
@@ -1372,7 +1380,10 @@ mod tests {
         let ok = ConnectionString::parse("Server=x;Database=d;Provider=MySql");
         assert_eq!(resolve_provider_kind(&ok).unwrap(), DatabaseKind::MySql);
         let alias = ConnectionString::parse("Server=x;Provider=postgres");
-        assert_eq!(resolve_provider_kind(&alias).unwrap(), DatabaseKind::PostgreSql);
+        assert_eq!(
+            resolve_provider_kind(&alias).unwrap(),
+            DatabaseKind::PostgreSql
+        );
         let missing = ConnectionString::parse("Server=x");
         assert!(resolve_provider_kind(&missing).is_err());
         let net = ConnectionString::parse("Server=http://127.0.0.1:1;Password=t;provider=network");
@@ -1403,7 +1414,10 @@ mod tests {
         // 空缓存 + 未配置组件源：明确报错
         let err = mgr.resolve_driver("dbserver-mysql", true).unwrap_err();
         let msg = format!("{err:?}");
-        assert!(msg.contains("本地缓存为空") && msg.contains("组件源"), "{msg}");
+        assert!(
+            msg.contains("本地缓存为空") && msg.contains("组件源"),
+            "{msg}"
+        );
         // 预置版本目录（含 dbserver 占位）→ 直接解析成功，且不联网
         let dir = cache.join("dbserver-mysql").join("1.2.3");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1450,7 +1464,10 @@ mod tests {
         assert_eq!(got, dir);
         assert!(mgr.hosts().is_empty(), "准备阶段不应拉起宿主");
         // 内嵌驱动：明确报错
-        assert!(mgr.prepare_package("Data Source=x.db;Provider=SQLite").is_err());
+        assert!(
+            mgr.prepare_package("Data Source=x.db;Provider=SQLite")
+                .is_err()
+        );
     }
 
     #[test]
@@ -1564,23 +1581,28 @@ mod tests {
         .unwrap();
         assert!(mgr.ensure("").is_err());
         assert!(mgr.ensure("Server=x").is_err());
-        assert!(mgr
-            .ensure("Server=http://x;Password=t;provider=network")
-            .is_err());
+        assert!(
+            mgr.ensure("Server=http://x;Password=t;provider=network")
+                .is_err()
+        );
         assert!(mgr.ensure("Data Source=x.db;Provider=SQLite").is_err());
         // 公钥无效 → 构造即报错
-        assert!(DriverManager::new(DriverManagerConfig {
-            store_url: "http://127.0.0.1:1".into(),
-            pubkey: "not-hex".into(),
-            ..Default::default()
-        })
-        .is_err());
+        assert!(
+            DriverManager::new(DriverManagerConfig {
+                store_url: "http://127.0.0.1:1".into(),
+                pubkey: "not-hex".into(),
+                ..Default::default()
+            })
+            .is_err()
+        );
         // 无公钥时非回环 http 源被拒
-        assert!(DriverManager::new(DriverManagerConfig {
-            store_url: "http://10.0.0.5:5502".into(),
-            ..Default::default()
-        })
-        .is_err());
+        assert!(
+            DriverManager::new(DriverManagerConfig {
+                store_url: "http://10.0.0.5:5502".into(),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 
     // ————— 端到端：假组件源 + 真签名 + 假 dbserver（rustc 现场编译） —————
@@ -1594,7 +1616,8 @@ fn main() {
 
     /// 现场编译假 dbserver（打印就绪行后常驻）；rustc 不可用返回 None（跳过）。
     fn build_fake_dbserver() -> Option<PathBuf> {
-        let dir = std::env::temp_dir().join(format!("pek-rcode-fake-server-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pek-rcode-fake-server-{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok()?;
         let bin = dir.join(if cfg!(windows) {
             "fake_dbserver.exe"
@@ -1636,7 +1659,9 @@ fn main() {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let Ok(clone) = stream.try_clone() else { continue };
+                let Ok(clone) = stream.try_clone() else {
+                    continue;
+                };
                 let mut reader = BufReader::new(clone);
                 let mut request_line = String::new();
                 if reader.read_line(&mut request_line).is_err() {
@@ -1717,14 +1742,8 @@ fn main() {
         .to_string();
         let sig = dhrust::plugin::sign_base64(&key, catalog.as_bytes());
         let routes = HashMap::from([
-            (
-                "/components/catalog.json".to_string(),
-                catalog.into_bytes(),
-            ),
-            (
-                "/components/catalog.json.sig".to_string(),
-                sig.into_bytes(),
-            ),
+            ("/components/catalog.json".to_string(), catalog.into_bytes()),
+            ("/components/catalog.json.sig".to_string(), sig.into_bytes()),
             (zip_path, zip),
         ]);
         serve(listener, routes);

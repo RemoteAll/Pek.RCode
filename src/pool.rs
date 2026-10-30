@@ -431,9 +431,7 @@ impl SqlSession for PooledSession {
         params: &[DbValue],
         table: Option<&str>,
     ) -> Result<i64> {
-        let result = self
-            .inner_mut()
-            .insert_and_get_identity(sql, params, table);
+        let result = self.inner_mut().insert_and_get_identity(sql, params, table);
         self.note(&result);
         result
     }
@@ -523,11 +521,10 @@ mod tests {
     fn mock_pool(options: PoolOptions, fail: bool) -> (Arc<SessionPool>, Arc<AtomicUsize>) {
         let created = Arc::new(AtomicUsize::new(0));
         let counter = created.clone();
-        let factory: SessionFactory =
-            Arc::new(move || {
-                counter.fetch_add(1, Ordering::Relaxed);
-                Ok(Box::new(MockSession { fail }))
-            });
+        let factory: SessionFactory = Arc::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(MockSession { fail }))
+        });
         (Arc::new(SessionPool::new(options, factory)), created)
     }
 
@@ -635,10 +632,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-pool-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rcode-pool-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("pool.db");
         let conn = format!("Data Source={};Provider=SQLite", db.display());

@@ -276,7 +276,10 @@ impl DbRow {
     /// 列名 → 下标（小表线性比较，宽表走共享列名索引）。
     fn position_of(&self, name: &str) -> Option<usize> {
         if self.columns.len() <= SMALL_COLUMN_COUNT {
-            return self.columns.iter().position(|c| c.eq_ignore_ascii_case(name));
+            return self
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name));
         }
         lookup_column(self.name_index(), name)
     }

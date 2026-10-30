@@ -68,27 +68,29 @@ impl LazyConsumer {
         let running = Arc::clone(&self.running);
         let _ = std::thread::Builder::new()
             .name("rcode-lazy".into())
-            .spawn(move || loop {
-                let task = lock(&queue).pop_front();
-                match task {
-                    Some(task) => {
-                        // 忽略任务内部 panic（与 C# 版一致，不中断队列）
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
-                    }
-                    None => {
-                        running.store(false, Ordering::Release);
-                        // 双重检查：清空与退出之间可能有新任务入队
-                        if lock(&queue).is_empty()
-                            || running
-                                .compare_exchange(
-                                    false,
-                                    true,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_err()
-                        {
-                            break;
+            .spawn(move || {
+                loop {
+                    let task = lock(&queue).pop_front();
+                    match task {
+                        Some(task) => {
+                            // 忽略任务内部 panic（与 C# 版一致，不中断队列）
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+                        }
+                        None => {
+                            running.store(false, Ordering::Release);
+                            // 双重检查：清空与退出之间可能有新任务入队
+                            if lock(&queue).is_empty()
+                                || running
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                 }

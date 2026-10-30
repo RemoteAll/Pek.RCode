@@ -136,9 +136,8 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                     skip = true;
                     Ok(())
                 } else {
-                    Err(meta.error(
-                        "未知的 entity 字段属性（支持 column/primary_key/identity/skip）",
-                    ))
+                    Err(meta
+                        .error("未知的 entity 字段属性（支持 column/primary_key/identity/skip）"))
                 }
             })?;
         }

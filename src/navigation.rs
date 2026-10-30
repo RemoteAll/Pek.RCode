@@ -108,9 +108,8 @@ impl Navigation {
         if primary_key_value.is_null() {
             return Ok(Vec::new());
         }
-        let query = Query::new().filter(
-            Where::new().eq(self.foreign_key.clone(), primary_key_value.clone()),
-        );
+        let query = Query::new()
+            .filter(Where::new().eq(self.foreign_key.clone(), primary_key_value.clone()));
         E::query(dal, session, &query)
     }
 
@@ -199,7 +198,14 @@ impl NavigationRegistry {
         foreign_key: impl Into<String>,
         primary_key: impl Into<String>,
     ) -> &Navigation {
-        self.push(NavType::HasOne, "", source, target, foreign_key, primary_key)
+        self.push(
+            NavType::HasOne,
+            "",
+            source,
+            target,
+            foreign_key,
+            primary_key,
+        )
     }
 
     /// 登记一对多集合导航（对应 `HasMany`）。
@@ -217,7 +223,14 @@ impl NavigationRegistry {
         primary_key: impl Into<String>,
         foreign_key: impl Into<String>,
     ) -> &Navigation {
-        self.push(NavType::HasMany, "", source, target, foreign_key, primary_key)
+        self.push(
+            NavType::HasMany,
+            "",
+            source,
+            target,
+            foreign_key,
+            primary_key,
+        )
     }
 
     /// 登记并显式指定导航名（缺省 `{Target}`，与 C# 自动推导一致）。
@@ -240,11 +253,16 @@ impl NavigationRegistry {
         let source = source.into();
         let target = target.into();
         let name = name.into();
-        let name = if name.is_empty() { target.clone() } else { name };
+        let name = if name.is_empty() {
+            target.clone()
+        } else {
+            name
+        };
 
         // 同（源, 名）覆盖旧登记（与 C# 注册表的覆盖语义一致）
-        self.items
-            .retain(|n| !(n.source.eq_ignore_ascii_case(&source) && n.name.eq_ignore_ascii_case(&name)));
+        self.items.retain(|n| {
+            !(n.source.eq_ignore_ascii_case(&source) && n.name.eq_ignore_ascii_case(&name))
+        });
         self.items.push(Navigation {
             name,
             nav_type,
@@ -261,9 +279,9 @@ impl NavigationRegistry {
     /// <param name="name">导航名</param>
     /// <returns>导航元数据</returns>
     pub fn get(&self, source: &str, name: &str) -> Option<&Navigation> {
-        self.items.iter().find(|n| {
-            n.source.eq_ignore_ascii_case(source) && n.name.eq_ignore_ascii_case(name)
-        })
+        self.items
+            .iter()
+            .find(|n| n.source.eq_ignore_ascii_case(source) && n.name.eq_ignore_ascii_case(name))
     }
 
     /// 某源实体的全部导航。
@@ -331,9 +349,8 @@ pub fn load_one<E: Entity>(
     foreign_key_value: &DbValue,
 ) -> Result<Option<E>> {
     let nav = with_registry(|r| r.get(source, name).cloned());
-    let nav = nav.ok_or_else(|| {
-        crate::error::Error::Model(format!("导航关系未注册：{source}.{name}"))
-    })?;
+    let nav =
+        nav.ok_or_else(|| crate::error::Error::Model(format!("导航关系未注册：{source}.{name}")))?;
     nav.load_one(dal, session, foreign_key_value)
 }
 
@@ -352,9 +369,8 @@ pub fn load_many<E: Entity>(
     primary_key_value: &DbValue,
 ) -> Result<Vec<E>> {
     let nav = with_registry(|r| r.get(source, name).cloned());
-    let nav = nav.ok_or_else(|| {
-        crate::error::Error::Model(format!("导航关系未注册：{source}.{name}"))
-    })?;
+    let nav =
+        nav.ok_or_else(|| crate::error::Error::Model(format!("导航关系未注册：{source}.{name}")))?;
     nav.load_many(dal, session, primary_key_value)
 }
 
@@ -373,9 +389,8 @@ pub fn load_ones<E: Entity>(
     fk_values: &[DbValue],
 ) -> Result<HashMap<String, E>> {
     let nav = with_registry(|r| r.get(source, name).cloned());
-    let nav = nav.ok_or_else(|| {
-        crate::error::Error::Model(format!("导航关系未注册：{source}.{name}"))
-    })?;
+    let nav =
+        nav.ok_or_else(|| crate::error::Error::Model(format!("导航关系未注册：{source}.{name}")))?;
     nav.load_ones(dal, session, fk_values)
 }
 
@@ -394,9 +409,8 @@ pub fn load_manys<E: Entity>(
     pk_values: &[DbValue],
 ) -> Result<HashMap<String, Vec<E>>> {
     let nav = with_registry(|r| r.get(source, name).cloned());
-    let nav = nav.ok_or_else(|| {
-        crate::error::Error::Model(format!("导航关系未注册：{source}.{name}"))
-    })?;
+    let nav =
+        nav.ok_or_else(|| crate::error::Error::Model(format!("导航关系未注册：{source}.{name}")))?;
     nav.load_manys(dal, session, pk_values)
 }
 
@@ -473,7 +487,10 @@ mod tests {
                 ("Id", DbValue::Int(self.id as i64)),
                 (
                     "Name",
-                    self.name.clone().map(DbValue::Text).unwrap_or(DbValue::Null),
+                    self.name
+                        .clone()
+                        .map(DbValue::Text)
+                        .unwrap_or(DbValue::Null),
                 ),
             ]
         }
@@ -517,7 +534,9 @@ mod tests {
                 ("Id", DbValue::Int(self.id as i64)),
                 (
                     "UserId",
-                    self.user_id.map(|v| DbValue::Int(v as i64)).unwrap_or(DbValue::Null),
+                    self.user_id
+                        .map(|v| DbValue::Int(v as i64))
+                        .unwrap_or(DbValue::Null),
                 ),
                 ("Amount", DbValue::Null),
             ]
@@ -542,11 +561,8 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-nav-{}-{}-{tag}",
-            std::process::id(),
-            stamp
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rcode-nav-{}-{}-{tag}", std::process::id(), stamp));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("test.db");
         let conn = format!("Data Source={};Provider=SQLite", db.display());
@@ -617,7 +633,11 @@ mod tests {
         assert_eq!(user.name.as_deref(), Some("Alice"));
 
         // 外键为 NULL：不查询直接 None
-        assert!(one.load_one::<User>(&dal, session.as_mut(), &DbValue::Null).unwrap().is_none());
+        assert!(
+            one.load_one::<User>(&dal, session.as_mut(), &DbValue::Null)
+                .unwrap()
+                .is_none()
+        );
 
         // HasMany：用户 1 有 2 张订单
         let many = nav.get("User", "Order").unwrap();
@@ -628,7 +648,11 @@ mod tests {
         assert!(orders.iter().all(|o| o.user_id == Some(1)));
 
         // 主键为 NULL：空集合
-        assert!(many.load_many::<Order>(&dal, session.as_mut(), &DbValue::Null).unwrap().is_empty());
+        assert!(
+            many.load_many::<Order>(&dal, session.as_mut(), &DbValue::Null)
+                .unwrap()
+                .is_empty()
+        );
 
         // 全局注册表路径
         with_registry_mut(|r| {
@@ -692,7 +716,12 @@ mod tests {
             .load_manys(
                 &dal,
                 session.as_mut(),
-                &[DbValue::Int(1), DbValue::Int(2), DbValue::Int(9), DbValue::Null],
+                &[
+                    DbValue::Int(1),
+                    DbValue::Int(2),
+                    DbValue::Int(9),
+                    DbValue::Null,
+                ],
             )
             .unwrap();
         assert_eq!(orders["1"].len(), 2);
@@ -701,7 +730,9 @@ mod tests {
 
         // 空/NULL 列表：不查询直接空表
         assert!(
-            one.load_ones::<User>(&dal, session.as_mut(), &[]).unwrap().is_empty()
+            one.load_ones::<User>(&dal, session.as_mut(), &[])
+                .unwrap()
+                .is_empty()
         );
         assert!(
             many.load_manys::<Order>(&dal, session.as_mut(), &[DbValue::Null])
@@ -721,8 +752,7 @@ mod tests {
             load_manys(&dal, session.as_mut(), "User", "Order", &[DbValue::Int(1)]).unwrap();
         assert_eq!(orders["1"].len(), 2);
         assert!(
-            load_ones::<User>(&dal, session.as_mut(), "Order", "Nope", &[DbValue::Int(1)])
-                .is_err()
+            load_ones::<User>(&dal, session.as_mut(), "Order", "Nope", &[DbValue::Int(1)]).is_err()
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -181,7 +181,8 @@ fn temp_db(name: &str) -> (PathBuf, PathBuf) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("rcode-batch-{}-{stamp}-{name}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("rcode-batch-{}-{stamp}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     (dir.clone(), dir.join("batch.db"))
 }
@@ -388,7 +389,12 @@ fn snowflake_batch_generates_ids() {
         .with_snow(pek_rcode::snowflake::shared());
 
     let now = chrono::Local::now().naive_local();
-    let month_start = now.date().with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+    let month_start = now
+        .date()
+        .with_day(1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
 
     let mut list = vec![
         EventLog {
@@ -772,13 +778,9 @@ fn upsert_and_update_batch_sharded() {
         TradeLog::update_batch_sharded(&dal, session.as_mut(), &policy, &rows).unwrap(),
         2
     );
-    let final_rows = TradeLog::query_sharded(
-        &dal,
-        session.as_mut(),
-        &policy,
-        &Query::new().filter(range),
-    )
-    .unwrap();
+    let final_rows =
+        TradeLog::query_sharded(&dal, session.as_mut(), &policy, &Query::new().filter(range))
+            .unwrap();
     assert!(final_rows.iter().all(|r| r.note.ends_with("-v3")));
     assert_eq!(
         TradeLog::update_batch_sharded(&dal, session.as_mut(), &policy, &[]).unwrap(),
@@ -817,7 +819,10 @@ fn update_batch_updates_by_primary_key() {
     let again = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
     assert_eq!(again.len(), 3);
     assert!(again.iter().all(|r| r.note.ends_with("-upd")));
-    assert_eq!(TradeLog::update_batch(&dal, session.as_mut(), &[]).unwrap(), 0);
+    assert_eq!(
+        TradeLog::update_batch(&dal, session.as_mut(), &[]).unwrap(),
+        0
+    );
 
     dal.clear_pool();
     drop(session);
@@ -847,7 +852,13 @@ fn delete_where_batched_loops_until_empty() {
     // batch=10：10 → 10 → 5 共三批删完（批间等待置 0 加速）
     assert_eq!(
         table
-            .delete_where_batched(session.as_mut(), &filter, Some(10), None, Some(Duration::ZERO))
+            .delete_where_batched(
+                session.as_mut(),
+                &filter,
+                Some(10),
+                None,
+                Some(Duration::ZERO)
+            )
             .unwrap(),
         25
     );

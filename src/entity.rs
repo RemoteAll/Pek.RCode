@@ -219,7 +219,11 @@ pub trait Entity: Sized {
         let fields: Vec<(&'static str, DbValue)> = self
             .to_fields()
             .into_iter()
-            .filter(|pair| !identity.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(pair.0)))
+            .filter(|pair| {
+                !identity
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(pair.0))
+            })
             .collect();
 
         let id = table.insert_static(session, &fields)?;
@@ -310,7 +314,13 @@ pub trait Entity: Sized {
             return Ok(0);
         }
         let refs: Vec<&Self> = list.iter().collect();
-        Self::write_batch_refs(dal, session, &refs, BatchWriteMode::InsertIgnore, batch_size)
+        Self::write_batch_refs(
+            dal,
+            session,
+            &refs,
+            BatchWriteMode::InsertIgnore,
+            batch_size,
+        )
     }
 
     /// 批量替换插入（对应 C# `EntityExtension.BatchReplace`）：按主键/唯一键替换整行。
@@ -356,11 +366,7 @@ pub trait Entity: Sized {
     }
 
     /// 批量按主键更新（对应 C# `EntityExtension.BatchUpdate`）：逐条 `Update`（无批更新能力的方言行为一致）。
-    fn update_batch(
-        dal: &Dal,
-        session: &mut dyn SqlSession,
-        list: &[Self],
-    ) -> Result<u64> {
+    fn update_batch(dal: &Dal, session: &mut dyn SqlSession, list: &[Self]) -> Result<u64> {
         if list.is_empty() {
             return Ok(0);
         }
@@ -456,7 +462,10 @@ pub trait Entity: Sized {
     fn update_with(&self, table: &TableRef<'_>, session: &mut dyn SqlSession) -> Result<u64> {
         let pks = Self::primary_keys();
         if pks.is_empty() {
-            return Err(Error::Model(format!("实体 {} 没有主键，无法按主键更新", Self::table())));
+            return Err(Error::Model(format!(
+                "实体 {} 没有主键，无法按主键更新",
+                Self::table()
+            )));
         }
 
         let identity = Self::identity_column();
@@ -516,7 +525,8 @@ pub trait Entity: Sized {
         filter: &Where,
     ) -> Result<u64> {
         Self::ensure_writable()?;
-        dal.table(Self::table())?.update_where(session, sets, filter)
+        dal.table(Self::table())?
+            .update_where(session, sets, filter)
     }
 
     /// **原子累加并回读**（对应 DH.NCode 的 `AdditionalFields`：`Count = Count + n`）。
@@ -1036,10 +1046,7 @@ pub trait Entity: Sized {
     fn query(dal: &Dal, session: &mut dyn SqlSession, query: &Query) -> Result<Vec<Self>> {
         let table = dal.table(Self::table())?;
         let rows = table.query(session, query)?;
-        rows.rows
-            .into_iter()
-            .map(Self::from_row_owned)
-            .collect()
+        rows.rows.into_iter().map(Self::from_row_owned).collect()
     }
 
     /// 全表（或按默认顺序）查询。
@@ -1322,7 +1329,8 @@ pub trait Entity: Sized {
                 group_dal.ensure_shard_table(Self::table(), &group.physical)?;
             }
             let table = group_dal.table_as(Self::table(), &group.physical)?;
-            affected += table.write_batch_prepared(group_session, &group.payload, mode, batch_size)?;
+            affected +=
+                table.write_batch_prepared(group_session, &group.payload, mode, batch_size)?;
         }
         // 批量写入成功后清空各实体的脏数据（与单表批量写入一致）
         for entity in list.iter() {
@@ -1410,7 +1418,9 @@ pub trait Entity: Sized {
         for entity in list {
             let fields = entity.to_fields();
             // 主键值缺失/为空 → 跳过（对齐 C# `if (val == null) continue`）
-            let Some((_, pk_value)) = fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(pk))
+            let Some((_, pk_value)) = fields
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(pk))
             else {
                 continue;
             };
@@ -1512,9 +1522,8 @@ pub trait Entity: Sized {
                     crate::interceptor::DataMethod::Insert,
                     &fields,
                 );
-                if let Some((_, value)) = prepared
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                if let Some((_, value)) =
+                    prepared.iter().find(|(n, _)| n.eq_ignore_ascii_case(name))
                     && Some(value) != own.as_ref()
                 {
                     let _ = self.set_field(&policy.field, value.clone());
@@ -1536,18 +1545,14 @@ pub trait Entity: Sized {
                 let pk = pk_values_of(&fields, Self::primary_keys())?;
                 let value = shard_value_of(self, policy)?;
                 match resolve_shard_target::<Self>(dal, policy, &value)? {
-                    Some(target) => run_on_shard_target(
-                        &target,
-                        dal,
-                        Self::table(),
-                        session,
-                        |t, s| {
+                    Some(target) => {
+                        run_on_shard_target(&target, dal, Self::table(), session, |t, s| {
                             if !s.table_exists(t.physical_name())? {
                                 return Ok(true);
                             }
                             Ok(t.find_by_pk(s, &pk)?.is_none())
-                        },
-                    )?,
+                        })?
+                    }
                     None => Self::find(dal, session, &pk)?.is_none(),
                 }
             }
@@ -1685,18 +1690,14 @@ pub trait Entity: Sized {
                 } else {
                     let value = shard_value_of(entity, policy)?;
                     match resolve_shard_target::<Self>(dal, policy, &value)? {
-                        Some(target) => run_on_shard_target(
-                            &target,
-                            dal,
-                            Self::table(),
-                            session,
-                            |t, s| {
+                        Some(target) => {
+                            run_on_shard_target(&target, dal, Self::table(), session, |t, s| {
                                 if !s.table_exists(t.physical_name())? {
                                     return Ok(true);
                                 }
                                 Ok(t.find_by_pk(s, &pk)?.is_none())
-                            },
-                        )?,
+                            })?
+                        }
                         None => Self::find(dal, session, &pk)?.is_none(),
                     }
                 }
@@ -2021,8 +2022,12 @@ fn add_values(current: &DbValue, delta: &DbValue) -> Option<DbValue> {
         (DbValue::Int(a), DbValue::Float(b)) => Some(DbValue::Float(*a as f64 + b)),
         (DbValue::Float(a), DbValue::Int(b)) => Some(DbValue::Float(a + *b as f64)),
         (DbValue::Decimal(a), DbValue::Decimal(b)) => Some(DbValue::Decimal(*a + *b)),
-        (DbValue::Decimal(a), DbValue::Int(b)) => Some(DbValue::Decimal(*a + rust_decimal::Decimal::from(*b))),
-        (DbValue::Int(a), DbValue::Decimal(b)) => Some(DbValue::Decimal(rust_decimal::Decimal::from(*a) + *b)),
+        (DbValue::Decimal(a), DbValue::Int(b)) => {
+            Some(DbValue::Decimal(*a + rust_decimal::Decimal::from(*b)))
+        }
+        (DbValue::Int(a), DbValue::Decimal(b)) => {
+            Some(DbValue::Decimal(rust_decimal::Decimal::from(*a) + *b))
+        }
         _ => None,
     }
 }

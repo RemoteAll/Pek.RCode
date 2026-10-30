@@ -95,7 +95,10 @@ impl StatField {
     /// <param name="column">列名</param>
     /// <param name="mode">统计方式</param>
     pub fn new(column: impl Into<String>, mode: StatModes) -> Self {
-        Self { column: column.into(), mode }
+        Self {
+            column: column.into(),
+            mode,
+        }
     }
 }
 
@@ -139,10 +142,20 @@ impl StatModel {
         let dt = self.time;
         match self.level {
             StatLevels::All => "全局".into(),
-            StatLevels::Year => format!("{dt:?}").split('-').next().unwrap_or_default().to_string(),
+            StatLevels::Year => format!("{dt:?}")
+                .split('-')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
             StatLevels::Month => format!("{}-{:02}", dt.year(), dt.month()),
             StatLevels::Day => format!("{}-{:02}-{:02}", dt.year(), dt.month(), dt.day()),
-            StatLevels::Hour => format!("{}-{:02}-{:02} {:02}", dt.year(), dt.month(), dt.day(), dt.hour()),
+            StatLevels::Hour => format!(
+                "{}-{:02}-{:02} {:02}",
+                dt.year(),
+                dt.month(),
+                dt.day(),
+                dt.hour()
+            ),
             StatLevels::Minute => format!(
                 "{}-{:02}-{:02} {:02}:{:02}",
                 dt.year(),
@@ -187,7 +200,10 @@ mod tests {
 
     /// 构造时间（秒为 0）。
     fn dt(y: i32, m: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, mi, 0).unwrap()
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
     }
 
     #[test]
@@ -218,13 +234,22 @@ mod tests {
     fn display_and_split() {
         let m = StatModel::new(StatLevels::Day, dt(2026, 9, 15, 10, 30));
         assert_eq!(m.format_display(), "2026-09-15");
-        assert_eq!(StatModel::new(StatLevels::All, m.time).format_display(), "全局");
-        assert_eq!(StatModel::new(StatLevels::Month, m.time).format_display(), "2026-09");
+        assert_eq!(
+            StatModel::new(StatLevels::All, m.time).format_display(),
+            "全局"
+        );
+        assert_eq!(
+            StatModel::new(StatLevels::Month, m.time).format_display(),
+            "2026-09"
+        );
         assert_eq!(
             StatModel::new(StatLevels::Minute, m.time).format_display(),
             "2026-09-15 10:30"
         );
-        assert_eq!(StatModel::new(StatLevels::Quarter, m.time).format_display(), "Quarter");
+        assert_eq!(
+            StatModel::new(StatLevels::Quarter, m.time).format_display(),
+            "Quarter"
+        );
 
         let list = m.split(&[StatLevels::All, StatLevels::Day]);
         assert_eq!(list.len(), 2);

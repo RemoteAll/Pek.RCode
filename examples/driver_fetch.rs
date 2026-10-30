@@ -31,13 +31,13 @@ fn main() {
         .cloned()
         .unwrap_or_else(|| "Server=127.0.0.1;Database=demo;Provider=MySql".to_string());
     // 可选：https 自签/内网 CA 的根证书 PEM 路径（第 4 参或环境变量 PEK_DRIVER_CA）
-    let ca_path = args
-        .get(3)
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .or_else(|| std::env::var("PEK_DRIVER_CA").ok().filter(|s| !s.is_empty()));
-    let ca_pem = ca_path
-        .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("读根证书失败（{p}）：{e}")));
+    let ca_path = args.get(3).filter(|s| !s.is_empty()).cloned().or_else(|| {
+        std::env::var("PEK_DRIVER_CA")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    let ca_pem =
+        ca_path.map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("读根证书失败（{p}）：{e}")));
 
     let mgr = match DriverManager::new(DriverManagerConfig {
         store_url: store,

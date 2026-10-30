@@ -111,13 +111,22 @@ impl Entity for RCodeTestItem {
 
     fn from_row(row: &DbRow) -> Result<Self> {
         Ok(Self {
-            id: row.get_by_name("Id").and_then(DbValue::as_i32).unwrap_or_default(),
-            code: row.get_by_name("Code").map(DbValue::to_text).unwrap_or_default(),
+            id: row
+                .get_by_name("Id")
+                .and_then(DbValue::as_i32)
+                .unwrap_or_default(),
+            code: row
+                .get_by_name("Code")
+                .map(DbValue::to_text)
+                .unwrap_or_default(),
             amount: row
                 .get_by_name("Amount")
                 .and_then(DbValue::as_decimal)
                 .unwrap_or_default(),
-            ok: row.get_by_name("Ok").and_then(DbValue::as_bool).unwrap_or_default(),
+            ok: row
+                .get_by_name("Ok")
+                .and_then(DbValue::as_bool)
+                .unwrap_or_default(),
             s_id: row.get_by_name("SId").and_then(DbValue::as_i64),
             create_time: row
                 .get_by_name("CreateTime")
@@ -169,7 +178,10 @@ impl Entity for RCodeTestKey {
 
     fn from_row(row: &DbRow) -> Result<Self> {
         Ok(Self {
-            key: row.get_by_name("Key").map(DbValue::to_text).unwrap_or_default(),
+            key: row
+                .get_by_name("Key")
+                .map(DbValue::to_text)
+                .unwrap_or_default(),
             value: row
                 .get_by_name("Value")
                 .filter(|v| !v.is_null())
@@ -247,7 +259,10 @@ fn run_roundtrip(dal: &Dal) {
     assert!(loaded.ok);
     assert_eq!(loaded.s_id, Some(9_000_000_001));
     assert_eq!(loaded.data, Some(vec![0x01, 0x02, 0xff]));
-    let delta = (loaded.create_time - base).num_microseconds().unwrap().abs();
+    let delta = (loaded.create_time - base)
+        .num_microseconds()
+        .unwrap()
+        .abs();
     assert!(delta < 1_000, "时间应精确到毫秒以内，实际偏差 {delta}us");
 
     // 4) save：新增分支（Id=0）与更新分支
@@ -268,7 +283,10 @@ fn run_roundtrip(dal: &Dal) {
     assert_eq!(reloaded.s_id, None, "NULL 字段应往返为 None");
 
     // 5) count / 条件查询 / 分页 / 全量
-    assert_eq!(RCodeTestItem::count(dal, session.as_mut(), None).unwrap(), 2);
+    assert_eq!(
+        RCodeTestItem::count(dal, session.as_mut(), None).unwrap(),
+        2
+    );
     let filtered = RCodeTestItem::query(
         dal,
         session.as_mut(),
@@ -296,9 +314,11 @@ fn run_roundtrip(dal: &Dal) {
 
     // 7) delete
     assert_eq!(reloaded.delete(dal, session.as_mut()).unwrap(), 1);
-    assert!(RCodeTestItem::find(dal, session.as_mut(), &[i64::from(item2.id).into()])
-        .unwrap()
-        .is_none());
+    assert!(
+        RCodeTestItem::find(dal, session.as_mut(), &[i64::from(item2.id).into()])
+            .unwrap()
+            .is_none()
+    );
 
     // 8) 事务回滚：插入后回滚，行数不应变化
     let before = RCodeTestItem::count(dal, session.as_mut(), None).unwrap();
@@ -382,7 +402,10 @@ fn run_network_roundtrip(dal: &Dal) {
     assert_eq!(loaded.amount, "12.3400".parse().unwrap());
     assert!(loaded.ok);
     assert_eq!(loaded.s_id, Some(9_000_000_001));
-    let delta = (loaded.create_time - base).num_microseconds().unwrap().abs();
+    let delta = (loaded.create_time - base)
+        .num_microseconds()
+        .unwrap()
+        .abs();
     assert!(delta < 1_000, "时间应精确到毫秒以内，实际偏差 {delta}us");
 
     // 3) save：新增与更新分支
@@ -411,7 +434,10 @@ fn run_network_roundtrip(dal: &Dal) {
     );
 
     // 4) count / 条件查询 / 分页（分页按远端类型套用）
-    assert_eq!(RCodeTestItem::count(dal, session.as_mut(), None).unwrap(), 2);
+    assert_eq!(
+        RCodeTestItem::count(dal, session.as_mut(), None).unwrap(),
+        2
+    );
     let filtered = RCodeTestItem::query(
         dal,
         session.as_mut(),
@@ -441,7 +467,10 @@ fn run_network_roundtrip(dal: &Dal) {
 
     // 7) 事务：Rust 宿主（`examples/dbserver`）提供 `Db/Begin/Commit/Rollback` → 真事务；
     //    C# `DbServer` 没有这三个路由 → `begin()` 返回 Unsupported（跳过，不算失败）
-    assert_eq!(RCodeTestItem::count(dal, session.as_mut(), None).unwrap(), 1);
+    assert_eq!(
+        RCodeTestItem::count(dal, session.as_mut(), None).unwrap(),
+        1
+    );
     match session.begin() {
         Err(e) => {
             eprintln!("跳过事务断言：远端不支持事务（{e}）——C# DbServer 无 Db/Begin 路由");

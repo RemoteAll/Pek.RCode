@@ -27,15 +27,13 @@ fn quote_ident(name: &str) -> String {
 }
 
 /// 读取单值计数（`COUNT(*)`）。
-fn count_of(
-    session: &mut dyn pek_rcode::session::SqlSession,
-    table: &str,
-) -> Option<i64> {
+fn count_of(session: &mut dyn pek_rcode::session::SqlSession, table: &str) -> Option<i64> {
     let sql = format!("SELECT COUNT(*) FROM {}", quote_ident(table));
-    session
-        .query(&sql, &[])
-        .ok()
-        .and_then(|set| set.first().and_then(|row| row.get(0)).and_then(|v| v.as_i64()))
+    session.query(&sql, &[]).ok().and_then(|set| {
+        set.first()
+            .and_then(|row| row.get(0))
+            .and_then(|v| v.as_i64())
+    })
 }
 
 #[test]
@@ -113,8 +111,8 @@ fn live_sqlite_incremental_sync_and_smoke() {
     // 5) 数据保护：同步前后行数一致
     let mut session = dal.open_session().unwrap();
     for (table, before) in &snapshot {
-        let after = count_of(session.as_mut(), table)
-            .unwrap_or_else(|| panic!("同步后应仍可读：{table}"));
+        let after =
+            count_of(session.as_mut(), table).unwrap_or_else(|| panic!("同步后应仍可读：{table}"));
         assert_eq!(after, *before, "同步不应改变数据行数：{table}");
     }
     eprintln!("数据保护通过：{} 张表行数同步前后一致", snapshot.len());

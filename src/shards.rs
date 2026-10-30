@@ -551,10 +551,9 @@ impl TimeShardPolicy {
         match value {
             DbValue::DateTime(time) => Ok((*time, true)),
             DbValue::Int(id) => {
-                let snow = self
-                    .snow
-                    .as_ref()
-                    .ok_or_else(|| Error::Model("分表策略要求指定雪花解析器（Snowflake）！".into()))?;
+                let snow = self.snow.as_ref().ok_or_else(|| {
+                    Error::Model("分表策略要求指定雪花解析器（Snowflake）！".into())
+                })?;
                 let (time, _, _) = snow.parse(*id);
                 Ok((time, false))
             }
@@ -822,7 +821,9 @@ pub fn clear_connections() {
 /// 未注册的分片连接名会解析为 `{目录}/{连接名}.db` 的 SQLite 库；默认目录为 `{程序目录}/Data`
 /// （程序目录解析规则同 dhrust `io::base_dir`，可用环境变量 `PEK_RCODE_BASE` 覆盖）。
 pub fn set_auto_db_dir(dir: impl Into<PathBuf>) {
-    *auto_db_dir_slot().write().unwrap_or_else(|e| e.into_inner()) = Some(dir.into());
+    *auto_db_dir_slot()
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(dir.into());
 }
 
 /// 当前生效的自动 SQLite 目录（默认 `{程序目录}/Data`）。
@@ -855,10 +856,9 @@ fn validate_conn_name(name: &str) -> Result<()> {
 /// `Data Source={自动目录}/{连接名}.db`；模型沿用基础连接（分库表结构与主库一致）。
 fn open_auto_sqlite(name: &str, base_dal: &Dal) -> Result<Arc<Dal>> {
     validate_conn_name(name)?;
-    let model = base_dal
-        .model()
-        .cloned()
-        .ok_or_else(|| Error::Model("基础连接未加载数据模型，无法按连接名自动创建 SQLite 库".into()))?;
+    let model = base_dal.model().cloned().ok_or_else(|| {
+        Error::Model("基础连接未加载数据模型，无法按连接名自动创建 SQLite 库".into())
+    })?;
     let dir = auto_db_dir();
     let _ = std::fs::create_dir_all(&dir);
     let conn = format!(
@@ -1043,9 +1043,7 @@ impl<'a> TableRef<'a> {
         let same_table = physical.eq_ignore_ascii_case(meta.effective_table_name());
         let same_conn = match shard.conn_name.as_deref() {
             None => true,
-            Some(conn) => base
-                .conn_name
-                .is_some_and(|c| c.eq_ignore_ascii_case(conn)),
+            Some(conn) => base.conn_name.is_some_and(|c| c.eq_ignore_ascii_case(conn)),
         };
         if same_table && same_conn {
             return self.insert_prepared_owned_single(session, fields);
@@ -1055,9 +1053,7 @@ impl<'a> TableRef<'a> {
         match resolve_shard_dal(&shard, base, self.dal())? {
             None => {
                 let target = self.dal().table_as(&meta.name, &physical)?;
-                self.dal()
-                    .ensure_shard_table(&meta.name, &physical)
-                    .ok();
+                self.dal().ensure_shard_table(&meta.name, &physical).ok();
                 target.insert_prepared_owned_single(session, fields)
             }
             Some(reg) => {
@@ -1178,9 +1174,7 @@ impl<'a> TableRef<'a> {
         {
             return Ok(model);
         }
-        Err(Error::Model(
-            "分表策略因条件不足无法执行分表操作！".into(),
-        ))
+        Err(Error::Model("分表策略因条件不足无法执行分表操作！".into()))
     }
 
     /// 在指定分片上执行（必要时自动建表 / 跨库开会话）。
@@ -1557,7 +1551,10 @@ mod tests {
         let t = at(2026, 9, 27, 10, 30);
         assert_eq!(format_policy("{0}_{1:yyyyMM}", "Log2", t), "Log2_202609");
         assert_eq!(format_policy("{0}_{1:yyyy}", "Log2", t), "Log2_2026");
-        assert_eq!(format_policy("{0}_{1:yyyyMMdd}", "Log2", t), "Log2_20260927");
+        assert_eq!(
+            format_policy("{0}_{1:yyyyMMdd}", "Log2", t),
+            "Log2_20260927"
+        );
         assert_eq!(format_policy("{0}_{1:dd}", "Log2", t), "Log2_27");
         assert_eq!(format_policy("t_{1:yyyy}_{0}", "Log2", t), "t_2026_Log2");
         assert_eq!(format_policy("{1:yyyy}_{1:MM}", "Log2", t), "2026_09");
@@ -1568,13 +1565,19 @@ mod tests {
         let policy = TimeShardPolicy::new("CreateTime")
             .with_conn_policy("{0}_{1:yyyy}")
             .with_table_policy("{0}_{1:yyyyMM}");
-        let model = policy.resolve_time(base(), at(2026, 9, 27, 10, 30)).unwrap();
+        let model = policy
+            .resolve_time(base(), at(2026, 9, 27, 10, 30))
+            .unwrap();
         assert_eq!(model.conn_name.as_deref(), Some("test_2026"));
         assert_eq!(model.table_name.as_deref(), Some("Log2_202609"));
 
         // 未配置模板 → 不分表
         let empty = TimeShardPolicy::new("CreateTime");
-        assert!(empty.resolve_time(base(), at(2026, 9, 27, 10, 30)).is_none());
+        assert!(
+            empty
+                .resolve_time(base(), at(2026, 9, 27, 10, 30))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1591,7 +1594,12 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["Log2_20240730", "Log2_20240731", "Log2_20240801", "Log2_20240802"]
+            [
+                "Log2_20240730",
+                "Log2_20240731",
+                "Log2_20240801",
+                "Log2_20240802"
+            ]
         );
 
         // 左闭右开：end=08-02 时仅扫到 08-01

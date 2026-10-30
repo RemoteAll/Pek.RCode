@@ -68,7 +68,13 @@ impl ReadWriteStrategy {
     /// <param name="in_transaction">是否处于事务中</param>
     /// <param name="day_time">当前时刻（当天时间）</param>
     /// <returns>是否可切换到只读库</returns>
-    pub fn validate(&self, action: &str, sql: &str, in_transaction: bool, day_time: NaiveTime) -> bool {
+    pub fn validate(
+        &self,
+        action: &str,
+        sql: &str,
+        in_transaction: bool,
+        day_time: NaiveTime,
+    ) -> bool {
         // 事务中不支持分离
         if in_transaction {
             return false;
@@ -166,7 +172,11 @@ pub fn row_number(order_by: &str, alias: Option<&str>) -> Result<String> {
 /// <param name="order_by">排序表达式</param>
 /// <param name="alias">别名（None 时使用 `RowNum`）</param>
 /// <returns>SQL 片段</returns>
-pub fn row_number_partition(partition_by: &str, order_by: &str, alias: Option<&str>) -> Result<String> {
+pub fn row_number_partition(
+    partition_by: &str,
+    order_by: &str,
+    alias: Option<&str>,
+) -> Result<String> {
     if partition_by.is_empty() {
         return row_number(order_by, alias);
     }
@@ -187,7 +197,10 @@ pub fn rank(order_by: &str, alias: Option<&str>) -> Result<String> {
     if order_by.is_empty() {
         return Err(Error::Argument("排序字段不能为空".into()));
     }
-    Ok(format!("RANK() OVER(ORDER BY {order_by}) AS {}", alias.unwrap_or("Rank")))
+    Ok(format!(
+        "RANK() OVER(ORDER BY {order_by}) AS {}",
+        alias.unwrap_or("Rank")
+    ))
 }
 
 /// 生成 `DENSE_RANK() OVER(ORDER BY {order_by}) AS {alias}`（对齐 `WindowFunction.DenseRank`）。
@@ -213,7 +226,12 @@ pub fn dense_rank(order_by: &str, alias: Option<&str>) -> Result<String> {
 /// <param name="partition_by">分区表达式</param>
 /// <param name="alias">别名</param>
 /// <returns>SQL 片段</returns>
-pub fn aggregate(func: &str, column: &str, partition_by: Option<&str>, alias: Option<&str>) -> Result<String> {
+pub fn aggregate(
+    func: &str,
+    column: &str,
+    partition_by: Option<&str>,
+    alias: Option<&str>,
+) -> Result<String> {
     if func.is_empty() {
         return Err(Error::Argument("聚合函数名不能为空".into()));
     }
@@ -222,7 +240,9 @@ pub fn aggregate(func: &str, column: &str, partition_by: Option<&str>, alias: Op
     }
     let alias = alias.unwrap_or_default();
     match partition_by {
-        Some(p) if !p.is_empty() => Ok(format!("{func}({column}) OVER(PARTITION BY {p}) AS {alias}")),
+        Some(p) if !p.is_empty() => Ok(format!(
+            "{func}({column}) OVER(PARTITION BY {p}) AS {alias}"
+        )),
         _ => Ok(format!("{func}({column}) OVER() AS {alias}")),
     }
 }
@@ -236,7 +256,9 @@ pub fn aggregate(func: &str, column: &str, partition_by: Option<&str>, alias: Op
 pub fn extract_table_names(sql: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut expect = false;
-    for raw in sql.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ';') {
+    for raw in
+        sql.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ';')
+    {
         if raw.is_empty() {
             continue;
         }
@@ -248,7 +270,10 @@ pub fn extract_table_names(sql: &str) -> Vec<String> {
             }
             continue;
         }
-        if matches!(raw.to_ascii_lowercase().as_str(), "from" | "join" | "update" | "into") {
+        if matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "from" | "join" | "update" | "into"
+        ) {
             expect = true;
         }
     }
@@ -292,9 +317,19 @@ mod tests {
         assert!(!s.validate("Select", "SELECT 1", false, time(0, 30)));
         assert!(s.validate("Select", "SELECT 1", false, time(0, 50)));
         // 忽略表名拒绝（大小写不敏感）
-        assert!(!s.validate("Select", "SELECT * FROM SysLog WHERE ID>0", false, time(10, 0)));
+        assert!(!s.validate(
+            "Select",
+            "SELECT * FROM SysLog WHERE ID>0",
+            false,
+            time(10, 0)
+        ));
         // 子查询中的 SELECT 不误判为表名
-        assert!(s.validate("Select", "SELECT * FROM (SELECT * FROM DH_Order) t", false, time(10, 0)));
+        assert!(s.validate(
+            "Select",
+            "SELECT * FROM (SELECT * FROM DH_Order) t",
+            false,
+            time(10, 0)
+        ));
     }
 
     #[test]
@@ -316,7 +351,10 @@ mod tests {
         assert_eq!(SaveModes::Replace as i32, 3);
         assert_eq!(ModelSortModes::default(), ModelSortModes::BaseFirst);
         assert_ne!(ModelSortModes::BaseFirst, ModelSortModes::DerivedFirst);
-        assert_eq!(ModelCheckModes::default(), ModelCheckModes::CheckAllTablesWhenInit);
+        assert_eq!(
+            ModelCheckModes::default(),
+            ModelCheckModes::CheckAllTablesWhenInit
+        );
         assert_ne!(
             ModelCheckModes::CheckAllTablesWhenInit,
             ModelCheckModes::CheckTableWhenFirstUse
@@ -344,7 +382,10 @@ mod tests {
         );
         assert!(row_number("", None).is_err());
 
-        assert_eq!(rank("Score DESC", None).unwrap(), "RANK() OVER(ORDER BY Score DESC) AS Rank");
+        assert_eq!(
+            rank("Score DESC", None).unwrap(),
+            "RANK() OVER(ORDER BY Score DESC) AS Rank"
+        );
         assert_eq!(
             dense_rank("Score DESC", None).unwrap(),
             "DENSE_RANK() OVER(ORDER BY Score DESC) AS DenseRank"
@@ -358,7 +399,10 @@ mod tests {
             "SUM(Amount) OVER(PARTITION BY DeptID) AS Total"
         );
         // 别名缺省（对齐 C# 默认参数 null）
-        assert_eq!(aggregate("COUNT", "*", None, None).unwrap(), "COUNT(*) OVER() AS ");
+        assert_eq!(
+            aggregate("COUNT", "*", None, None).unwrap(),
+            "COUNT(*) OVER() AS "
+        );
         assert!(aggregate("", "Amount", None, None).is_err());
     }
 
@@ -372,6 +416,9 @@ mod tests {
             extract_table_names("UPDATE \"Order\" SET Status=1 WHERE ID=2"),
             vec!["Order"]
         );
-        assert_eq!(extract_table_names("INSERT INTO DH_Log(Content) VALUES('x')"), vec!["DH_Log"]);
+        assert_eq!(
+            extract_table_names("INSERT INTO DH_Log(Content) VALUES('x')"),
+            vec!["DH_Log"]
+        );
     }
 }

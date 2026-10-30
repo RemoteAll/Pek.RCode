@@ -249,8 +249,10 @@ mod tests {
             hana_to_dbvalue(&HdbValue::STRING("12.50".into())),
             DbValue::Text("12.50".into())
         );
-        assert!(hana_to_dbvalue(&HdbValue::STRING("2026-09-27 10:30:00".into()))
-            .as_datetime()
-            .is_some());
+        assert!(
+            hana_to_dbvalue(&HdbValue::STRING("2026-09-27 10:30:00".into()))
+                .as_datetime()
+                .is_some()
+        );
     }
 }

@@ -106,10 +106,7 @@ impl BatchFinder {
     }
 
     /// 按表与键集合创建。
-    pub fn with_keys(
-        table: &TableMeta,
-        keys: impl IntoIterator<Item = DbValue>,
-    ) -> Result<Self> {
+    pub fn with_keys(table: &TableMeta, keys: impl IntoIterator<Item = DbValue>) -> Result<Self> {
         let mut finder = Self::new(table)?;
         finder.add(keys);
         Ok(finder)
@@ -219,10 +216,8 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-batch-{}-{stamp}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rcode-batch-{}-{stamp}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("batch.db");
         let model = EntityModel::parse(MODEL).expect("测试模型应可解析");

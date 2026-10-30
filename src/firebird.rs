@@ -118,9 +118,7 @@ fn parse_settings(cs: &ConnectionString) -> Result<FirebirdSettings> {
         .or(cs.get("initial catalog"))
         .or(cs.get("db"))
         .or(data_source)
-        .ok_or_else(|| {
-            Error::Model("Firebird 连接串缺少 Database（数据库文件路径或别名）".into())
-        })?
+        .ok_or_else(|| Error::Model("Firebird 连接串缺少 Database（数据库文件路径或别名）".into()))?
         .to_string();
 
     let mode = match server {
@@ -169,7 +167,11 @@ fn parse_settings(cs: &ConnectionString) -> Result<FirebirdSettings> {
 
 /// 自动查找 `fbclient.dll`：环境变量 → PATH → `Program Files\Firebird\**`。
 fn locate_fbclient() -> Result<String> {
-    let file_name = if cfg!(windows) { "fbclient.dll" } else { "libfbclient.so" };
+    let file_name = if cfg!(windows) {
+        "fbclient.dll"
+    } else {
+        "libfbclient.so"
+    };
 
     // 1) 环境变量指定目录
     if let Ok(dir) = std::env::var("FBCLIENT_LIB_DIR") {

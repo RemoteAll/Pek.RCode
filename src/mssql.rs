@@ -26,9 +26,7 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
-use tiberius::{
-    AuthMethod, Client, ColumnData, Config as MssqlConfig, EncryptionLevel, ToSql,
-};
+use tiberius::{AuthMethod, Client, ColumnData, Config as MssqlConfig, EncryptionLevel, ToSql};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
@@ -60,10 +58,7 @@ impl MssqlSession {
             }
             config.application_name("Pek.RCode");
             config.encryption(settings.encryption);
-            config.authentication(AuthMethod::sql_server(
-                &settings.user,
-                &settings.password,
-            ));
+            config.authentication(AuthMethod::sql_server(&settings.user, &settings.password));
             if settings.trust_server_certificate {
                 config.trust_cert();
             }
@@ -169,10 +164,11 @@ fn parse_settings(cs: &ConnectionString) -> Result<MssqlSettings> {
     };
 
     let connect_timeout = match cs.get("timeout").or(cs.get("connect timeout")) {
-        Some(v) => Some(Duration::from_secs(
-            v.parse::<u64>()
-                .map_err(|e| Error::Model(format!("无效的 Timeout \"{v}\"：{e}")))?,
-        )),
+        Some(v) => {
+            Some(Duration::from_secs(v.parse::<u64>().map_err(|e| {
+                Error::Model(format!("无效的 Timeout \"{v}\"：{e}"))
+            })?))
+        }
         None => Some(Duration::from_secs(15)),
     };
 
@@ -218,11 +214,7 @@ impl ToSql for MssqlParam<'_> {
 }
 
 /// SQL Server 单元格 → `DbValue`。
-fn mssql_to_dbvalue(
-    row: &tiberius::Row,
-    index: usize,
-    data: &ColumnData<'_>,
-) -> Result<DbValue> {
+fn mssql_to_dbvalue(row: &tiberius::Row, index: usize, data: &ColumnData<'_>) -> Result<DbValue> {
     Ok(match data {
         // 时间类：通过 FromSql 读取为 chrono 类型（覆盖 datetime/smalldatetime/datetime2）
         ColumnData::DateTime(Some(_))
@@ -450,7 +442,9 @@ mod tests {
         assert_eq!(s.encryption, EncryptionLevel::Required);
 
         // 无效值报错
-        assert!(parse_settings(&ConnectionString::parse("Encrypt=maybe;provider=sqlserver")).is_err());
+        assert!(
+            parse_settings(&ConnectionString::parse("Encrypt=maybe;provider=sqlserver")).is_err()
+        );
     }
 
     #[test]

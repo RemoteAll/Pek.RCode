@@ -34,7 +34,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 use crate::model::EntityModel;
 use crate::store::SharedStore;
@@ -214,11 +214,7 @@ impl DbAdmin {
     pub fn query_readonly(&self, sql: &str) -> Result<Json, String> {
         validate_readonly_sql(sql)?;
         let started = std::time::Instant::now();
-        let mut session = self
-            .store
-            .dal()
-            .open_session()
-            .map_err(|e| e.to_string())?;
+        let mut session = self.store.dal().open_session().map_err(|e| e.to_string())?;
         let set = session.query(sql, &[]).map_err(|e| e.to_string())?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let truncated = set.rows.len() > MAX_QUERY_ROWS;
@@ -329,9 +325,9 @@ impl DbAdmin {
             let dal = self.store.dal();
             let mut session = dal.open_session().map_err(|e| e.to_string())?;
             for entity in &present {
-                let physical = self.physical_name(entity).ok_or_else(|| {
-                    format!("未知实体：{entity}（不在模型内）")
-                })?;
+                let physical = self
+                    .physical_name(entity)
+                    .ok_or_else(|| format!("未知实体：{entity}（不在模型内）"))?;
                 // 标识符按目标方言引用：SQLite `"x"`、MySQL `` `x` ``、SqlServer `[x]`。
                 // 硬编码双引号在 MySQL 下会被当作字符串字面量，导致语法错误。
                 let quoted = dal.kind().quote(&physical);
@@ -354,11 +350,7 @@ impl DbAdmin {
             }
             let mut rows = serde_json::Map::new();
             for entity in &present {
-                let mut session = self
-                    .store
-                    .dal()
-                    .open_session()
-                    .map_err(|e| e.to_string())?;
+                let mut session = self.store.dal().open_session().map_err(|e| e.to_string())?;
                 let n = self
                     .store
                     .dal()
@@ -443,10 +435,9 @@ pub fn validate_readonly_sql(sql: &str) -> Result<(), String> {
         return Err("仅支持单条查询：SQL 中不允许出现分号（字符串内的分号也会被拒绝）".into());
     }
     let is_select = match s.get(..6) {
-        Some(head) if head.eq_ignore_ascii_case("SELECT") => s
-            .as_bytes()
-            .get(6)
-            .is_none_or(|b| b.is_ascii_whitespace()),
+        Some(head) if head.eq_ignore_ascii_case("SELECT") => {
+            s.as_bytes().get(6).is_none_or(|b| b.is_ascii_whitespace())
+        }
         _ => false,
     };
     if !is_select {
@@ -577,7 +568,9 @@ mod tests {
         assert_eq!(info["tables"][0]["name"], "Demo_Item");
         assert_eq!(info["tables"][0]["rows"], 2);
         // 只读查询
-        let q = admin.query_readonly("SELECT * FROM \"Demo_Item\" ORDER BY \"Id\"").unwrap();
+        let q = admin
+            .query_readonly("SELECT * FROM \"Demo_Item\" ORDER BY \"Id\"")
+            .unwrap();
         assert_eq!(q["rowCount"], 2);
         assert_eq!(q["columns"][1], "Name");
         assert!(admin.query_readonly("DELETE FROM \"Demo_Item\"").is_err());
@@ -594,7 +587,9 @@ mod tests {
         assert_eq!(result["rows"]["Demo_Item"], 2);
         // 坏包被拒：不破坏现有数据
         assert!(admin.restore_zip(b"not a zip").is_err());
-        let after = admin.query_readonly("SELECT COUNT(*) AS C FROM \"Demo_Item\"").unwrap();
+        let after = admin
+            .query_readonly("SELECT COUNT(*) AS C FROM \"Demo_Item\"")
+            .unwrap();
         assert_eq!(after["rows"][0][0], 2);
         // 档案：创建 → 列表 → 读取 → 还原 → 删除
         let created = admin.create_backup().unwrap();

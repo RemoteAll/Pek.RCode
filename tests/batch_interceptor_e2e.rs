@@ -125,7 +125,10 @@ fn interceptor_fills_fields_before_batch_routing() {
     assert_eq!(filled.len(), 1);
     let today = chrono::Local::now().naive_local();
     assert_eq!(
-        (filled[0].create_time.year(), filled[0].create_time.ordinal()),
+        (
+            filled[0].create_time.year(),
+            filled[0].create_time.ordinal()
+        ),
         (today.year(), today.ordinal()),
         "批量插入也应由拦截器补全 CreateTime"
     );

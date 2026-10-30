@@ -5,11 +5,11 @@
 
 use std::path::PathBuf;
 
+use pek_rcode::Dal;
 use pek_rcode::dal::ConnectionString;
 use pek_rcode::model::EntityModel;
 use pek_rcode::query::{Query, Where};
 use pek_rcode::value::DbValue;
-use pek_rcode::Dal;
 
 const MODEL: &str = r#"<EntityModel><Tables>
 <Table Name="V_Order" TableName="v_order" Description="订单视图" IsView="True">
@@ -27,10 +27,7 @@ const MODEL: &str = r#"<EntityModel><Tables>
 </Tables></EntityModel>"#;
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "pek-rcode-view-{tag}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("pek-rcode-view-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -53,14 +50,14 @@ fn setup(tag: &str) -> (PathBuf, Dal) {
         !report.added_columns.iter().any(|(t, _)| t == "v_order"),
         "视图不应补列：{report}"
     );
-    assert!(report.created_tables.iter().any(|t| t == "DH_Order"), "{report}");
+    assert!(
+        report.created_tables.iter().any(|t| t == "DH_Order"),
+        "{report}"
+    );
 
     let mut s = dal.open_session().unwrap();
-    s.execute(
-        "create view v_order as select Id, Code from DH_Order",
-        &[],
-    )
-    .unwrap();
+    s.execute("create view v_order as select Id, Code from DH_Order", &[])
+        .unwrap();
     s.execute(
         "insert into DH_Order (Code) values (?), (?)",
         &[DbValue::Text("A".into()), DbValue::Text("B".into())],
@@ -99,7 +96,12 @@ fn view_table_rejects_all_writes() {
     // 批量写入
     let rows = vec![vec![("Code", DbValue::Text("Y".into()))]];
     let err = table
-        .write_batch(&mut *s, &rows, pek_rcode::sqlbuild::BatchWriteMode::Insert, None)
+        .write_batch(
+            &mut *s,
+            &rows,
+            pek_rcode::sqlbuild::BatchWriteMode::Insert,
+            None,
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("视图无法添删改"), "{err}");
@@ -112,7 +114,10 @@ fn view_table_rejects_all_writes() {
     assert!(err.contains("视图无法添删改"), "{err}");
 
     // 按主键删除 / 条件删除 / 分批删除
-    let err = table.delete_by_pk(&mut *s, &[1.into()]).unwrap_err().to_string();
+    let err = table
+        .delete_by_pk(&mut *s, &[1.into()])
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("视图无法添删改"), "{err}");
     let err = table
         .delete_where(&mut *s, &Where::new().eq("Code", "A"))
@@ -126,7 +131,10 @@ fn view_table_rejects_all_writes() {
     assert!(err.contains("视图无法添删改"), "{err}");
 
     // 视图不建分表
-    assert!(!dal.ensure_shard_table("V_Order", "v_order_20260101").unwrap());
+    assert!(
+        !dal.ensure_shard_table("V_Order", "v_order_20260101")
+            .unwrap()
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -145,7 +153,13 @@ fn name_starting_with_hash_is_view() {
     // 往返保留 IsView
     let out = model.to_xml();
     assert!(out.contains("IsView=\"true\""), "{out}");
-    assert!(EntityModel::parse(&out).unwrap().table("#V_Stat").unwrap().is_view);
+    assert!(
+        EntityModel::parse(&out)
+            .unwrap()
+            .table("#V_Stat")
+            .unwrap()
+            .is_view
+    );
 }
 
 #[test]

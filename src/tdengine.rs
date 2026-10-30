@@ -68,8 +68,12 @@ impl TDengineSession {
             self.settings.timeout,
         )?;
 
-        let json: Json = serde_json::from_str(&body)
-            .map_err(|e| Error::Db(format!("TDengine 响应不是合法 JSON：{e}；内容：{}", trim(&body))))?;
+        let json: Json = serde_json::from_str(&body).map_err(|e| {
+            Error::Db(format!(
+                "TDengine 响应不是合法 JSON：{e}；内容：{}",
+                trim(&body)
+            ))
+        })?;
         let code = json.get("code").and_then(Json::as_i64).unwrap_or(-1);
         if code != 0 {
             let desc = json
@@ -147,12 +151,7 @@ fn json_to_rowset(json: &Json) -> Result<RowSet> {
         .and_then(Json::as_array)
         .map(|meta| {
             meta.iter()
-                .map(|item| {
-                    item.get(0)
-                        .and_then(Json::as_str)
-                        .unwrap_or("")
-                        .to_string()
-                })
+                .map(|item| item.get(0).and_then(Json::as_str).unwrap_or("").to_string())
                 .collect()
         })
         .unwrap_or_default();
@@ -161,12 +160,7 @@ fn json_to_rowset(json: &Json) -> Result<RowSet> {
         .and_then(Json::as_array)
         .map(|meta| {
             meta.iter()
-                .map(|item| {
-                    item.get(1)
-                        .and_then(Json::as_str)
-                        .unwrap_or("")
-                        .to_string()
-                })
+                .map(|item| item.get(1).and_then(Json::as_str).unwrap_or("").to_string())
                 .collect()
         })
         .unwrap_or_default();
@@ -209,7 +203,10 @@ fn json_cell_to_dbvalue(cell: &Json, ty: &str) -> DbValue {
         "DECIMAL" => cell
             .as_str()
             .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
-            .or_else(|| cell.as_f64().and_then(rust_decimal::Decimal::from_f64_retain))
+            .or_else(|| {
+                cell.as_f64()
+                    .and_then(rust_decimal::Decimal::from_f64_retain)
+            })
             .map(DbValue::Decimal)
             .unwrap_or(DbValue::Null),
         _ => match cell {

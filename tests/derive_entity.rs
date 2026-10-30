@@ -46,7 +46,10 @@ fn setup(name: &str) -> Result<(std::path::PathBuf, Dal)> {
         .format("%H%M%S%.6f")
         .to_string()
         .replace('.', "");
-    let dir = std::env::temp_dir().join(format!("rcode-derive-{}-{stamp}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "rcode-derive-{}-{stamp}-{name}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("derive.db");
     let dal = Dal::open_with_model(

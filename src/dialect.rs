@@ -102,7 +102,10 @@ impl DatabaseKind {
     pub fn is_file_based(&self) -> bool {
         matches!(
             self,
-            DatabaseKind::Sqlite | DatabaseKind::DuckDb | DatabaseKind::Firebird | DatabaseKind::Access
+            DatabaseKind::Sqlite
+                | DatabaseKind::DuckDb
+                | DatabaseKind::Firebird
+                | DatabaseKind::Access
         )
     }
 
@@ -476,7 +479,7 @@ impl DatabaseKind {
                         "longtext".into()
                     }
                 }
-                DataType::DateTime => "datetime".into(),
+                DataType::DateTime => datetime_spec("datetime", col.scale),
                 DataType::Binary => "longblob".into(),
             },
             DatabaseKind::SqlServer => match t {
@@ -495,7 +498,7 @@ impl DatabaseKind {
                         format!("nvarchar({})", col.length)
                     }
                 }
-                DataType::DateTime => "datetime".into(),
+                DataType::DateTime => datetime_spec_mssql(col.scale),
                 DataType::Binary => "varbinary(max)".into(),
             },
             DatabaseKind::PostgreSql => match t {
@@ -513,7 +516,7 @@ impl DatabaseKind {
                         "text".into()
                     }
                 }
-                DataType::DateTime => "timestamp".into(),
+                DataType::DateTime => datetime_spec("timestamp", col.scale),
                 DataType::Binary => "bytea".into(),
             },
             DatabaseKind::Oracle => match t {
@@ -592,7 +595,9 @@ impl DatabaseKind {
                 DataType::Int64 => "BIGINT".into(),
                 DataType::Single => "FLOAT".into(),
                 DataType::Double => "DOUBLE".into(),
-                DataType::Decimal => format!("DECIMAL({},{})", col.precision.max(1), col.scale.max(0)),
+                DataType::Decimal => {
+                    format!("DECIMAL({},{})", col.precision.max(1), col.scale.max(0))
+                }
                 DataType::String => {
                     if col.length > 0 && col.length <= 16374 {
                         format!("VARCHAR({})", col.length)
@@ -605,7 +610,9 @@ impl DatabaseKind {
             },
             DatabaseKind::InfluxDb => match t {
                 DataType::Boolean => "BOOLEAN".into(),
-                DataType::Byte | DataType::Int16 | DataType::Int32 | DataType::Int64 => "INTEGER".into(),
+                DataType::Byte | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                    "INTEGER".into()
+                }
                 DataType::Single | DataType::Double | DataType::Decimal => "FLOAT".into(),
                 DataType::String => "STRING".into(),
                 DataType::DateTime => "TIMESTAMP".into(),
@@ -877,10 +884,7 @@ impl DatabaseKind {
         // TDengine 3.x 要求首列必须是 TIMESTAMP：把第一个时间列提到最前
         let ordered_columns: Vec<&ColumnMeta> = if *self == DatabaseKind::TDengine {
             let mut cols: Vec<&ColumnMeta> = table.columns.iter().collect();
-            if let Some(pos) = cols
-                .iter()
-                .position(|c| c.data_type == DataType::DateTime)
-            {
+            if let Some(pos) = cols.iter().position(|c| c.data_type == DataType::DateTime) {
                 let first = cols.remove(pos);
                 cols.insert(0, first);
             }
@@ -915,10 +919,7 @@ impl DatabaseKind {
             // 默认值：Oracle 系（Oracle/DB2）要求 DEFAULT 出现在 NOT NULL 之前
             let mut default_part = column_default_sql(self, col).map(|d| format!(" DEFAULT {d}"));
             // DuckDB 自增：序列 + DEFAULT nextval（插入时由列默认值生成）
-            if *self == DatabaseKind::DuckDb
-                && col.identity
-                && default_part.is_none()
-            {
+            if *self == DatabaseKind::DuckDb && col.identity && default_part.is_none() {
                 // 序列名以“带双引号的字符串”传入（与 CREATE SEQUENCE 的大小写一致）
                 default_part = Some(format!(
                     " DEFAULT nextval('{}')",
@@ -948,7 +949,10 @@ impl DatabaseKind {
 
             // MySQL 特有：把字段说明写成列注释（与 DH.NCode 的 COMMENT 行为一致）
             if self == &DatabaseKind::MySql && !col.description.is_empty() {
-                line.push_str(&format!(" COMMENT '{}'", escape_mysql_text(&col.description)));
+                line.push_str(&format!(
+                    " COMMENT '{}'",
+                    escape_mysql_text(&col.description)
+                ));
             }
 
             lines.push(line);
@@ -1055,7 +1059,10 @@ impl DatabaseKind {
             }
         }
         if self == &DatabaseKind::MySql && !col.description.is_empty() {
-            sql.push_str(&format!(" COMMENT '{}'", escape_mysql_text(&col.description)));
+            sql.push_str(&format!(
+                " COMMENT '{}'",
+                escape_mysql_text(&col.description)
+            ));
         }
         sql
     }
@@ -1188,7 +1195,10 @@ pub enum PageStyle {
 ///
 /// 无排序时 `OVER(Order By (SELECT NULL))` 兜底（语法合法，不保证顺序，与调用方的主键兜底策略配合）。
 fn sqlserver_row_number_paging(sql: &str, order_sql: &str, offset: usize, size: usize) -> String {
-    let order_expr = order_sql.strip_prefix("ORDER BY ").unwrap_or(order_sql).trim();
+    let order_expr = order_sql
+        .strip_prefix("ORDER BY ")
+        .unwrap_or(order_sql)
+        .trim();
     let order_expr = if order_expr.is_empty() {
         "(SELECT NULL)"
     } else {
@@ -1284,6 +1294,27 @@ fn mysql_decimal_spec(col: &ColumnMeta) -> (i32, i32) {
     (precision, scale)
 }
 
+/// 日期时间类型 + 小数秒位数：`Scale` 1..=6 时生成 `datetime(3)` / `timestamp(3)`，否则保持无精度原类型。
+///
+/// 为什么需要：`ColumnMeta.scale` 一直有解析（C# 模型可写 `Scale="3"`，`sync-model.ps1` 也原样透传），
+/// 但这里原来一律输出无精度的 `datetime` —— 毫秒在 MySQL 会被截断成秒（2026-10-30 审计时间要毫秒）。
+/// **只对显式声明 `Scale>0` 的列生效**，现有模型（scale 默认 0）行为完全不变。
+fn datetime_spec(base: &str, scale: i32) -> String {
+    match scale {
+        1..=6 => format!("{base}({scale})"),
+        _ => base.to_string(),
+    }
+}
+
+/// SQL Server：`Scale=0` 保持 `datetime`（历史类型），有小数位才换 `datetime2(s)`
+/// （`datetime` 固定约 3.33ms 精度、且不支持 `datetime(n)` 写法）。
+fn datetime_spec_mssql(scale: i32) -> String {
+    match scale {
+        1..=6 => format!("datetime2({scale})"),
+        _ => "datetime".to_string(),
+    }
+}
+
 /// MySQL 字符串字面量转义（COMMENT 等场景：先转义反斜杠，再双写单引号）。
 fn escape_mysql_text(v: &str) -> String {
     v.replace('\\', "\\\\").replace('\'', "''")
@@ -1377,15 +1408,50 @@ mod tests {
         EntityModel::parse(xml).unwrap().tables.remove(0)
     }
 
+    /// `DateTime` 列的 `Scale` → 带小数秒的列类型（MySQL/PG 同名，SQL Server 换 `datetime2`）。
+    ///
+    /// 背景：模型一直能写 `Scale="3"`，但映射层原来忽略它 → 毫秒被 MySQL 截断成秒。
+    /// 撤掉 `datetime_spec` 后本用例的 `datetime(3)` 断言会失败。
+    #[test]
+    fn datetime_scale_maps_to_fractional_type() {
+        assert_eq!(datetime_spec("datetime", 0), "datetime", "未声明 Scale 时保持原类型");
+        assert_eq!(datetime_spec("datetime", 3), "datetime(3)");
+        assert_eq!(datetime_spec("timestamp", 6), "timestamp(6)");
+        assert_eq!(datetime_spec("datetime", 9), "datetime", "超范围(>6)不生成非法 DDL");
+        assert_eq!(datetime_spec_mssql(0), "datetime", "SQL Server 默认仍是 datetime");
+        assert_eq!(datetime_spec_mssql(3), "datetime2(3)");
+    }
+
     #[test]
     fn provider_parsing() {
-        assert_eq!(DatabaseKind::from_provider("SQLite").unwrap(), DatabaseKind::Sqlite);
-        assert_eq!(DatabaseKind::from_provider("mysql").unwrap(), DatabaseKind::MySql);
-        assert_eq!(DatabaseKind::from_provider("SqlServer").unwrap(), DatabaseKind::SqlServer);
-        assert_eq!(DatabaseKind::from_provider("postgresql").unwrap(), DatabaseKind::PostgreSql);
-        assert_eq!(DatabaseKind::from_provider("dameng").unwrap(), DatabaseKind::DaMeng);
-        assert_eq!(DatabaseKind::from_provider("nova").unwrap(), DatabaseKind::MySql);
-        assert_eq!(DatabaseKind::from_provider("kingbase").unwrap(), DatabaseKind::PostgreSql);
+        assert_eq!(
+            DatabaseKind::from_provider("SQLite").unwrap(),
+            DatabaseKind::Sqlite
+        );
+        assert_eq!(
+            DatabaseKind::from_provider("mysql").unwrap(),
+            DatabaseKind::MySql
+        );
+        assert_eq!(
+            DatabaseKind::from_provider("SqlServer").unwrap(),
+            DatabaseKind::SqlServer
+        );
+        assert_eq!(
+            DatabaseKind::from_provider("postgresql").unwrap(),
+            DatabaseKind::PostgreSql
+        );
+        assert_eq!(
+            DatabaseKind::from_provider("dameng").unwrap(),
+            DatabaseKind::DaMeng
+        );
+        assert_eq!(
+            DatabaseKind::from_provider("nova").unwrap(),
+            DatabaseKind::MySql
+        );
+        assert_eq!(
+            DatabaseKind::from_provider("kingbase").unwrap(),
+            DatabaseKind::PostgreSql
+        );
         assert!(DatabaseKind::from_provider("network").is_err());
     }
 
@@ -1440,24 +1506,40 @@ mod tests {
 
         // 删除列（Full 档）：与 DH.NCode 各驱动 DropColumnSQL 对齐
         assert_eq!(
-            DatabaseKind::Sqlite.drop_column_sql("DH_Order", "Extra").unwrap(),
+            DatabaseKind::Sqlite
+                .drop_column_sql("DH_Order", "Extra")
+                .unwrap(),
             "Alter Table \"DH_Order\" Drop Column \"Extra\""
         );
         assert_eq!(
-            DatabaseKind::MySql.drop_column_sql("DH_Order", "Extra").unwrap(),
+            DatabaseKind::MySql
+                .drop_column_sql("DH_Order", "Extra")
+                .unwrap(),
             "Alter Table `DH_Order` Drop Column `Extra`"
         );
         // 文档库与 Access 不支持列级删除
-        assert!(DatabaseKind::MongoDb.drop_column_sql("DH_Order", "Extra").is_none());
-        assert!(DatabaseKind::Access.drop_column_sql("DH_Order", "Extra").is_none());
+        assert!(
+            DatabaseKind::MongoDb
+                .drop_column_sql("DH_Order", "Extra")
+                .is_none()
+        );
+        assert!(
+            DatabaseKind::Access
+                .drop_column_sql("DH_Order", "Extra")
+                .is_none()
+        );
 
         // 删除索引（Full 档）：SQL Server 用 `Drop Index 表.索引`；MySQL 带 On；其余独立语句
         assert_eq!(
-            DatabaseKind::SqlServer.drop_index_sql("ix_a", Some("DH_Order")).unwrap(),
+            DatabaseKind::SqlServer
+                .drop_index_sql("ix_a", Some("DH_Order"))
+                .unwrap(),
             "Drop Index [DH_Order].[ix_a]"
         );
         assert_eq!(
-            DatabaseKind::MySql.drop_index_sql("ix_a", Some("DH_Order")).unwrap(),
+            DatabaseKind::MySql
+                .drop_index_sql("ix_a", Some("DH_Order"))
+                .unwrap(),
             "Drop Index `ix_a` On `DH_Order`"
         );
         assert_eq!(
@@ -1465,10 +1547,16 @@ mod tests {
             "Drop Index \"ix_a\""
         );
         assert_eq!(
-            DatabaseKind::PostgreSql.drop_index_sql("ix_a", Some("DH_Order")).unwrap(),
+            DatabaseKind::PostgreSql
+                .drop_index_sql("ix_a", Some("DH_Order"))
+                .unwrap(),
             "Drop Index \"ix_a\""
         );
-        assert!(DatabaseKind::ClickHouse.drop_index_sql("ix_a", None).is_none());
+        assert!(
+            DatabaseKind::ClickHouse
+                .drop_index_sql("ix_a", None)
+                .is_none()
+        );
 
         // 删除表（供人工/工具使用；自动迁移从不调用）
         assert_eq!(
@@ -1482,11 +1570,15 @@ mod tests {
             "Alter Table `DH_Order` Modify Column `Code` varchar(50)"
         );
         assert_eq!(
-            DatabaseKind::SqlServer.alter_column_sql(&table, code).unwrap(),
+            DatabaseKind::SqlServer
+                .alter_column_sql(&table, code)
+                .unwrap(),
             "Alter Table [DH_Order] Alter Column [Code] nvarchar(50) NOT NULL"
         );
         assert_eq!(
-            DatabaseKind::PostgreSql.alter_column_sql(&table, code).unwrap(),
+            DatabaseKind::PostgreSql
+                .alter_column_sql(&table, code)
+                .unwrap(),
             "ALTER TABLE \"DH_Order\" ALTER COLUMN \"Code\" TYPE varchar(50)"
         );
         assert_eq!(
@@ -1498,9 +1590,17 @@ mod tests {
             "Alter Table \"DH_Order\" Modify \"Code\" VARCHAR2(50)"
         );
         // SQLite 不支持直接改列类型（需重建表）——由人工处理
-        assert!(DatabaseKind::Sqlite.alter_column_sql(&table, code).is_none());
+        assert!(
+            DatabaseKind::Sqlite
+                .alter_column_sql(&table, code)
+                .is_none()
+        );
         // Firebird 亦不支持（C# 端 AlterColumnSQL 已注释）
-        assert!(DatabaseKind::Firebird.alter_column_sql(&table, code).is_none());
+        assert!(
+            DatabaseKind::Firebird
+                .alter_column_sql(&table, code)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1515,7 +1615,10 @@ mod tests {
         let table = EntityModel::parse(xml).unwrap().tables.remove(0);
 
         let sql = DatabaseKind::MySql.create_table_sql(&table).remove(0);
-        assert!(sql.contains("`Amount` decimal(12,4)"), "Length 应覆盖 Precision：{sql}");
+        assert!(
+            sql.contains("`Amount` decimal(12,4)"),
+            "Length 应覆盖 Precision：{sql}"
+        );
         assert!(sql.contains("COMMENT '金额合计'"), "{sql}");
         assert!(sql.contains("`Ok` TINYINT"), "{sql}");
 
@@ -1530,9 +1633,18 @@ mod tests {
         let stmts = DatabaseKind::Sqlite.create_table_sql(&table);
         let sql = &stmts[0];
 
-        assert!(sql.contains("\"Id\" integer PRIMARY KEY AUTOINCREMENT"), "{sql}");
-        assert!(sql.contains("\"Code\" nvarchar(50) NOT NULL COLLATE NOCASE"), "{sql}");
-        assert!(sql.contains("\"Title\" text NOT NULL COLLATE NOCASE"), "{sql}");
+        assert!(
+            sql.contains("\"Id\" integer PRIMARY KEY AUTOINCREMENT"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("\"Code\" nvarchar(50) NOT NULL COLLATE NOCASE"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("\"Title\" text NOT NULL COLLATE NOCASE"),
+            "{sql}"
+        );
         assert!(sql.contains("\"Amount\" decimal NOT NULL"), "{sql}");
         assert!(sql.contains("\"Ok\" bit NOT NULL"), "{sql}");
         assert!(sql.contains("\"CreateTime\" datetime NOT NULL"), "{sql}");
@@ -1586,18 +1698,13 @@ mod tests {
         });
         let stmts = DatabaseKind::MySql.create_table_sql(&table);
         let joined = stmts.join("\n");
-        assert!(
-            joined.contains("(`Code`)"),
-            "变长列不应带前缀：{joined}"
-        );
+        assert!(joined.contains("(`Code`)"), "变长列不应带前缀：{joined}");
         assert!(
             joined.contains("(`Title`(191))"),
             "longtext 列必须带前缀长度：{joined}"
         );
         // 其它方言不加前缀
-        let sqlite = DatabaseKind::Sqlite
-            .create_table_sql(&table)
-            .join("\n");
+        let sqlite = DatabaseKind::Sqlite.create_table_sql(&table).join("\n");
         assert!(sqlite.contains("(\"Title\")"), "{sqlite}");
     }
 
@@ -1688,9 +1795,11 @@ mod tests {
             "SELECT * FROM \"T\" ORDER BY [Id] OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY"
         );
         // SQL Server 缺少排序时给出兜底排序，保证语法合法
-        assert!(DatabaseKind::SqlServer
-            .apply_paging(base, "", 0, 10)
-            .contains("ORDER BY (SELECT NULL)"));
+        assert!(
+            DatabaseKind::SqlServer
+                .apply_paging(base, "", 0, 10)
+                .contains("ORDER BY (SELECT NULL)")
+        );
         // Oracle 使用 ROWNUM 双层包装（兼容 11g）
         assert_eq!(
             DatabaseKind::Oracle.apply_paging(base, "ORDER BY \"Id\"", 20, 10),
@@ -1716,8 +1825,12 @@ mod tests {
         );
 
         // 无排序：OVER 子句给合法兜底，保证语法可用
-        let sql = DatabaseKind::SqlServer.apply_paging_with_style(base, "", 0, 5, PageStyle::RowNumber);
-        assert!(sql.contains("row_number() over(Order By (SELECT NULL)) as rowNumber"), "{sql}");
+        let sql =
+            DatabaseKind::SqlServer.apply_paging_with_style(base, "", 0, 5, PageStyle::RowNumber);
+        assert!(
+            sql.contains("row_number() over(Order By (SELECT NULL)) as rowNumber"),
+            "{sql}"
+        );
         assert!(sql.contains("rowNumber BETWEEN 1 And 5"), "{sql}");
 
         // 其它库忽略风格（与默认分页一致）
@@ -1747,7 +1860,11 @@ mod tests {
 
         // Oracle：自增列无内联属性，SQL 跟随建表脚本一起导出
         let stmts = DatabaseKind::Oracle.create_table_sql(&table);
-        assert!(stmts[0].contains("\"Id\" number(10) NOT NULL"), "{}", stmts[0]);
+        assert!(
+            stmts[0].contains("\"Id\" number(10) NOT NULL"),
+            "{}",
+            stmts[0]
+        );
         assert!(!stmts[0].contains("IDENTITY"), "{}", stmts[0]);
         // NOT NULL 的 DateTime 列补固定默认值（与 DH.NCode 一致），且 DEFAULT 在 NOT NULL 之前
         assert!(
@@ -1768,14 +1885,23 @@ mod tests {
         col.default_value = Some("x".into());
 
         let sqlite = DatabaseKind::Sqlite.add_column_sql(&table, &col);
-        assert!(sqlite.starts_with("ALTER TABLE \"DH_Order\" ADD COLUMN \"Code\""), "{sqlite}");
+        assert!(
+            sqlite.starts_with("ALTER TABLE \"DH_Order\" ADD COLUMN \"Code\""),
+            "{sqlite}"
+        );
 
         let mssql = DatabaseKind::SqlServer.add_column_sql(&table, &col);
-        assert!(mssql.starts_with("ALTER TABLE [DH_Order] ADD [Code]"), "{mssql}");
+        assert!(
+            mssql.starts_with("ALTER TABLE [DH_Order] ADD [Code]"),
+            "{mssql}"
+        );
         assert!(!mssql.contains("ADD COLUMN"), "{mssql}");
 
         let oracle = DatabaseKind::Oracle.add_column_sql(&table, &col);
-        assert!(oracle.starts_with("ALTER TABLE \"DH_Order\" ADD \"Code\""), "{oracle}");
+        assert!(
+            oracle.starts_with("ALTER TABLE \"DH_Order\" ADD \"Code\""),
+            "{oracle}"
+        );
         assert!(oracle.contains("DEFAULT 'x' NOT NULL"), "{oracle}");
     }
 
@@ -1784,12 +1910,14 @@ mod tests {
         let table = sample_table();
         let mut col = table.column("Ok").unwrap().clone();
         col.default_value = Some("True".into());
-        assert!(DatabaseKind::Sqlite.create_table_sql(&{
-            let mut t = table.clone();
-            t.columns = vec![col.clone()];
-            t
-        })[0]
-        .contains("DEFAULT 1"));
+        assert!(
+            DatabaseKind::Sqlite.create_table_sql(&{
+                let mut t = table.clone();
+                t.columns = vec![col.clone()];
+                t
+            })[0]
+                .contains("DEFAULT 1")
+        );
 
         let mut s = col.clone();
         s.data_type = DataType::String;

@@ -174,7 +174,10 @@ fn tsv_cell_to_dbvalue(cell: &str, ty: &str) -> DbValue {
         return DbValue::Text(text);
     }
     if ty.starts_with("Float") {
-        return text.parse::<f64>().map(DbValue::Float).unwrap_or(DbValue::Text(text));
+        return text
+            .parse::<f64>()
+            .map(DbValue::Float)
+            .unwrap_or(DbValue::Text(text));
     }
     if ty.starts_with("Decimal") {
         return text
@@ -185,7 +188,8 @@ fn tsv_cell_to_dbvalue(cell: &str, ty: &str) -> DbValue {
     if ty.starts_with("DateTime") || ty.starts_with("Date") {
         // 形如 2026-09-27 10:30:00.123（可能带时区后缀）
         let trimmed = text.split('.').next().map(str::to_string);
-        if let Some(dt) = parse_datetime(&text).or_else(|| trimmed.and_then(|t| parse_datetime(&t))) {
+        if let Some(dt) = parse_datetime(&text).or_else(|| trimmed.and_then(|t| parse_datetime(&t)))
+        {
             return DbValue::DateTime(dt);
         }
         return DbValue::Text(text);

@@ -184,7 +184,10 @@ impl DbValue {
             DbValue::Float(v) => v.to_string(),
             DbValue::Decimal(v) => v.to_string(),
             DbValue::Text(v) => format!("'{}'", v.replace('\'', "''")),
-            DbValue::Blob(v) => format!("X'{}'", v.iter().map(|b| format!("{b:02X}")).collect::<String>()),
+            DbValue::Blob(v) => format!(
+                "X'{}'",
+                v.iter().map(|b| format!("{b:02X}")).collect::<String>()
+            ),
             DbValue::DateTime(v) => format!("'{}'", format_datetime(v)),
         }
     }
@@ -259,7 +262,10 @@ mod tests {
         assert_eq!(DbValue::from(7).as_i16(), Some(7));
         assert_eq!(DbValue::from(255).as_u8(), Some(255));
         assert_eq!(DbValue::from(1.5).as_f32(), Some(1.5f32));
-        assert_eq!(DbValue::from("12.34").as_decimal().unwrap().to_string(), "12.34");
+        assert_eq!(
+            DbValue::from("12.34").as_decimal().unwrap().to_string(),
+            "12.34"
+        );
         assert_eq!(DbValue::from(12).as_decimal().unwrap().to_string(), "12");
         assert_eq!(DbValue::from(vec![1u8, 2]).as_blob(), Some(&[1u8, 2][..]));
         assert_eq!(DbValue::Text("abc".into()).as_blob(), None);
@@ -283,7 +289,10 @@ mod tests {
         assert!(parse_datetime("2026-09-26 18:01:02").is_some());
         assert_eq!(
             parse_datetime("2026-09-26").unwrap(),
-            NaiveDate::from_ymd_opt(2026, 9, 26).unwrap().and_hms_opt(0, 0, 0).unwrap()
+            NaiveDate::from_ymd_opt(2026, 9, 26)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
         );
         assert!(parse_datetime("").is_none());
     }
@@ -294,7 +303,10 @@ mod tests {
         assert_eq!(DbValue::from(3).to_sql_literal(), "3");
         assert_eq!(DbValue::from(true).to_sql_literal(), "1");
         assert_eq!(DbValue::Null.to_sql_literal(), "NULL");
-        assert_eq!(DbValue::from(vec![0x0A, 0xFFu8]).to_sql_literal(), "X'0AFF'");
+        assert_eq!(
+            DbValue::from(vec![0x0A, 0xFFu8]).to_sql_literal(),
+            "X'0AFF'"
+        );
     }
 
     #[test]

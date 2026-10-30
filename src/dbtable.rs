@@ -243,10 +243,7 @@ fn write_cell(w: &mut Writer, kind: ColumnType, value: &DbValue) {
             w.bytes(&v.to_be_bytes());
         }
         ColumnType::Decimal => {
-            let (lo, mid, hi, flags) = value
-                .as_decimal()
-                .map(decimal_bits)
-                .unwrap_or((0, 0, 0, 0));
+            let (lo, mid, hi, flags) = value.as_decimal().map(decimal_bits).unwrap_or((0, 0, 0, 0));
             w.encoded_i32(lo as i32);
             w.encoded_i32(mid as i32);
             w.encoded_i32(hi as i32);
@@ -345,7 +342,11 @@ pub fn decode_rowset(bytes: &[u8]) -> Result<RowSet> {
             code::DATETIME => ColumnType::DateTime,
             code::STRING => ColumnType::Text,
             code::OBJECT => {
-                let name = if version >= 2 { r.string()? } else { String::new() };
+                let name = if version >= 2 {
+                    r.string()?
+                } else {
+                    String::new()
+                };
                 match name.as_str() {
                     "System.Byte[]" => ColumnType::Blob,
                     "System.Guid" => ColumnType::Guid,
@@ -429,9 +430,10 @@ fn read_cell(r: &mut Reader<'_>, kind: ColumnType, full_time: bool) -> Result<Db
                     .and_then(|d| d.and_hms_opt(0, 0, 0))
                     .unwrap();
                 DbValue::DateTime(
-                    base.checked_add_signed(TimeDelta::try_seconds(seconds).ok_or_else(|| {
-                        Error::Db("DateTime 秒数超出范围".into())
-                    })?)
+                    base.checked_add_signed(
+                        TimeDelta::try_seconds(seconds)
+                            .ok_or_else(|| Error::Db("DateTime 秒数超出范围".into()))?,
+                    )
                     .ok_or_else(|| Error::Db("DateTime 秒数超出范围".into()))?,
                 )
             }
@@ -499,7 +501,9 @@ struct Writer {
 
 impl Writer {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(256) }
+        Self {
+            buf: Vec::with_capacity(256),
+        }
     }
 
     fn byte(&mut self, value: u8) {
@@ -611,7 +615,8 @@ impl<'a> Reader<'a> {
     /// varint 长度 + UTF-8。
     fn string(&mut self) -> Result<String> {
         let bytes = self.sized_bytes()?;
-        String::from_utf8(bytes).map_err(|e| Error::Db(format!("DbTable 字符串不是合法 UTF-8：{e}")))
+        String::from_utf8(bytes)
+            .map_err(|e| Error::Db(format!("DbTable 字符串不是合法 UTF-8：{e}")))
     }
 
     /// varint 长度 + 原始字节。
@@ -704,7 +709,10 @@ mod tests {
 
         // 解码
         let back = decode_rowset(&golden_bytes()).unwrap();
-        assert_eq!(back.columns.as_ref(), &vec!["Id".to_string(), "Name".to_string()]);
+        assert_eq!(
+            back.columns.as_ref(),
+            &vec!["Id".to_string(), "Name".to_string()]
+        );
         assert_eq!(back.len(), 1);
         assert_eq!(back.rows[0].get(0), Some(&DbValue::Int(7)));
         assert_eq!(back.rows[0].get(1), Some(&DbValue::Text("ab".into())));
@@ -757,7 +765,12 @@ mod tests {
             .unwrap();
         let mut set = RowSet::new(vec!["N".into(), "S".into(), "B".into(), "D".into()]);
         // 第一行全 NULL（类型由第二行推断）
-        set.push(vec![DbValue::Null, DbValue::Null, DbValue::Null, DbValue::Null]);
+        set.push(vec![
+            DbValue::Null,
+            DbValue::Null,
+            DbValue::Null,
+            DbValue::Null,
+        ]);
         set.push(vec![
             DbValue::Int(5),
             DbValue::Text("x".into()),
@@ -821,7 +834,9 @@ mod tests {
         let set = decode_rowset(&bytes).unwrap();
         assert_eq!(
             set.rows[0].get(0),
-            Some(&DbValue::Text("03020100-0504-0706-0809-0a0b0c0d0e0f".into()))
+            Some(&DbValue::Text(
+                "03020100-0504-0706-0809-0a0b0c0d0e0f".into()
+            ))
         );
     }
 

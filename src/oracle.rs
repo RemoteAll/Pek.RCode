@@ -383,9 +383,8 @@ mod tests {
         assert_eq!(s.connect_string, "ORCLPDB");
 
         // TNS 别名 + ServiceName → 组装 EZConnect
-        let cs = ConnectionString::parse(
-            "Data Source=db1;ServiceName=xe;Uid=u;Pwd=p;provider=oracle",
-        );
+        let cs =
+            ConnectionString::parse("Data Source=db1;ServiceName=xe;Uid=u;Pwd=p;provider=oracle");
         let s = parse_settings(&cs).unwrap();
         assert_eq!(s.connect_string, "//db1:1521/xe");
 

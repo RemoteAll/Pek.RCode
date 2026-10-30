@@ -260,8 +260,7 @@ impl TableMeta {
         *self.audit_columns.get_or_init(|| {
             let mut flags = 0u16;
             for column in &self.columns {
-                let is_int =
-                    matches!(column.data_type, DataType::Int32 | DataType::Int64);
+                let is_int = matches!(column.data_type, DataType::Int32 | DataType::Int64);
                 let is_string = column.data_type == DataType::String;
                 let is_datetime = column.data_type == DataType::DateTime;
                 let name = column.name.as_str();
@@ -502,18 +501,18 @@ impl EntityModel {
 
     /// 按实体名查找表（忽略大小写）。
     pub fn table(&self, name: &str) -> Option<&TableMeta> {
-        self.tables
-            .iter()
-            .find(|t| t.name.eq_ignore_ascii_case(name) || t.effective_table_name().eq_ignore_ascii_case(name))
+        self.tables.iter().find(|t| {
+            t.name.eq_ignore_ascii_case(name) || t.effective_table_name().eq_ignore_ascii_case(name)
+        })
     }
 
     /// 仅包含指定表的新模型（用于切片生成/局部迁移）。
     pub fn subset(&self, tables: &[&str]) -> EntityModel {
         let mut cloned = self.clone();
         cloned.tables.retain(|t| {
-            tables
-                .iter()
-                .any(|n| t.name.eq_ignore_ascii_case(n) || t.effective_table_name().eq_ignore_ascii_case(n))
+            tables.iter().any(|n| {
+                t.name.eq_ignore_ascii_case(n) || t.effective_table_name().eq_ignore_ascii_case(n)
+            })
         });
         cloned
     }
@@ -531,10 +530,7 @@ impl EntityModel {
         // Option
         out.push_str("  <Option>\n");
         for (key, value) in &self.options.raw {
-            out.push_str(&format!(
-                "    <{key}>{}</{key}>\n",
-                escape_text(value)
-            ));
+            out.push_str(&format!("    <{key}>{}</{key}>\n", escape_text(value)));
         }
         out.push_str("  </Option>\n");
 
@@ -584,7 +580,11 @@ impl EntityModel {
                 write_attr(&mut out, "Category", col.category.as_deref());
                 write_attr(&mut out, "ItemType", col.item_type.as_deref());
                 if let Some(uc) = col.using_cache {
-                    write_attr(&mut out, "UsingCache", Some(if uc { "True" } else { "False" }));
+                    write_attr(
+                        &mut out,
+                        "UsingCache",
+                        Some(if uc { "True" } else { "False" }),
+                    );
                 }
                 write_attr(&mut out, "Description", Some(&col.description));
                 // 未识别的属性原样回写（含 C# 模型里拼写错误的 `Lengt`）
@@ -712,12 +712,10 @@ fn parse_table(node: &Node) -> Result<TableMeta> {
 
 /// 解析 `<Column>`。
 fn parse_column(node: &Node, table_name: &str) -> Result<ColumnMeta> {
-    let name = attr_string(node, "Name").ok_or_else(|| {
-        Error::Model(format!("表 {table_name} 中存在缺少 Name 属性的 Column"))
-    })?;
-    let type_text = attr_string(node, "DataType").ok_or_else(|| {
-        Error::Model(format!("表 {table_name} 的列 {name} 缺少 DataType 属性"))
-    })?;
+    let name = attr_string(node, "Name")
+        .ok_or_else(|| Error::Model(format!("表 {table_name} 中存在缺少 Name 属性的 Column")))?;
+    let type_text = attr_string(node, "DataType")
+        .ok_or_else(|| Error::Model(format!("表 {table_name} 的列 {name} 缺少 DataType 属性")))?;
     let data_type = DataType::from_name(&type_text)
         .map_err(|e| Error::Model(format!("表 {table_name} 的列 {name}：{e}")))?;
 
@@ -842,7 +840,10 @@ fn write_attr(out: &mut String, name: &str, value: Option<&str>) {
 fn write_name_and_table_name(table: &TableMeta) -> String {
     let mut s = format!(" Name=\"{}\"", escape_attr(&table.name));
     if !table.table_name.is_empty() && table.table_name != table.name {
-        s.push_str(&format!(" TableName=\"{}\"", escape_attr(&table.table_name)));
+        s.push_str(&format!(
+            " TableName=\"{}\"",
+            escape_attr(&table.table_name)
+        ));
     }
     if let Some(conn) = &table.conn_name {
         s.push_str(&format!(" ConnName=\"{}\"", escape_attr(conn)));
@@ -883,7 +884,9 @@ fn escape_attr(v: &str) -> String {
 
 /// XML 文本转义。
 fn escape_text(v: &str) -> String {
-    v.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    v.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -905,7 +908,11 @@ mod tests {
         let model = EntityModel::parse(wide).unwrap();
         let issues = model.mysql_row_size_issues();
         assert_eq!(issues.len(), 1, "{issues:?}");
-        assert!(issues[0].contains("Big(16000)"), "应点名超宽列：{}", issues[0]);
+        assert!(
+            issues[0].contains("Big(16000)"),
+            "应点名超宽列：{}",
+            issues[0]
+        );
         assert!(issues[0].contains("65535"), "应说明上限：{}", issues[0]);
 
         // 改成 Text（不写 Length → MySQL LONGTEXT，行内只占指针）后通过
@@ -1010,7 +1017,10 @@ mod tests {
 
         // 枚举类型与精度字段
         let dev = model.table("HardwareDevices").unwrap();
-        assert_eq!(dev.column("HType").unwrap().enum_type.as_deref(), Some("Dto.HardwareType"));
+        assert_eq!(
+            dev.column("HType").unwrap().enum_type.as_deref(),
+            Some("Dto.HardwareType")
+        );
 
         // 固件应完整覆盖生产模型使用的 8 种数据类型
         let mut kinds = std::collections::BTreeSet::new();
@@ -1036,7 +1046,11 @@ mod tests {
         let model = EntityModel::load(std::path::Path::new(&path)).expect("全量模型应可解析");
         assert!(!model.tables.is_empty(), "全量模型不应为空");
         let total: usize = model.tables.iter().map(|t| t.columns.len()).sum();
-        eprintln!("全量模型回归通过：{} 张表 / {} 列（{path}）", model.tables.len(), total);
+        eprintln!(
+            "全量模型回归通过：{} 张表 / {} 列（{path}）",
+            model.tables.len(),
+            total
+        );
     }
 
     #[test]
@@ -1120,7 +1134,10 @@ mod tests {
         assert_eq!(table.base_type.as_deref(), Some("EntityTree"));
         assert_eq!(table.max_cache_count, 0);
         assert!(
-            table.extra.iter().any(|(k, v)| k == "IgnoreNameCase" && v == "False"),
+            table
+                .extra
+                .iter()
+                .any(|(k, v)| k == "IgnoreNameCase" && v == "False"),
             "未显式解析的表属性应进 extra 保真：{:?}",
             table.extra
         );
@@ -1143,7 +1160,10 @@ mod tests {
         assert_eq!(table.indexes.len(), 2);
         assert!(table.indexes[0].unique);
         assert_eq!(table.indexes[0].columns, vec!["Uuid".to_string()]);
-        assert_eq!(table.indexes[1].columns, vec!["Category".to_string(), "Length".to_string()]);
+        assert_eq!(
+            table.indexes[1].columns,
+            vec!["Category".to_string(), "Length".to_string()]
+        );
     }
 
     #[test]

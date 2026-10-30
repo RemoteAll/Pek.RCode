@@ -73,7 +73,9 @@ pub(crate) fn probe_remote_kind(conn_str: &ConnectionString) -> Result<DatabaseK
 fn remote_prefix(kind: DatabaseKind) -> char {
     match kind {
         DatabaseKind::Oracle | DatabaseKind::DaMeng | DatabaseKind::Db2 => ':',
-        DatabaseKind::MySql | DatabaseKind::Hana | DatabaseKind::Iris | DatabaseKind::TDengine => '?',
+        DatabaseKind::MySql | DatabaseKind::Hana | DatabaseKind::Iris | DatabaseKind::TDengine => {
+            '?'
+        }
         _ => '@',
     }
 }
@@ -85,7 +87,11 @@ fn remote_prefix(kind: DatabaseKind) -> char {
 /// - **NULL 值内联为 `NULL` 字面量**（不进字典）：C# 服务端 `DbService.ConvertToDictionary`
 ///   会丢弃 NULL 参数，若占位符仍保留将报“缺少参数”；
 /// - 字符串字面量内的占位符不转换。
-fn translate(sql: &str, params: &[DbValue], kind: DatabaseKind) -> (String, BTreeMap<String, Value>) {
+fn translate(
+    sql: &str,
+    params: &[DbValue],
+    kind: DatabaseKind,
+) -> (String, BTreeMap<String, Value>) {
     let prefix = remote_prefix(kind);
     let mut out = String::with_capacity(sql.len() + params.len() * 5);
     let mut dict: BTreeMap<String, Value> = BTreeMap::new();
@@ -241,13 +247,16 @@ impl SqlSession for NetworkSession {
 
     fn execute(&mut self, sql: &str, params: &[DbValue]) -> Result<u64> {
         let (sql, parameters) = translate(sql, params, self.kind);
-        let n = self.client.execute_in(self.tx.as_deref(), &sql, Some(&parameters))?;
+        let n = self
+            .client
+            .execute_in(self.tx.as_deref(), &sql, Some(&parameters))?;
         Ok(n.max(0) as u64)
     }
 
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
         let (sql, parameters) = translate(sql, params, self.kind);
-        self.client.query_rowset_in(self.tx.as_deref(), &sql, Some(&parameters))
+        self.client
+            .query_rowset_in(self.tx.as_deref(), &sql, Some(&parameters))
     }
 
     /// 插入并取自增：转发到远端原子接口 `POST Db/InsertAndGetIdentity`（对齐 C# `NetworkSession`）。
@@ -297,7 +306,8 @@ impl SqlSession for NetworkSession {
 
     fn last_identity(&mut self) -> Result<i64> {
         Err(Error::Unsupported(
-            "network 驱动请使用 insert_and_get_identity（由远端 Db/InsertAndGetIdentity 返回）".into(),
+            "network 驱动请使用 insert_and_get_identity（由远端 Db/InsertAndGetIdentity 返回）"
+                .into(),
         ))
     }
 
@@ -449,12 +459,20 @@ mod tests {
                                 )
                             } else {
                                 let set = RowSet::new(vec!["Id".into(), "Name".into()]);
-                                (200, "application/octet-stream", dbtable::encode_rowset(&set))
+                                (
+                                    200,
+                                    "application/octet-stream",
+                                    dbtable::encode_rowset(&set),
+                                )
                             }
                         } else {
                             let mut set = RowSet::new(vec!["Id".into()]);
                             set.push(vec![DbValue::Int(7)]);
-                            (200, "application/octet-stream", dbtable::encode_rowset(&set))
+                            (
+                                200,
+                                "application/octet-stream",
+                                dbtable::encode_rowset(&set),
+                            )
                         }
                     } else if request.contains("/Db/InsertAndGetIdentity") {
                         (200, "application/json", br#"{"data": 9}"#.to_vec())
@@ -462,7 +480,11 @@ mod tests {
                         (200, "application/json", br#"{"data": 3}"#.to_vec())
                     };
 
-                let reason = if status == 200 { "OK" } else { "Internal Server Error" };
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -513,8 +535,14 @@ mod tests {
         assert_eq!(id, 9);
 
         // 表结构探测：`SELECT * FROM 表 WHERE 1=0`（缺表时远端报错 → false）
-        assert!(session.table_exists("dh_user").unwrap(), "表名匹配应忽略大小写");
-        assert_eq!(session.table_columns("DH_User").unwrap(), vec!["Id", "Name"]);
+        assert!(
+            session.table_exists("dh_user").unwrap(),
+            "表名匹配应忽略大小写"
+        );
+        assert_eq!(
+            session.table_columns("DH_User").unwrap(),
+            vec!["Id", "Name"]
+        );
         assert!(!session.table_exists("NotExists").unwrap());
 
         // 事务与裸取自增：明确不支持

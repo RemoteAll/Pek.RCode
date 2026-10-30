@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once};
 
+use crate::DatabaseKind;
 use crate::dal::Dal;
 use crate::session::SqlSession;
-use crate::DatabaseKind;
 
 /// 共享存储：一个数据目录一个数据访问层 + 一把串行锁。
 pub struct SharedStore {
@@ -487,7 +487,8 @@ mod tests {
     }
 
     #[test]
-    fn reopen_after_drop_runs_open_again() {        let dir = temp_dir("reopen");
+    fn reopen_after_drop_runs_open_again() {
+        let dir = temp_dir("reopen");
         let (_, created1) = get_or_open(&dir, || open_dal(&dir)).unwrap();
         assert!(created1);
         drop_for_test(&dir);

@@ -145,7 +145,9 @@ impl Default for SqliteOptions {
             synchronous: DEFAULT_SYNCHRONOUS,
             cache_size_kib: None,
             busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
-            read_only: false,            query_only: false,        }
+            read_only: false,
+            query_only: false,
+        }
     }
 }
 
@@ -172,9 +174,12 @@ impl SqliteOptions {
             options.busy_timeout_ms = ms;
         }
         // 只读连接：跳过 journal_mode（只读文件不能写 WAL/-shm，与 C# 的 Readonly 分支一致）
-        options.read_only = conn
-            .get("readonly")
-            .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"));
+        options.read_only = conn.get("readonly").is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes"
+            )
+        });
         if options.read_only {
             options.journal_mode = None;
         }
@@ -311,10 +316,7 @@ impl SqlSession for SqliteSession {
 
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
         let values: Vec<SqlParam> = params.iter().map(to_param).collect();
-        let Self {
-            conn,
-            column_cache,
-        } = self;
+        let Self { conn, column_cache } = self;
         let mut stmt = conn.prepare_cached(sql)?;
 
         // 列名按 SQL 缓存：分页/条件只有参数不同的同构查询，不再每轮重建列名列表
@@ -401,7 +403,11 @@ impl SqlSession for SqliteSession {
 }
 
 /// 便捷方法：执行查询并返回首行（无结果时为 None）。
-pub fn query_one(session: &mut dyn SqlSession, sql: &str, params: &[DbValue]) -> Result<Option<DbRow>> {
+pub fn query_one(
+    session: &mut dyn SqlSession,
+    sql: &str,
+    params: &[DbValue],
+) -> Result<Option<DbRow>> {
     let set = session.query(sql, params)?;
     Ok(set.rows.into_iter().next())
 }
@@ -418,7 +424,11 @@ mod tests {
     #[test]
     fn default_options_match_csharp() {
         let options = SqliteOptions::default();
-        assert_eq!(options.synchronous, SqliteSynchronous::Off, "默认对齐 C#：Synchronous=Off");
+        assert_eq!(
+            options.synchronous,
+            SqliteSynchronous::Off,
+            "默认对齐 C#：Synchronous=Off"
+        );
         assert_eq!(options.journal_mode, Some(SqliteJournalMode::Wal));
         assert_eq!(options.cache_size_kib, None);
         assert_eq!(options.busy_timeout_ms, 5000);
@@ -460,10 +470,8 @@ mod tests {
 
     #[test]
     fn pragmas_are_applied_to_connection() {
-        let dir = std::env::temp_dir().join(format!(
-            "pek-rcode-sqlite-options-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pek-rcode-sqlite-options-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("options.db");
         let options = SqliteOptions {
@@ -473,7 +481,9 @@ mod tests {
         };
         let session = SqliteSession::open_with_options(path.to_str().unwrap(), &options).unwrap();
         let conn = session.connection();
-        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(sync, 1, "NORMAL = 1");
         let cache: i64 = conn
             .query_row("PRAGMA cache_size", [], |row| row.get(0))
@@ -503,7 +513,12 @@ mod tests {
                     DbValue::from("Demo"),
                     DbValue::from("12.3400".parse::<rust_decimal::Decimal>().unwrap()),
                     DbValue::from(true),
-                    DbValue::from(chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap().and_hms_opt(18, 1, 2).unwrap()),
+                    DbValue::from(
+                        chrono::NaiveDate::from_ymd_opt(2026, 9, 26)
+                            .unwrap()
+                            .and_hms_opt(18, 1, 2)
+                            .unwrap(),
+                    ),
                 ],
             )
             .unwrap();
@@ -512,7 +527,9 @@ mod tests {
         let id = s.last_identity().unwrap();
         assert_eq!(id, 1);
 
-        let set = s.query("SELECT * FROM t WHERE name = ?1", &[DbValue::from("demo")]).unwrap();
+        let set = s
+            .query("SELECT * FROM t WHERE name = ?1", &[DbValue::from("demo")])
+            .unwrap();
         assert_eq!(set.len(), 1, "COLLATE NOCASE 应支持忽略大小写查询");
 
         let row = set.first().unwrap();
@@ -544,7 +561,8 @@ mod tests {
     #[test]
     fn introspection() {
         let mut s = memory();
-        s.execute("CREATE TABLE DH_Order (Id int, Code nvarchar(50))", &[]).unwrap();
+        s.execute("CREATE TABLE DH_Order (Id int, Code nvarchar(50))", &[])
+            .unwrap();
 
         assert!(s.table_exists("dh_order").unwrap(), "表名匹配应忽略大小写");
         assert!(!s.table_exists("NotExists").unwrap());

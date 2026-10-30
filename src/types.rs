@@ -95,7 +95,11 @@ impl DataType {
 
     /// 是否数值族。
     pub fn is_numeric(&self) -> bool {
-        self.is_integer() || matches!(self, DataType::Single | DataType::Double | DataType::Decimal)
+        self.is_integer()
+            || matches!(
+                self,
+                DataType::Single | DataType::Double | DataType::Decimal
+            )
     }
 
     /// 对应的 Rust 基础类型名（用于代码生成与文档，不含 `Option`）。

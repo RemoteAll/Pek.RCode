@@ -10,9 +10,9 @@ use crate::types::DataType;
 /// Rust 关键字（作为字段名时需要加 `r#` 前缀）。
 const KEYWORDS: [&str; 39] = [
     "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn",
-    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
-    "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while",
-    "async", "await", "box", "yield",
+    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+    "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+    "where", "while", "async", "await", "box", "yield",
 ];
 
 /// 表名 → 生成文件名（`OrderItem` → `order_item.rs`）。
@@ -362,7 +362,11 @@ pub fn generate(table: &TableMeta) -> String {
             if col.nullable || !matches!(col.data_type, DataType::String) {
                 continue;
             }
-            if col.default_value.as_ref().is_some_and(|v| !v.trim().is_empty()) {
+            if col
+                .default_value
+                .as_ref()
+                .is_some_and(|v| !v.trim().is_empty())
+            {
                 continue;
             }
             if VALID_EXCLUDES
@@ -564,12 +568,12 @@ fn from_row_expr(col: &ColumnMeta, name: &str, owned: bool) -> String {
     }
 
     match col.data_type {
-        DataType::String => format!(
-            "row.{accessor}(\"{name}\").map(DbValue::{text_of}).unwrap_or_default()"
-        ),
-        DataType::Binary => format!(
-            "row.{accessor}(\"{name}\").and_then(|v| {blob_opt}).unwrap_or_default()"
-        ),
+        DataType::String => {
+            format!("row.{accessor}(\"{name}\").map(DbValue::{text_of}).unwrap_or_default()")
+        }
+        DataType::Binary => {
+            format!("row.{accessor}(\"{name}\").and_then(|v| {blob_opt}).unwrap_or_default()")
+        }
         DataType::DateTime => format!(
             "row.{accessor}(\"{name}\").and_then({}).unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc())",
             conv("DbValue::as_datetime")
@@ -625,7 +629,10 @@ fn set_field_expr(col: &ColumnMeta) -> String {
         return match col.data_type {
             DataType::String => "(!value.is_null()).then(|| value.to_text())".into(),
             DataType::Binary => "value.as_blob().map(<[u8]>::to_vec)".into(),
-            other => format!("value.{}()", value_converter(other).trim_start_matches("DbValue::")),
+            other => format!(
+                "value.{}()",
+                value_converter(other).trim_start_matches("DbValue::")
+            ),
         };
     }
     match col.data_type {
@@ -654,7 +661,9 @@ pub fn to_snake_case(name: &str) -> String {
                 && match prev {
                     Some(p) if p.is_ascii_lowercase() || p.is_ascii_digit() => true,
                     // 连续大写中，仅当后面是小写时切分（如 SId → s_id，IP → ip）
-                    Some(p) if p.is_ascii_uppercase() => next.is_some_and(|n| n.is_ascii_lowercase()),
+                    Some(p) if p.is_ascii_uppercase() => {
+                        next.is_some_and(|n| n.is_ascii_lowercase())
+                    }
                     _ => false,
                 };
             if need_sep {
@@ -777,7 +786,11 @@ impl<'a> SearchBuilder<'a> {
         for col in self.columns() {
             let mut type_name = col.data_type.rust_type().to_string();
             if !extend {
-                type_name = type_name.rsplit("::").next().unwrap_or(&type_name).to_string();
+                type_name = type_name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&type_name)
+                    .to_string();
             }
             result.push(SearchParameter {
                 name: col.name.clone(),
@@ -823,7 +836,9 @@ impl<'a> SearchBuilder<'a> {
                 if show.search_hide() {
                     continue;
                 }
-                let matched = index_columns.iter().any(|n| n.eq_ignore_ascii_case(&col.name))
+                let matched = index_columns
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&col.name))
                     || col
                         .column_name
                         .as_deref()
@@ -836,7 +851,10 @@ impl<'a> SearchBuilder<'a> {
 
         // 2) 特殊字段（ShowIn 显式 / 数据时间 / 整数枚举与映射 / 布尔）
         for col in &table.columns {
-            if columns.iter().any(|c| c.name.eq_ignore_ascii_case(&col.name)) {
+            if columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&col.name))
+            {
                 continue;
             }
             let show = ShowInOption::parse(col.show_in.as_deref().unwrap_or_default());
@@ -864,11 +882,15 @@ impl<'a> SearchBuilder<'a> {
 
         // 3) enable / isDeleted 置于最后
         for col in &table.columns {
-            if columns.iter().any(|c| c.name.eq_ignore_ascii_case(&col.name)) {
+            if columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&col.name))
+            {
                 continue;
             }
             if col.data_type == DataType::Boolean
-                && (col.name.eq_ignore_ascii_case("enable") || col.name.eq_ignore_ascii_case("isDeleted"))
+                && (col.name.eq_ignore_ascii_case("enable")
+                    || col.name.eq_ignore_ascii_case("isDeleted"))
             {
                 columns.push(col);
             }
@@ -887,10 +909,16 @@ impl<'a> SearchBuilder<'a> {
                     .is_some_and(|v| v.to_ascii_lowercase().starts_with("time"))
             })
             .copied()
-            .or_else(|| columns.iter().find(|c| c.data_type == DataType::DateTime).copied())
+            .or_else(|| {
+                columns
+                    .iter()
+                    .find(|c| c.data_type == DataType::DateTime)
+                    .copied()
+            })
             .or_else(|| {
                 table.columns.iter().find(|c| {
-                    c.name.eq_ignore_ascii_case("UpdateTime") || c.name.eq_ignore_ascii_case("CreateTime")
+                    c.name.eq_ignore_ascii_case("UpdateTime")
+                        || c.name.eq_ignore_ascii_case("CreateTime")
                 })
             });
         let snow_column = columns
@@ -901,9 +929,13 @@ impl<'a> SearchBuilder<'a> {
         if let Some(time) = time_column {
             columns.retain(|c| !c.name.eq_ignore_ascii_case(&time.name));
         }
-        columns.retain(|c| !c.name.eq_ignore_ascii_case("key") && !c.name.eq_ignore_ascii_case("page"));
+        columns.retain(|c| {
+            !c.name.eq_ignore_ascii_case("key") && !c.name.eq_ignore_ascii_case("page")
+        });
         if snow_column.is_some() || time_column.is_some() {
-            columns.retain(|c| !c.name.eq_ignore_ascii_case("start") && !c.name.eq_ignore_ascii_case("end"));
+            columns.retain(|c| {
+                !c.name.eq_ignore_ascii_case("start") && !c.name.eq_ignore_ascii_case("end")
+            });
         }
 
         (columns, snow_column.or(time_column))
@@ -1024,7 +1056,11 @@ pub fn generate_model(table: &TableMeta) -> String {
         &table.description
     };
     let table_name = table.effective_table_name();
-    let columns: Vec<&ColumnMeta> = table.columns.iter().filter(|c| !model_excluded(c)).collect();
+    let columns: Vec<&ColumnMeta> = table
+        .columns
+        .iter()
+        .filter(|c| !model_excluded(c))
+        .collect();
 
     let mut out = String::with_capacity(2048);
     out.push_str(&format!(
@@ -1093,7 +1129,11 @@ pub fn generate_interface(table: &TableMeta) -> String {
         &table.description
     };
     let table_name = table.effective_table_name();
-    let columns: Vec<&ColumnMeta> = table.columns.iter().filter(|c| !model_excluded(c)).collect();
+    let columns: Vec<&ColumnMeta> = table
+        .columns
+        .iter()
+        .filter(|c| !model_excluded(c))
+        .collect();
 
     let mut out = String::with_capacity(2048);
     out.push_str(&format!(
@@ -1102,7 +1142,10 @@ pub fn generate_interface(table: &TableMeta) -> String {
     out.push_str(
         "#[allow(unused_imports)]\nuse chrono::NaiveDateTime;\n#[allow(unused_imports)]\nuse rust_decimal::Decimal;\n\n",
     );
-    out.push_str(&format!("/// {display} 实体接口\npub trait I{name} {{\n", name = table.name));
+    out.push_str(&format!(
+        "/// {display} 实体接口\npub trait I{name} {{\n",
+        name = table.name
+    ));
     for col in &columns {
         let field = safe_field_name(&to_snake_case(&col.name));
         let setter = format!("set_{}", to_snake_case(&col.name));
@@ -1186,16 +1229,34 @@ mod tests {
         assert!(code.contains("pub struct OrderItem {"), "{code}");
         assert!(code.contains("    id: i32,"), "{code}");
         assert!(code.contains("    order_id: i32,"), "{code}");
-        assert!(code.contains("    s_id: Option<i64>,"), "可空字段应加 Option：{code}");
-        assert!(code.contains("    amount: rust_decimal::Decimal,"), "{code}");
-        assert!(code.contains("    create_time: chrono::NaiveDateTime,"), "{code}");
-        assert!(code.contains("    r#type: String,"), "关键字字段名应转义：{code}");
-        assert!(code.contains("pub const TABLE_NAME: &'static str = \"DH_OrderItem\";"), "{code}");
+        assert!(
+            code.contains("    s_id: Option<i64>,"),
+            "可空字段应加 Option：{code}"
+        );
+        assert!(
+            code.contains("    amount: rust_decimal::Decimal,"),
+            "{code}"
+        );
+        assert!(
+            code.contains("    create_time: chrono::NaiveDateTime,"),
+            "{code}"
+        );
+        assert!(
+            code.contains("    r#type: String,"),
+            "关键字字段名应转义：{code}"
+        );
+        assert!(
+            code.contains("pub const TABLE_NAME: &'static str = \"DH_OrderItem\";"),
+            "{code}"
+        );
         assert!(code.contains("/// 编号（主键、自增）"), "{code}");
 
         // 访问器与脏追踪：写入自动登记脏列，更新只写脏列
         assert!(code.contains("pub fn id(&self) -> &i32"), "{code}");
-        assert!(code.contains("pub fn set_id(&mut self, value: i32)"), "{code}");
+        assert!(
+            code.contains("pub fn set_id(&mut self, value: i32)"),
+            "{code}"
+        );
         assert!(code.contains("self.dirty.mark_static(\"Id\");"), "{code}");
         assert!(
             code.contains("fn column_value(&self, column: &str) -> Option<DbValue>"),
@@ -1205,18 +1266,42 @@ mod tests {
             code.contains("fn dirty_state(&self) -> Option<&pek_rcode::dirty::DirtyState>"),
             "{code}"
         );
-        assert!(code.contains("dirty: pek_rcode::dirty::DirtyState::new(),"), "{code}");
+        assert!(
+            code.contains("dirty: pek_rcode::dirty::DirtyState::new(),"),
+            "{code}"
+        );
 
         // 对象实体实现
-        assert!(code.contains("use pek_rcode::{DbRow, DbValue, Entity, Result};"), "{code}");
-        assert!(code.contains("impl Entity for OrderItem {"), "{code}");
-        assert!(code.contains("fn primary_keys() -> &'static [&'static str] {\n        &[\"Id\"]\n    }"), "{code}");
-        assert!(code.contains("fn identity_column() -> Option<&'static str> {\n        Some(\"Id\")\n    }"), "{code}");
-        assert!(code.contains("(\"Id\", self.id.into())"), "{code}");
-        assert!(code.contains("(\"Type\", self.r#type.clone().into())"), "String 字段应 clone：{code}");
-        assert!(code.contains("(\"SId\", self.s_id.into())"), "Option<i64> 为 Copy，无需 clone：{code}");
         assert!(
-            code.contains("id: row.get_by_name(\"Id\").and_then(DbValue::as_i32).unwrap_or_default()"),
+            code.contains("use pek_rcode::{DbRow, DbValue, Entity, Result};"),
+            "{code}"
+        );
+        assert!(code.contains("impl Entity for OrderItem {"), "{code}");
+        assert!(
+            code.contains(
+                "fn primary_keys() -> &'static [&'static str] {\n        &[\"Id\"]\n    }"
+            ),
+            "{code}"
+        );
+        assert!(
+            code.contains(
+                "fn identity_column() -> Option<&'static str> {\n        Some(\"Id\")\n    }"
+            ),
+            "{code}"
+        );
+        assert!(code.contains("(\"Id\", self.id.into())"), "{code}");
+        assert!(
+            code.contains("(\"Type\", self.r#type.clone().into())"),
+            "String 字段应 clone：{code}"
+        );
+        assert!(
+            code.contains("(\"SId\", self.s_id.into())"),
+            "Option<i64> 为 Copy，无需 clone：{code}"
+        );
+        assert!(
+            code.contains(
+                "id: row.get_by_name(\"Id\").and_then(DbValue::as_i32).unwrap_or_default()"
+            ),
             "{code}"
         );
         assert!(
@@ -1231,7 +1316,10 @@ mod tests {
         // 构造与默认值
         assert!(code.contains("pub fn new() -> Self {"), "{code}");
         assert!(code.contains("impl Default for OrderItem {"), "{code}");
-        assert!(code.contains("create_time: chrono::DateTime::UNIX_EPOCH.naive_utc(),"), "{code}");
+        assert!(
+            code.contains("create_time: chrono::DateTime::UNIX_EPOCH.naive_utc(),"),
+            "{code}"
+        );
     }
 
     #[test]
@@ -1260,17 +1348,25 @@ mod tests {
             "{code}"
         );
         assert!(code.contains("TimeShardPolicy::new(\"Id\")"), "{code}");
-        assert!(code.contains(".with_table_policy(\"{0}_{1:yyyy}\")"), "{code}");
+        assert!(
+            code.contains(".with_table_policy(\"{0}_{1:yyyy}\")"),
+            "{code}"
+        );
         assert!(code.contains(".with_step_days(365)"), "{code}");
         assert!(
             code.contains(".with_snow(pek_rcode::snowflake::shared())"),
             "雪花主键分表应携带进程级雪花实例：{code}"
         );
         assert!(
-            code.contains("fn set_field(&mut self, column: &str, value: DbValue) -> Result<bool> {"),
+            code.contains(
+                "fn set_field(&mut self, column: &str, value: DbValue) -> Result<bool> {"
+            ),
             "{code}"
         );
-        assert!(code.contains("if column.eq_ignore_ascii_case(\"Id\")"), "{code}");
+        assert!(
+            code.contains("if column.eq_ignore_ascii_case(\"Id\")"),
+            "{code}"
+        );
 
         // 时间列分表 + 连接模板（`timeShard:表模板:连接模板`，对应 C# BuildShardPolicy 的三段解析）
         let model = EntityModel::parse(
@@ -1283,9 +1379,18 @@ mod tests {
         )
         .unwrap();
         let code = generate(&model.tables[0]);
-        assert!(code.contains("TimeShardPolicy::new(\"CreateTime\")"), "{code}");
-        assert!(code.contains(".with_table_policy(\"{0}_{1:yyyyMMdd}\")"), "{code}");
-        assert!(code.contains(".with_conn_policy(\"{0}_{1:yyyy}\")"), "{code}");
+        assert!(
+            code.contains("TimeShardPolicy::new(\"CreateTime\")"),
+            "{code}"
+        );
+        assert!(
+            code.contains(".with_table_policy(\"{0}_{1:yyyyMMdd}\")"),
+            "{code}"
+        );
+        assert!(
+            code.contains(".with_conn_policy(\"{0}_{1:yyyy}\")"),
+            "{code}"
+        );
         assert!(code.contains(".with_step_days(1)"), "{code}");
         assert!(
             !code.contains("with_snow"),
@@ -1331,7 +1436,10 @@ mod tests {
 
         let params = builder.parameters(false);
         let param_names: Vec<&str> = params.iter().map(|p| p.parameter_name.as_str()).collect();
-        assert_eq!(param_names, vec!["code", "status", "ok", "visible", "enable", "start", "end"]);
+        assert_eq!(
+            param_names,
+            vec!["code", "status", "ok", "visible", "enable", "start", "end"]
+        );
         let status = params.iter().find(|p| p.name == "Status").unwrap();
         assert_eq!(status.type_name, "i32");
         let ok = params.iter().find(|p| p.name == "Ok").unwrap();
@@ -1358,19 +1466,31 @@ mod tests {
         assert!(code.contains("pub struct OrderItemModel {"), "{code}");
         assert!(code.contains("pub code: String,"), "{code}");
         assert!(code.contains("pub remark: Option<String>,"), "{code}");
-        assert!(code.contains("pub fn from_row(row: &DbRow) -> Self {"), "{code}");
-        assert!(!code.contains("create_user"), "Model=False 的列不应进入模型类：{code}");
+        assert!(
+            code.contains("pub fn from_row(row: &DbRow) -> Self {"),
+            "{code}"
+        );
+        assert!(
+            !code.contains("create_user"),
+            "Model=False 的列不应进入模型类：{code}"
+        );
 
         // 接口（只定义契约；实体自带 inherent 访问器）
         let code = generate_interface(table);
         assert!(code.contains("pub trait IOrderItem {"), "{code}");
         assert!(code.contains("fn code(&self) -> &String;"), "{code}");
-        assert!(code.contains("fn set_code(&mut self, value: String);"), "{code}");
+        assert!(
+            code.contains("fn set_code(&mut self, value: String);"),
+            "{code}"
+        );
         assert!(
             !code.contains("impl IOrderItem for OrderItem"),
             "接口不再生成实现（字段封装后由实体提供 inherent 访问器）：{code}"
         );
-        assert!(!code.contains("create_user"), "Model=False 的列不应进入接口：{code}");
+        assert!(
+            !code.contains("create_user"),
+            "Model=False 的列不应进入接口：{code}"
+        );
 
         // 全量生成文件名
         assert_eq!(generate_all_models(&model)[0].0, "order_item_model.rs");
@@ -1426,10 +1546,7 @@ mod tests {
             code.contains("pub fn set_sex(&mut self, value: pek_rcode::membership::SexKinds)"),
             "{code}"
         );
-        assert!(
-            code.contains("self.sex as i32).into()"),
-            "{code}"
-        );
+        assert!(code.contains("self.sex as i32).into()"), "{code}");
         assert!(
             code.contains("self.menu.map(|v| v as i32).into()"),
             "{code}"

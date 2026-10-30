@@ -88,10 +88,7 @@ impl MysqlSession {
 
     /// 执行查询并构建结果集（owned / borrowed 两条参数入口共用）。
     fn query_with_values(&mut self, sql: &str, values: Vec<Value>) -> Result<RowSet> {
-        let Self {
-            conn,
-            column_cache,
-        } = self;
+        let Self { conn, column_cache } = self;
         let result = conn.exec_iter(sql, values).map_err(map_err)?;
 
         // 列名 + 列元信息按 SQL 缓存：分页/条件只有参数不同的同构查询不再每轮重建
@@ -279,10 +276,11 @@ fn parse_settings(cs: &ConnectionString) -> Result<MysqlSettings> {
     }
 
     let connect_timeout = match cs.get("timeout").or(cs.get("connect timeout")) {
-        Some(v) => Some(Duration::from_secs(
-            v.parse::<u64>()
-                .map_err(|e| Error::Model(format!("无效的 Timeout \"{v}\"：{e}")))?,
-        )),
+        Some(v) => {
+            Some(Duration::from_secs(v.parse::<u64>().map_err(|e| {
+                Error::Model(format!("无效的 Timeout \"{v}\"：{e}"))
+            })?))
+        }
         None => Some(Duration::from_secs(15)),
     };
 
@@ -499,7 +497,9 @@ fn mysql_to_dbvalue(value: Value, meta: &ValueMeta) -> DbValue {
             {
                 Some(dt) => DbValue::DateTime(dt),
                 // 非法日期（如 0000-00-00）退化为文本，保证不丢数据
-                None => DbValue::Text(format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{us:06}")),
+                None => DbValue::Text(format!(
+                    "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{us:06}"
+                )),
             }
         }
         Value::Time(neg, days, h, mi, s, us) => {
@@ -712,7 +712,9 @@ mod tests {
         assert!(opts.skip_domain_validation());
 
         // VerifyFull：全量校验；根证书写入
-        let opts = build_ssl_opts(&settings("Server=x;provider=mysql;SslMode=VerifyFull;SslCa=ca.pem"));
+        let opts = build_ssl_opts(&settings(
+            "Server=x;provider=mysql;SslMode=VerifyFull;SslCa=ca.pem",
+        ));
         assert!(!opts.accept_invalid_certs());
         assert!(!opts.skip_domain_validation());
         assert_eq!(opts.root_cert_path(), Some(std::path::Path::new("ca.pem")));
@@ -721,9 +723,15 @@ mod tests {
     #[test]
     fn value_binding_conversions() {
         assert!(matches!(dbvalue_to_mysql(&DbValue::Null), Value::NULL));
-        assert!(matches!(dbvalue_to_mysql(&DbValue::Bool(true)), Value::Int(1)));
+        assert!(matches!(
+            dbvalue_to_mysql(&DbValue::Bool(true)),
+            Value::Int(1)
+        ));
         assert!(matches!(dbvalue_to_mysql(&DbValue::Int(5)), Value::Int(5)));
-        assert!(matches!(dbvalue_to_mysql(&DbValue::Float(1.5)), Value::Double(_)));
+        assert!(matches!(
+            dbvalue_to_mysql(&DbValue::Float(1.5)),
+            Value::Double(_)
+        ));
 
         let d = "12.3400".parse::<rust_decimal::Decimal>().unwrap();
         match dbvalue_to_mysql(&DbValue::Decimal(d)) {
@@ -743,13 +751,28 @@ mod tests {
 
     #[test]
     fn value_reading_conversions() {
-        let text_meta = ValueMeta { is_bit: false, is_binary: false };
-        let blob_meta = ValueMeta { is_bit: false, is_binary: true };
-        let bit_meta = ValueMeta { is_bit: true, is_binary: true };
+        let text_meta = ValueMeta {
+            is_bit: false,
+            is_binary: false,
+        };
+        let blob_meta = ValueMeta {
+            is_bit: false,
+            is_binary: true,
+        };
+        let bit_meta = ValueMeta {
+            is_bit: true,
+            is_binary: true,
+        };
 
         assert!(mysql_to_dbvalue(Value::NULL, &text_meta).is_null());
-        assert_eq!(mysql_to_dbvalue(Value::Int(-3), &text_meta).as_i64(), Some(-3));
-        assert_eq!(mysql_to_dbvalue(Value::UInt(7), &text_meta).as_i64(), Some(7));
+        assert_eq!(
+            mysql_to_dbvalue(Value::Int(-3), &text_meta).as_i64(),
+            Some(-3)
+        );
+        assert_eq!(
+            mysql_to_dbvalue(Value::UInt(7), &text_meta).as_i64(),
+            Some(7)
+        );
         assert_eq!(
             mysql_to_dbvalue(Value::Bytes(b"hello".to_vec()), &text_meta).as_str(),
             Some("hello")
@@ -760,7 +783,10 @@ mod tests {
             DbValue::Blob(_)
         ));
         // BIT(1)：单字节 0x01 → 1
-        assert_eq!(mysql_to_dbvalue(Value::Bytes(vec![1]), &bit_meta).as_i64(), Some(1));
+        assert_eq!(
+            mysql_to_dbvalue(Value::Bytes(vec![1]), &bit_meta).as_i64(),
+            Some(1)
+        );
         // BIT(9)：0x01 0x00 → 256
         assert_eq!(
             mysql_to_dbvalue(Value::Bytes(vec![1, 0]), &bit_meta).as_i64(),

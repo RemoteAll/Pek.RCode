@@ -52,7 +52,12 @@ impl DbCache {
     }
 
     /// 读取缓存项（不存在或已过期返回 `None`）。
-    pub fn get(&self, dal: &Dal, session: &mut dyn SqlSession, key: &str) -> Result<Option<String>> {
+    pub fn get(
+        &self,
+        dal: &Dal,
+        session: &mut dyn SqlSession,
+        key: &str,
+    ) -> Result<Option<String>> {
         let Some(row) = self.find(dal, session, key)? else {
             return Ok(None);
         };
@@ -132,7 +137,11 @@ impl DbCache {
     /// 清除全部缓存项（保留表结构），返回删除行数。
     pub fn clear(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
         let kind = dal.kind();
-        let table = dal.table(&self.table)?.meta().effective_table_name().to_string();
+        let table = dal
+            .table(&self.table)?
+            .meta()
+            .effective_table_name()
+            .to_string();
         let sql = format!("DELETE FROM {}", kind.quote(&table));
         dal.log_sql(&sql);
         session.execute(&sql, &[])
@@ -141,7 +150,11 @@ impl DbCache {
     /// 删除已过期缓存项，返回删除行数（替代 C# 的定时清理）。
     pub fn remove_expired(&self, dal: &Dal, session: &mut dyn SqlSession) -> Result<u64> {
         let kind = dal.kind();
-        let table = dal.table(&self.table)?.meta().effective_table_name().to_string();
+        let table = dal
+            .table(&self.table)?
+            .meta()
+            .effective_table_name()
+            .to_string();
         let sql = format!(
             "DELETE FROM {} WHERE {} < {}",
             kind.quote(&table),
@@ -222,9 +235,7 @@ mod tests {
         let cache = DbCache::new("SysCache");
 
         assert!(!cache.contains(&dal, session.as_mut(), "k1").unwrap());
-        cache
-            .set(&dal, session.as_mut(), "k1", "v1", 60)
-            .unwrap();
+        cache.set(&dal, session.as_mut(), "k1", "v1", 60).unwrap();
         assert_eq!(
             cache.get(&dal, session.as_mut(), "k1").unwrap().as_deref(),
             Some("v1")
@@ -239,9 +250,7 @@ mod tests {
         assert!(cache.add(&dal, session.as_mut(), "k2", "v2", 60).unwrap());
 
         // set 覆盖
-        cache
-            .set(&dal, session.as_mut(), "k1", "v1b", 60)
-            .unwrap();
+        cache.set(&dal, session.as_mut(), "k1", "v1b", 60).unwrap();
         assert_eq!(
             cache.get(&dal, session.as_mut(), "k1").unwrap().as_deref(),
             Some("v1b")
@@ -260,12 +269,8 @@ mod tests {
         let mut session = dal.open_session().unwrap();
         let cache = DbCache::new("SysCache");
 
-        cache
-            .set(&dal, session.as_mut(), "old", "v", 60)
-            .unwrap();
-        cache
-            .set(&dal, session.as_mut(), "live", "v", 60)
-            .unwrap();
+        cache.set(&dal, session.as_mut(), "old", "v", 60).unwrap();
+        cache.set(&dal, session.as_mut(), "live", "v", 60).unwrap();
 
         // 手工把 old 的过期时间改成过去
         session
@@ -278,7 +283,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(cache.get(&dal, session.as_mut(), "old").unwrap(), None, "过期项不应返回");
+        assert_eq!(
+            cache.get(&dal, session.as_mut(), "old").unwrap(),
+            None,
+            "过期项不应返回"
+        );
         assert!(cache.get(&dal, session.as_mut(), "live").unwrap().is_some());
 
         // 清理过期项
@@ -304,10 +313,8 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-dbcache-{}-{stamp}-bad",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rcode-dbcache-{}-{stamp}-bad", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("bad.db");
         let model = EntityModel::parse(BAD_MODEL).unwrap();
@@ -320,9 +327,7 @@ mod tests {
 
         let mut session = dal.open_session().unwrap();
         let cache = DbCache::new("NoKey");
-        let err = cache
-            .set(&dal, session.as_mut(), "k", "v", 60)
-            .unwrap_err();
+        let err = cache.set(&dal, session.as_mut(), "k", "v", 60).unwrap_err();
         assert!(err.to_string().contains("单一字符串主键"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);

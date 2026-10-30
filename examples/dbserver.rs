@@ -115,7 +115,11 @@ fn main() {
     let kind = dal.kind().name().to_string();
     println!(
         "DbServer 已启动：http://{local}（数据库类型 {kind}，令牌 {}）",
-        if token.is_empty() { "<未设置>" } else { "<已设置>" }
+        if token.is_empty() {
+            "<未设置>"
+        } else {
+            "<已设置>"
+        }
     );
     // 就绪行（驱动宿主解析用；稳定单行 JSON 协议 v1）
     println!("{{\"event\":\"ready\",\"addr\":\"{local}\",\"kind\":\"{kind}\",\"protocol\":1}}");
@@ -301,7 +305,11 @@ fn handle(mut stream: TcpStream, dal: &Dal, service: &DbService) -> std::io::Res
                 Err(e) => respond_error(&mut stream, 500, &e.to_string()),
             }
         }
-        _ => respond_error(&mut stream, 404, "未知路由（支持 /Db/Login、/Db/Query、/Db/Execute、/Db/InsertAndGetIdentity、/Db/QueryCount、/Db/GetTables）"),
+        _ => respond_error(
+            &mut stream,
+            404,
+            "未知路由（支持 /Db/Login、/Db/Query、/Db/Execute、/Db/InsertAndGetIdentity、/Db/QueryCount、/Db/GetTables）",
+        ),
     }
 }
 
@@ -382,13 +390,23 @@ fn percent_decode(text: &str) -> String {
 
 /// 输出 JSON 应答。
 fn respond_json(stream: &mut TcpStream, status: u16, body: &Value) -> std::io::Result<()> {
-    respond(stream, status, "application/json", body.to_string().as_bytes())
+    respond(
+        stream,
+        status,
+        "application/json",
+        body.to_string().as_bytes(),
+    )
 }
 
 /// 输出错误应答（NewLife 信封 `{code, msg}`）。
 fn respond_error(stream: &mut TcpStream, status: u16, message: &str) -> std::io::Result<()> {
     let body = json!({ "code": status, "msg": message });
-    respond(stream, status, "application/json", body.to_string().as_bytes())
+    respond(
+        stream,
+        status,
+        "application/json",
+        body.to_string().as_bytes(),
+    )
 }
 
 /// 输出 HTTP 应答。

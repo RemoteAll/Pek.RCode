@@ -105,7 +105,11 @@ pub struct TxRegistry {
 impl fmt::Debug for TxRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let active = self.map.lock().map(|m| m.len()).unwrap_or(0);
-        write!(f, "TxRegistry(active={active}, timeout={}s)", self.timeout().as_secs())
+        write!(
+            f,
+            "TxRegistry(active={active}, timeout={}s)",
+            self.timeout().as_secs()
+        )
     }
 }
 
@@ -155,7 +159,9 @@ impl TxRegistry {
         let mut n = 0;
         for (id, slot) in expired {
             // 正在执行语句（锁被占）→ 说明它还活着，下一轮再收
-            let Ok(mut session) = slot.session.try_lock() else { continue };
+            let Ok(mut session) = slot.session.try_lock() else {
+                continue;
+            };
             let _ = session.rollback();
             drop(session);
             if let Ok(mut map) = self.map.lock() {
@@ -170,7 +176,9 @@ impl TxRegistry {
     fn lazy_sweep(&self) {
         let now = Instant::now();
         {
-            let Ok(mut last) = self.last_sweep.lock() else { return };
+            let Ok(mut last) = self.last_sweep.lock() else {
+                return;
+            };
             if let Some(t) = *last
                 && now.duration_since(t) < Self::SWEEP_INTERVAL
             {
@@ -218,8 +226,10 @@ impl DbService {
     /// <param name="token">令牌</param>
     /// <param name="databases">允许访问的数据库连接名</param>
     pub fn set_token(&mut self, token: &str, databases: &[&str]) {
-        self.tokens
-            .insert(token.to_string(), databases.iter().map(|s| s.to_string()).collect());
+        self.tokens.insert(
+            token.to_string(),
+            databases.iter().map(|s| s.to_string()).collect(),
+        );
     }
 
     /// 验证令牌是否可访问指定数据库（对齐 `ValidateToken`）。
@@ -323,7 +333,10 @@ impl DbService {
             return Err(Error::Argument("事务令牌不能为空".into()));
         }
         let slot = self.txs.get(id)?;
-        if !db.trim().is_empty() && !slot.db.trim().is_empty() && !slot.db.eq_ignore_ascii_case(db.trim()) {
+        if !db.trim().is_empty()
+            && !slot.db.trim().is_empty()
+            && !slot.db.eq_ignore_ascii_case(db.trim())
+        {
             return Err(Error::Db(format!(
                 "事务[{id}]属于数据源[{}]，不能用于[{db}]",
                 slot.db
@@ -336,7 +349,11 @@ impl DbService {
             .session
             .lock()
             .map_err(|_| Error::Db(format!("事务[{id}]的会话锁已中毒（上一次执行 panic）")))?;
-        if commit { session.commit() } else { session.rollback() }
+        if commit {
+            session.commit()
+        } else {
+            session.rollback()
+        }
     }
 
     /// 在「事务固定会话」或「新建会话」上执行闭包。
@@ -375,7 +392,12 @@ impl DbService {
     /// <param name="sql">SQL 语句</param>
     /// <param name="parameters">参数字典</param>
     /// <returns>结果集</returns>
-    pub fn query(&self, dal: &Dal, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<RowSet> {
+    pub fn query(
+        &self,
+        dal: &Dal,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<RowSet> {
         self.query_in(dal, None, sql, parameters)
     }
 
@@ -438,7 +460,12 @@ impl DbService {
     /// <param name="sql">SQL 语句</param>
     /// <param name="parameters">参数字典</param>
     /// <returns>受影响行数</returns>
-    pub fn execute(&self, dal: &Dal, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<u64> {
+    pub fn execute(
+        &self,
+        dal: &Dal,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<u64> {
         self.execute_in(dal, None, sql, parameters)
     }
 
@@ -643,7 +670,11 @@ impl DbClient {
     /// <param name="sql">SQL 语句</param>
     /// <param name="parameters">参数字典</param>
     /// <returns>结果集</returns>
-    pub fn query_rowset(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<RowSet> {
+    pub fn query_rowset(
+        &self,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<RowSet> {
         self.query_rowset_in(None, sql, parameters)
     }
 
@@ -723,7 +754,11 @@ impl DbClient {
     /// <param name="sql">SQL 语句</param>
     /// <param name="parameters">参数字典</param>
     /// <returns>自增主键值</returns>
-    pub fn insert_and_get_identity(&self, sql: &str, parameters: Option<&BTreeMap<String, Value>>) -> Result<i64> {
+    pub fn insert_and_get_identity(
+        &self,
+        sql: &str,
+        parameters: Option<&BTreeMap<String, Value>>,
+    ) -> Result<i64> {
         self.insert_and_get_identity_in(None, sql, parameters)
     }
 
@@ -1068,7 +1103,8 @@ pub fn rowset_from_json(value: &Value) -> Result<RowSet> {
 /// <param name="text">响应文本</param>
 /// <returns>数据部分的 JSON</returns>
 fn parse_envelope(text: &str) -> Result<Value> {
-    let value: Value = serde_json::from_str(text).map_err(|e| Error::Db(format!("响应解析失败：{e}")))?;
+    let value: Value =
+        serde_json::from_str(text).map_err(|e| Error::Db(format!("响应解析失败：{e}")))?;
     match value.get("code").and_then(Value::as_i64) {
         Some(0) | None => match value.get("data") {
             Some(data) => Ok(data.clone()),
@@ -1121,7 +1157,9 @@ fn percent_encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -1148,8 +1186,15 @@ mod tests {
 
     /// 建临时库。
     fn temp_dal(name: &str) -> (Dal, std::path::PathBuf) {
-        let stamp = chrono::Local::now().format("%H%M%S%.6f").to_string().replace('.', "");
-        let dir = std::env::temp_dir().join(format!("rcode-dbsvc-{}-{}-{name}", std::process::id(), stamp));
+        let stamp = chrono::Local::now()
+            .format("%H%M%S%.6f")
+            .to_string()
+            .replace('.', "");
+        let dir = std::env::temp_dir().join(format!(
+            "rcode-dbsvc-{}-{}-{name}",
+            std::process::id(),
+            stamp
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("test.db");
         let conn = format!("Data Source={};Provider=SQLite", db.display());
@@ -1189,7 +1234,12 @@ mod tests {
 
         // 执行插入（无参数）
         assert_eq!(
-            svc.execute(&dal, "INSERT INTO DH_User(Name, Enable) VALUES('a', 1)", None).unwrap(),
+            svc.execute(
+                &dal,
+                "INSERT INTO DH_User(Name, Enable) VALUES('a', 1)",
+                None
+            )
+            .unwrap(),
             1
         );
         // 带参数插入（按字母序绑定：Enable → ?1，Name → ?2）
@@ -1197,18 +1247,29 @@ mod tests {
         ps.insert("Enable".to_string(), json!(1));
         ps.insert("Name".to_string(), json!("b"));
         assert_eq!(
-            svc.execute(&dal, "INSERT INTO DH_User(Enable, Name) VALUES(?, ?)", Some(&ps)).unwrap(),
+            svc.execute(
+                &dal,
+                "INSERT INTO DH_User(Enable, Name) VALUES(?, ?)",
+                Some(&ps)
+            )
+            .unwrap(),
             1
         );
 
         // 查询
-        let set = svc.query(&dal, "SELECT Name FROM DH_User ORDER BY Id", None).unwrap();
+        let set = svc
+            .query(&dal, "SELECT Name FROM DH_User ORDER BY Id", None)
+            .unwrap();
         assert_eq!(set.len(), 2);
         assert_eq!(set.first().unwrap().get(0).unwrap().as_str(), Some("a"));
 
         // 自增标识
         let id = svc
-            .insert_and_get_identity(&dal, "INSERT INTO DH_User(Name, Enable) VALUES('c', 1)", None)
+            .insert_and_get_identity(
+                &dal,
+                "INSERT INTO DH_User(Name, Enable) VALUES('c', 1)",
+                None,
+            )
             .unwrap();
         assert!(id > 0);
 
@@ -1330,11 +1391,8 @@ mod tests {
         // 无命名占位符：按字典键序兼容绑定
         let mut ps = BTreeMap::new();
         ps.insert("Name".to_string(), json!("n"));
-        let (sql, values) = bind_forwarded(
-            DatabaseKind::Sqlite,
-            "SELECT * FROM T WHERE A=?",
-            Some(&ps),
-        );
+        let (sql, values) =
+            bind_forwarded(DatabaseKind::Sqlite, "SELECT * FROM T WHERE A=?", Some(&ps));
         assert_eq!(sql, "SELECT * FROM T WHERE A=?");
         assert_eq!(values, vec![DbValue::Text("n".into())]);
     }
@@ -1342,8 +1400,16 @@ mod tests {
     #[test]
     fn rowset_json_roundtrip() {
         let mut ps = RowSet::new(vec!["Id".into(), "Name".into(), "Score".into()]);
-        ps.push(vec![DbValue::Int(1), DbValue::Text("张三".into()), DbValue::Null]);
-        ps.push(vec![DbValue::Int(2), DbValue::Text("李四".into()), DbValue::Float(9.5)]);
+        ps.push(vec![
+            DbValue::Int(1),
+            DbValue::Text("张三".into()),
+            DbValue::Null,
+        ]);
+        ps.push(vec![
+            DbValue::Int(2),
+            DbValue::Text("李四".into()),
+            DbValue::Float(9.5),
+        ]);
 
         let value = rowset_to_json(&ps);
         assert_eq!(value["columns"][0], "Id");
@@ -1524,7 +1590,9 @@ mod tests {
         let client = DbClient::new(format!("http://127.0.0.1:{port}"), "Demo", Some("tk"));
 
         // 二进制应答 → RowSet
-        let back = client.query_rowset("SELECT Id,Name,Score FROM T", None).unwrap();
+        let back = client
+            .query_rowset("SELECT Id,Name,Score FROM T", None)
+            .unwrap();
         assert_eq!(back.columns.as_ref(), set.columns.as_ref());
         assert_eq!(back.rows[0].get(0), Some(&DbValue::Int(7)));
         assert_eq!(back.rows[0].get(1), Some(&DbValue::Text("张三".into())));
@@ -1590,10 +1658,19 @@ mod tests {
 
         let tx = svc.begin_tx(&dal, "Demo").unwrap();
         assert_eq!(svc.tx_count(), 1, "开启后应有一个活跃事务");
-        svc.execute_in(&dal, Some(&tx), "INSERT INTO TxProbe (Name) VALUES ('a')", None)
-            .unwrap();
+        svc.execute_in(
+            &dal,
+            Some(&tx),
+            "INSERT INTO TxProbe (Name) VALUES ('a')",
+            None,
+        )
+        .unwrap();
         // 事务内可见自己的未提交写（说明语句确实落在同一条连接上）
-        assert_eq!(probe_count(&svc, &dal, Some(&tx)), 1, "事务内应读到自己的写");
+        assert_eq!(
+            probe_count(&svc, &dal, Some(&tx)),
+            1,
+            "事务内应读到自己的写"
+        );
 
         svc.commit_tx("Demo", &tx).unwrap();
         assert_eq!(svc.tx_count(), 0, "提交后事务应被收取");
@@ -1609,8 +1686,13 @@ mod tests {
         probe_table(&svc, &dal);
 
         let tx = svc.begin_tx(&dal, "Demo").unwrap();
-        svc.execute_in(&dal, Some(&tx), "INSERT INTO TxProbe (Name) VALUES ('b')", None)
-            .unwrap();
+        svc.execute_in(
+            &dal,
+            Some(&tx),
+            "INSERT INTO TxProbe (Name) VALUES ('b')",
+            None,
+        )
+        .unwrap();
         assert_eq!(probe_count(&svc, &dal, Some(&tx)), 1);
 
         svc.rollback_tx("Demo", &tx).unwrap();
@@ -1654,9 +1736,15 @@ mod tests {
         let svc = DbService::new();
         probe_table(&svc, &dal);
 
-        assert!(svc.execute_in(&dal, Some("deadbeef"), "SELECT 1", None).is_err());
+        assert!(
+            svc.execute_in(&dal, Some("deadbeef"), "SELECT 1", None)
+                .is_err()
+        );
         assert!(svc.commit_tx("Demo", "").is_err(), "空令牌应报参数错误");
-        assert!(svc.rollback_tx("Demo", "deadbeef").is_err(), "不存在的令牌应报错");
+        assert!(
+            svc.rollback_tx("Demo", "deadbeef").is_err(),
+            "不存在的令牌应报错"
+        );
 
         let tx = svc.begin_tx(&dal, "Demo").unwrap();
         let wrong_db = svc.commit_tx("Other", &tx);
@@ -1675,8 +1763,13 @@ mod tests {
 
         svc.set_tx_timeout(1);
         let tx = svc.begin_tx(&dal, "Demo").unwrap();
-        svc.execute_in(&dal, Some(&tx), "INSERT INTO TxProbe (Name) VALUES ('z')", None)
-            .unwrap();
+        svc.execute_in(
+            &dal,
+            Some(&tx),
+            "INSERT INTO TxProbe (Name) VALUES ('z')",
+            None,
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(1200));
 
         assert_eq!(svc.sweep_txs(), 1, "空闲超时的事务应被回收");
@@ -1701,7 +1794,10 @@ mod tests {
             1,
         );
         let client = DbClient::new(format!("http://127.0.0.1:{port}"), "Demo", None);
-        let err = client.begin_tx().map(|_| ()).expect_err("404 应转为 Unsupported");
+        let err = client
+            .begin_tx()
+            .map(|_| ())
+            .expect_err("404 应转为 Unsupported");
         assert!(
             matches!(err, Error::Unsupported(_)),
             "应降级为 Unsupported（调用方据此回退无事务），实际：{err}"

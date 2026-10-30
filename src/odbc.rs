@@ -22,17 +22,17 @@
 //! - Access 不支持列清单探测（`sync_schema` 仅支持建表，不支持补列）
 //! - 写入受影响行数依赖驱动支持，无法获取时返回 0
 
-use odbc_api::buffers::TextRowSet;
-use odbc_api::{
-    ColumnDescription, Connection, ConnectionOptions, Cursor, DataType, Environment,
-    ResultSetMetadata,
-};
 use crate::dal::ConnectionString;
 use crate::dialect::DatabaseKind;
 use crate::error::{Error, Result};
 use crate::http::{LiteralStyle, inline_params};
 use crate::session::{RowSet, SqlSession};
 use crate::value::{DbValue, parse_datetime};
+use odbc_api::buffers::TextRowSet;
+use odbc_api::{
+    ColumnDescription, Connection, ConnectionOptions, Cursor, DataType, Environment,
+    ResultSetMetadata,
+};
 
 /// ODBC 会话（复用同一实现承载多个 provider）。
 pub struct OdbcSession {
@@ -47,8 +47,8 @@ impl OdbcSession {
     pub fn open(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Self> {
         let connection_string = build_connection_string(kind, conn_str)?;
 
-        let environment = Environment::new()
-            .map_err(|e| Error::Db(format!("初始化 ODBC 环境失败：{e}")))?;
+        let environment =
+            Environment::new().map_err(|e| Error::Db(format!("初始化 ODBC 环境失败：{e}")))?;
         // 泄漏环境以取得 'static 生命周期（每个会话约几百字节，随进程结束释放）
         let environment: &'static Environment = Box::leak(Box::new(environment));
         let conn = environment
@@ -107,14 +107,13 @@ fn build_connection_string(kind: DatabaseKind, cs: &ConnectionString) -> Result<
         }
         DatabaseKind::DaMeng => {
             let port = cs.get("port").unwrap_or("5236");
-            format!("DRIVER={{DM8 ODBC DRIVER}};SERVER={host};PORT={port};UID={user};PWD={password};")
+            format!(
+                "DRIVER={{DM8 ODBC DRIVER}};SERVER={host};PORT={port};UID={user};PWD={password};"
+            )
         }
         DatabaseKind::Iris => {
             let port = cs.get("port").unwrap_or("1972");
-            let namespace = cs
-                .get("database")
-                .or(cs.get("namespace"))
-                .unwrap_or("USER");
+            let namespace = cs.get("database").or(cs.get("namespace")).unwrap_or("USER");
             format!(
                 "DRIVER={{InterSystems IRIS ODBC35}};SERVER={host}:{port};NAMESPACE={namespace};UID={user};PWD={password};"
             )
@@ -293,12 +292,12 @@ impl SqlSession for OdbcSession {
     fn table_exists(&mut self, table: &str) -> Result<bool> {
         let upper = table.to_uppercase();
         let sql = match self.kind {
-            DatabaseKind::Db2 => format!(
-                "SELECT COUNT(*) FROM SYSCAT.TABLES WHERE TABNAME = '{upper}'"
-            ),
-            DatabaseKind::DaMeng => format!(
-                "SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = '{upper}'"
-            ),
+            DatabaseKind::Db2 => {
+                format!("SELECT COUNT(*) FROM SYSCAT.TABLES WHERE TABNAME = '{upper}'")
+            }
+            DatabaseKind::DaMeng => {
+                format!("SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = '{upper}'")
+            }
             DatabaseKind::Iris => format!(
                 "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME IN ('{table}', '{upper}')"
             ),
@@ -497,7 +496,8 @@ mod tests {
 
     #[test]
     fn connection_string_templates() {
-        let cs = ConnectionString::parse("Server=dm.local;Port=5236;Uid=SYSDBA;Pwd=***;provider=dameng");
+        let cs =
+            ConnectionString::parse("Server=dm.local;Port=5236;Uid=SYSDBA;Pwd=***;provider=dameng");
         let s = build_connection_string(DatabaseKind::DaMeng, &cs).unwrap();
         assert!(s.contains("DRIVER={DM8 ODBC DRIVER}"), "{s}");
         assert!(s.contains("SERVER=dm.local;PORT=5236"), "{s}");
@@ -528,22 +528,32 @@ mod tests {
             DbValue::Int(42)
         );
         assert_eq!(
-            odbc_cell_to_dbvalue(Some(b"12.3400"), &DataType::Decimal { precision: 18, scale: 4 }),
+            odbc_cell_to_dbvalue(
+                Some(b"12.3400"),
+                &DataType::Decimal {
+                    precision: 18,
+                    scale: 4
+                }
+            ),
             DbValue::Decimal("12.3400".parse().unwrap())
         );
         assert_eq!(
             odbc_cell_to_dbvalue(Some(b"1"), &DataType::Bit),
             DbValue::Bool(true)
         );
-        assert!(odbc_cell_to_dbvalue(
-            Some(b"2026-09-27 10:30:00"),
-            &DataType::Timestamp { precision: 6 }
-        )
-        .as_datetime()
-        .is_some());
-        assert!(odbc_cell_to_dbvalue(Some(b"2026-09-27"), &DataType::Date)
+        assert!(
+            odbc_cell_to_dbvalue(
+                Some(b"2026-09-27 10:30:00"),
+                &DataType::Timestamp { precision: 6 }
+            )
             .as_datetime()
-            .is_some());
+            .is_some()
+        );
+        assert!(
+            odbc_cell_to_dbvalue(Some(b"2026-09-27"), &DataType::Date)
+                .as_datetime()
+                .is_some()
+        );
         assert_eq!(
             odbc_cell_to_dbvalue(Some(b"\x01\x02"), &DataType::Binary { length: None }),
             DbValue::Blob(vec![1, 2])

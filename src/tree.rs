@@ -98,7 +98,10 @@ pub fn full_path(rows: &[TreeRow], id: i32, separator: &str, include_self: bool)
     }
     let mut names: Vec<&str> = Vec::with_capacity(chain.len());
     for cid in &chain {
-        let name = rows.iter().find(|r| r.id == *cid).map(|r| r.name.as_str())?;
+        let name = rows
+            .iter()
+            .find(|r| r.id == *cid)
+            .map(|r| r.name.as_str())?;
         names.push(name);
     }
     Some(names.join(separator))
@@ -188,7 +191,15 @@ impl TreeSetting {
             .find(|n| table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(n)))
             .map(|n| n.to_string());
 
-        Some(TreeSetting { key, parent, sort, name, text, big_sort: true, max_depth: 0 })
+        Some(TreeSetting {
+            key,
+            parent,
+            sort,
+            name,
+            text,
+            big_sort: true,
+            max_depth: 0,
+        })
     }
 
     /// 表声明为树（`BaseType` 含 `EntityTree`）**且具备父键列**时返回设置。
@@ -254,7 +265,10 @@ impl TreeIndex {
     pub fn from_rowset(setting: TreeSetting, rows: &RowSet) -> Self {
         let mut nodes: Vec<TreeNode> = Vec::with_capacity(rows.rows.len());
         for row in &rows.rows {
-            let key = row.get_by_name(&setting.key).and_then(|v| v.as_i64()).unwrap_or(0);
+            let key = row
+                .get_by_name(&setting.key)
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             if key == 0 {
                 continue; // 无主键的行不参与树
             }
@@ -283,7 +297,13 @@ impl TreeIndex {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&name)
                 .to_string();
-            nodes.push(TreeNode { key, parent, sort, name, text });
+            nodes.push(TreeNode {
+                key,
+                parent,
+                sort,
+                name,
+                text,
+            });
         }
 
         let mut by_key: HashMap<i64, usize> = HashMap::with_capacity(nodes.len());
@@ -308,7 +328,12 @@ impl TreeIndex {
         }
 
         // 排序：先排序列、再主键（C#）；BigSort=true 时排序值大的在前
-        fn sort_idx(nodes: &[TreeNode], big_sort: bool, a: &usize, b: &usize) -> std::cmp::Ordering {
+        fn sort_idx(
+            nodes: &[TreeNode],
+            big_sort: bool,
+            a: &usize,
+            b: &usize,
+        ) -> std::cmp::Ordering {
             let (na, nb) = (&nodes[*a], &nodes[*b]);
             if na.sort == nb.sort {
                 na.key.cmp(&nb.key)
@@ -324,7 +349,14 @@ impl TreeIndex {
         }
         roots.sort_by(|a, b| sort_idx(&nodes, big, a, b));
 
-        Self { setting, nodes, by_key, children, roots, orphans }
+        Self {
+            setting,
+            nodes,
+            by_key,
+            children,
+            roots,
+            orphans,
+        }
     }
 
     /// 加载整表并建索引（一次 `SELECT`，只取树需要的列）。
@@ -336,10 +368,14 @@ impl TreeIndex {
             .table(table_name)
             .ok_or_else(|| crate::Error::Model(format!("表 {table_name} 不存在")))?;
         let setting = TreeSetting::from_table(meta).ok_or_else(|| {
-            crate::Error::Model(format!("表 {table_name} 不是树形表（缺少 Parent{{主键}} 列）"))
+            crate::Error::Model(format!(
+                "表 {table_name} 不是树形表（缺少 Parent{{主键}} 列）"
+            ))
         })?;
 
-        let mut q = Query::new().column(setting.key.as_str()).column(setting.parent.as_str());
+        let mut q = Query::new()
+            .column(setting.key.as_str())
+            .column(setting.parent.as_str());
         if let Some(c) = setting.sort.as_deref() {
             q = q.column(c);
         }
@@ -526,7 +562,9 @@ impl TreeIndex {
         if root == key {
             return true;
         }
-        self.descendants(root, false, None, -1).iter().any(|n| n.key == key)
+        self.descendants(root, false, None, -1)
+            .iter()
+            .any(|n| n.key == key)
     }
 
     /// 校验「把 `key` 挂到 `parent` 下」是否合法（对齐 C# `Valid`）：
@@ -588,10 +626,8 @@ pub fn move_node(
         .map_err(crate::Error::Validation)?;
 
     let parent_col = index.setting().parent.clone();
-    let values: Vec<(&str, DbValue)> = vec![(
-        parent_col.as_str(),
-        DbValue::Int(new_parent.unwrap_or(0)),
-    )];
+    let values: Vec<(&str, DbValue)> =
+        vec![(parent_col.as_str(), DbValue::Int(new_parent.unwrap_or(0)))];
     dal.table(table_name)?
         .update_by_pk(session, &values, &[DbValue::Int(key)])
 }
@@ -690,7 +726,10 @@ mod tests {
         // 节点不存在
         assert_eq!(ancestor_ids(&rows, 9, true), Vec::<i32>::new());
 
-        assert_eq!(full_path(&rows, 3, "\\", true).as_deref(), Some("根\\分支\\叶子"));
+        assert_eq!(
+            full_path(&rows, 3, "\\", true).as_deref(),
+            Some("根\\分支\\叶子")
+        );
         assert_eq!(full_path(&rows, 3, "/", false).as_deref(), Some("根/分支"));
         assert_eq!(full_path(&rows, 3, "/", true), Some("根/分支/叶子".into()));
         assert_eq!(full_path(&rows, 9, "/", true), None);
@@ -765,7 +804,11 @@ mod tests {
     fn tree_roots_follow_big_sort() {
         let t = sample_tree();
         let roots: Vec<i64> = t.roots().iter().map(|n| n.key).collect();
-        assert_eq!(roots, vec![1, 5], "BigSort=true：sort 大的在前（A=10 先于 B=5）");
+        assert_eq!(
+            roots,
+            vec![1, 5],
+            "BigSort=true：sort 大的在前（A=10 先于 B=5）"
+        );
     }
 
     #[test]
@@ -779,20 +822,34 @@ mod tests {
     #[test]
     fn tree_descendants_are_depth_first_preorder() {
         let t = sample_tree();
-        let all: Vec<i64> = t.descendants(1, false, None, -1).iter().map(|n| n.key).collect();
+        let all: Vec<i64> = t
+            .descendants(1, false, None, -1)
+            .iter()
+            .map(|n| n.key)
+            .collect();
         assert_eq!(all, vec![3, 2, 4], "深度优先先序：A2 → A1 → A1a");
 
-        let with_self: Vec<i64> =
-            t.descendants(1, true, None, -1).iter().map(|n| n.key).collect();
+        let with_self: Vec<i64> = t
+            .descendants(1, true, None, -1)
+            .iter()
+            .map(|n| n.key)
+            .collect();
         assert_eq!(with_self, vec![1, 3, 2, 4]);
 
         // 排除 A2 整棵子树
-        let no_a2: Vec<i64> =
-            t.descendants(1, true, Some(3), -1).iter().map(|n| n.key).collect();
+        let no_a2: Vec<i64> = t
+            .descendants(1, true, Some(3), -1)
+            .iter()
+            .map(|n| n.key)
+            .collect();
         assert_eq!(no_a2, vec![1, 2, 4]);
 
         // 限深 2：只到 A2/A1 层，不含 A1a
-        let depth2: Vec<i64> = t.descendants(1, true, None, 2).iter().map(|n| n.key).collect();
+        let depth2: Vec<i64> = t
+            .descendants(1, true, None, 2)
+            .iter()
+            .map(|n| n.key)
+            .collect();
         assert_eq!(depth2, vec![1, 3, 2]);
     }
 
@@ -825,7 +882,10 @@ mod tests {
     fn tree_validate_parent_rejects_self_and_descendant() {
         let t = sample_tree();
         assert!(t.validate_parent(2, Some(2)).is_err(), "上级不能是自己");
-        assert!(t.validate_parent(2, Some(4)).is_err(), "上级不能是自己的子孙");
+        assert!(
+            t.validate_parent(2, Some(4)).is_err(),
+            "上级不能是自己的子孙"
+        );
         assert!(t.validate_parent(2, Some(5)).is_ok());
         assert!(t.validate_parent(2, None).is_ok());
     }
@@ -841,10 +901,7 @@ mod tests {
 
     #[test]
     fn tree_orphans_listed_under_root() {
-        let t = TreeIndex::from_rowset(
-            setting(),
-            &rowset(&[(1, 0, 1, "A"), (2, 999, 2, "X")]),
-        );
+        let t = TreeIndex::from_rowset(setting(), &rowset(&[(1, 0, 1, "A"), (2, 999, 2, "X")]));
         assert_eq!(t.roots().len(), 1);
         assert_eq!(t.orphans().len(), 1);
         assert_eq!(t.children(None).len(), 2, "顶级列表附带无头节点（同 C#）");
@@ -903,15 +960,21 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("pek-tree-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let conn = format!("Data Source={};Provider=SQLite", dir.join("tree.db").display());
+        let conn = format!(
+            "Data Source={};Provider=SQLite",
+            dir.join("tree.db").display()
+        );
 
         let dal = Dal::open_with_model(&conn, model).unwrap();
         dal.sync_schema().unwrap();
         let mut s = dal.open_session().unwrap();
 
-        for (id, parent, sort, name) in
-            [(1i64, 0i64, 10i64, "A"), (2, 1, 20, "A1"), (3, 1, 30, "A2"), (4, 2, 40, "A1a")]
-        {
+        for (id, parent, sort, name) in [
+            (1i64, 0i64, 10i64, "A"),
+            (2, 1, 20, "A1"),
+            (3, 1, 30, "A2"),
+            (4, 2, 40, "A1a"),
+        ] {
             dal.table("DeviceGroup")
                 .unwrap()
                 .insert(
@@ -943,7 +1006,10 @@ mod tests {
         assert_eq!(idx2.full_path(4, true, "/"), "A/A2/A1a");
 
         // 4) 同级上移：BigSort 降序下 A2(3,sort30) 已排首位 → 上移无效；A1(2) 上移与它交换 Sort
-        assert!(!up(&dal, &mut *s, "DeviceGroup", &idx2, 3).unwrap(), "已在首位应返回 false");
+        assert!(
+            !up(&dal, &mut *s, "DeviceGroup", &idx2, 3).unwrap(),
+            "已在首位应返回 false"
+        );
         assert!(up(&dal, &mut *s, "DeviceGroup", &idx2, 2).unwrap());
         let idx3 = TreeIndex::load(&dal, &mut *s, "DeviceGroup").unwrap();
         let kids3: Vec<i64> = idx3.children(Some(1)).iter().map(|n| n.key).collect();

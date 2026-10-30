@@ -78,7 +78,10 @@ impl Dal {
         let query = match kind {
             DatabaseKind::MySql => format!("SHOW DATABASES LIKE '{}'", escape_like(&name)),
             DatabaseKind::SqlServer => {
-                format!("SELECT * FROM sysdatabases WHERE name = N'{}'", escape_text(&name))
+                format!(
+                    "SELECT * FROM sysdatabases WHERE name = N'{}'",
+                    escape_text(&name)
+                )
             }
             DatabaseKind::PostgreSql => format!(
                 "SELECT datname FROM pg_database WHERE datname = '{}'",
@@ -159,7 +162,10 @@ impl Dal {
             ),
             DatabaseKind::SqlServer => match file {
                 // C#：无数据目录时 `CREATE DATABASE x COLLATE Chinese_PRC_CI_AS`；给了文件按附加路径处理
-                None => format!("CREATE DATABASE {} COLLATE Chinese_PRC_CI_AS", kind.quote(name)),
+                None => format!(
+                    "CREATE DATABASE {} COLLATE Chinese_PRC_CI_AS",
+                    kind.quote(name)
+                ),
                 Some(file) => format!(
                     "CREATE DATABASE {} ON (NAME = N'{}', FILENAME = N'{}')",
                     kind.quote(name),
@@ -173,7 +179,10 @@ impl Dal {
                 pg_create_database_sql(kind, name, self.connection_string().provider())
             }
             DatabaseKind::Oracle => {
-                format!("CREATE DATABASE {} CHARACTER SET AL32UTF8", kind.quote(name))
+                format!(
+                    "CREATE DATABASE {} CHARACTER SET AL32UTF8",
+                    kind.quote(name)
+                )
             }
             DatabaseKind::Hana | DatabaseKind::Iris => format!(
                 "Create Database If Not Exists {} DEFAULT CHARACTER SET utf8mb4",
@@ -248,14 +257,13 @@ impl Dal {
             | DatabaseKind::Hana
             | DatabaseKind::Iris
             | DatabaseKind::TDengine => {
-                self.execute_ddl(&format!(
-                    "Drop Database If Exists {}",
-                    kind.quote(name)
-                ))?;
+                self.execute_ddl(&format!("Drop Database If Exists {}", kind.quote(name)))?;
                 Ok(true)
             }
             DatabaseKind::DuckDb | DatabaseKind::Sqlite => unreachable!("文件型库已在上方处理"),
-            DatabaseKind::InfluxDb | DatabaseKind::Firebird | DatabaseKind::MongoDb
+            DatabaseKind::InfluxDb
+            | DatabaseKind::Firebird
+            | DatabaseKind::MongoDb
             | DatabaseKind::Access => Err(Error::Unsupported(format!(
                 "{kind:?} 不支持经 SQL 删库（InfluxDB 用 HTTP API、Firebird 连接后 DROP DATABASE、MongoDB 用客户端）"
             ))),
@@ -659,11 +667,8 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-meta-{}-{}-{tag}",
-            std::process::id(),
-            stamp
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rcode-meta-{}-{}-{tag}", std::process::id(), stamp));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("test.db");
         let conn = format!("Data Source={};Provider=SQLite", db.display());
@@ -738,12 +743,36 @@ mod tests {
     fn ddl_sql_texts_match_csharp() {
         // 各库建库/删库语句（对齐 DH.NCode 覆写）
         let cases: Vec<(DatabaseKind, &str, &str)> = vec![
-            (DatabaseKind::MySql, "testdb", "Create Database If Not Exists `testdb` DEFAULT CHARACTER SET utf8mb4"),
-            (DatabaseKind::PostgreSql, "testdb", "Create Database If Not Exists \"testdb\" ENCODING \"UTF8\""),
-            (DatabaseKind::SqlServer, "testdb", "CREATE DATABASE [testdb] COLLATE Chinese_PRC_CI_AS"),
-            (DatabaseKind::Oracle, "testdb", "CREATE DATABASE \"testdb\" CHARACTER SET AL32UTF8"),
-            (DatabaseKind::Hana, "testdb", "Create Database If Not Exists \"testdb\" DEFAULT CHARACTER SET utf8mb4"),
-            (DatabaseKind::TDengine, "testdb", "Create Database If Not Exists `testdb`"),
+            (
+                DatabaseKind::MySql,
+                "testdb",
+                "Create Database If Not Exists `testdb` DEFAULT CHARACTER SET utf8mb4",
+            ),
+            (
+                DatabaseKind::PostgreSql,
+                "testdb",
+                "Create Database If Not Exists \"testdb\" ENCODING \"UTF8\"",
+            ),
+            (
+                DatabaseKind::SqlServer,
+                "testdb",
+                "CREATE DATABASE [testdb] COLLATE Chinese_PRC_CI_AS",
+            ),
+            (
+                DatabaseKind::Oracle,
+                "testdb",
+                "CREATE DATABASE \"testdb\" CHARACTER SET AL32UTF8",
+            ),
+            (
+                DatabaseKind::Hana,
+                "testdb",
+                "Create Database If Not Exists \"testdb\" DEFAULT CHARACTER SET utf8mb4",
+            ),
+            (
+                DatabaseKind::TDengine,
+                "testdb",
+                "Create Database If Not Exists `testdb`",
+            ),
         ];
         for (kind, name, expect) in cases {
             let sql = match kind {
@@ -753,10 +782,16 @@ mod tests {
                 ),
                 DatabaseKind::PostgreSql => pg_create_database_sql(kind, name, None),
                 DatabaseKind::SqlServer => {
-                    format!("CREATE DATABASE {} COLLATE Chinese_PRC_CI_AS", kind.quote(name))
+                    format!(
+                        "CREATE DATABASE {} COLLATE Chinese_PRC_CI_AS",
+                        kind.quote(name)
+                    )
                 }
                 DatabaseKind::Oracle => {
-                    format!("CREATE DATABASE {} CHARACTER SET AL32UTF8", kind.quote(name))
+                    format!(
+                        "CREATE DATABASE {} CHARACTER SET AL32UTF8",
+                        kind.quote(name)
+                    )
                 }
                 DatabaseKind::Hana | DatabaseKind::Iris => format!(
                     "Create Database If Not Exists {} DEFAULT CHARACTER SET utf8mb4",

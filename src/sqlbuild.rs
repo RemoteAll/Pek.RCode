@@ -121,7 +121,10 @@ pub fn insert_sql_owned_named<S: AsRef<str>>(
             .iter()
             .map(|(name, value)| (name.as_ref(), value.clone()))
             .collect();
-        return Ok((influx_line_protocol(table, table_name, &borrowed)?, Vec::new()));
+        return Ok((
+            influx_line_protocol(table, table_name, &borrowed)?,
+            Vec::new(),
+        ));
     }
 
     // 序列型自增（Oracle/DB2/Firebird，XCode 约定 SEQ_{表名}）：未显式提供自增列时补序列表达式
@@ -129,9 +132,11 @@ pub fn insert_sql_owned_named<S: AsRef<str>>(
     let add_sequence = matches!(
         kind,
         DatabaseKind::Oracle | DatabaseKind::Db2 | DatabaseKind::Firebird
-    ) && identity_name
-        .as_ref()
-        .is_some_and(|name| !fields.iter().any(|(field, _)| field.as_ref().eq_ignore_ascii_case(name)));
+    ) && identity_name.as_ref().is_some_and(|name| {
+        !fields
+            .iter()
+            .any(|(field, _)| field.as_ref().eq_ignore_ascii_case(name))
+    });
 
     let mut columns_sql = String::with_capacity(fields.len() * 16);
     let mut marks_sql = String::with_capacity(fields.len() * 4);
@@ -209,7 +214,17 @@ pub fn multi_write_sql_named(
     rows: usize,
     mode: BatchWriteMode,
 ) -> Result<String> {
-    multi_write_impl(kind, table, table_name, columns, rows, mode, None, None, &[])
+    multi_write_impl(
+        kind,
+        table,
+        table_name,
+        columns,
+        rows,
+        mode,
+        None,
+        None,
+        &[],
+    )
 }
 
 /// 组装多行 Upsert，并**指定冲突列**（通常是某个唯一索引列，如业务主键 `DeviceId`）。
@@ -324,7 +339,9 @@ fn multi_write_impl(
             }
         },
         BatchWriteMode::Replace => match kind {
-            DatabaseKind::Sqlite | DatabaseKind::DuckDb => ("INSERT OR REPLACE INTO", String::new()),
+            DatabaseKind::Sqlite | DatabaseKind::DuckDb => {
+                ("INSERT OR REPLACE INTO", String::new())
+            }
             DatabaseKind::MySql => ("REPLACE INTO", String::new()),
             _ => {
                 return Err(Error::Unsupported(format!(
@@ -475,7 +492,14 @@ pub fn insert_multi_sql_named(
     columns: &[&str],
     rows: usize,
 ) -> Result<String> {
-    multi_write_sql_named(kind, table, table_name, columns, rows, BatchWriteMode::Insert)
+    multi_write_sql_named(
+        kind,
+        table,
+        table_name,
+        columns,
+        rows,
+        BatchWriteMode::Insert,
+    )
 }
 
 /// InfluxDB 行协议：`measurement,tag=.. field=.. timestamp`。
@@ -513,7 +537,10 @@ fn influx_line_protocol(
         if col.primary_key || col.master {
             // tag：值不能为 NULL（NULL 时跳过该 tag）
             if !value.is_null() {
-                line.push_str(&format!(",{key}={}", escape_influx(&influx_tag_value(value))));
+                line.push_str(&format!(
+                    ",{key}={}",
+                    escape_influx(&influx_tag_value(value))
+                ));
             }
         } else {
             if !values.is_empty() {
@@ -791,8 +818,7 @@ pub fn update_by_pk_sql_owned_named<S: AsRef<str>>(
         params.push(value);
     }
 
-    let mut where_sql =
-        String::with_capacity(pk_names.len() * 16 + expected.len() * 18);
+    let mut where_sql = String::with_capacity(pk_names.len() * 16 + expected.len() * 18);
     for (index, (name, value)) in pk_names.iter().zip(pk_values.iter()).enumerate() {
         if index > 0 {
             where_sql.push_str(" AND ");
@@ -863,8 +889,7 @@ pub fn update_by_pk_sql_named(
         params.push(value.clone());
     }
 
-    let mut where_sql =
-        String::with_capacity(pk_names.len() * 16 + expected.len() * 18);
+    let mut where_sql = String::with_capacity(pk_names.len() * 16 + expected.len() * 18);
     for (index, (name, value)) in pk_names.iter().zip(pk_values.iter()).enumerate() {
         if index > 0 {
             where_sql.push_str(" AND ");
@@ -1079,7 +1104,13 @@ pub fn select_sql_named(
     // 分页优先于 offset/limit；offset 无 limit 时按"跳到末尾取全部"处理（BIGINT 上限）
     if paging {
         let offset = (query.page_index - 1) * query.page_size;
-        sql = kind.apply_paging_with_style(&sql, &order_sql, offset, query.page_size, query.page_style);
+        sql = kind.apply_paging_with_style(
+            &sql,
+            &order_sql,
+            offset,
+            query.page_size,
+            query.page_style,
+        );
     } else if let Some(offset) = query.offset {
         let size = query.limit.unwrap_or(i64::MAX as usize);
         sql = kind.apply_paging_with_style(&sql, &order_sql, offset, size, query.page_style);
@@ -1196,8 +1227,7 @@ pub fn increment_sql_owned_named<S: AsRef<str>>(
         params.push(value);
     }
 
-    let mut sql =
-        String::with_capacity(16 + table_name.len() + set_sql.len() + 48);
+    let mut sql = String::with_capacity(16 + table_name.len() + set_sql.len() + 48);
     sql.push_str("UPDATE ");
     kind.push_quoted(&mut sql, table_name);
     sql.push_str(" SET ");
@@ -1234,7 +1264,13 @@ mod tests {
         let (sql, params) = insert_sql(
             DatabaseKind::Sqlite,
             &t,
-            &[("Code", "A1".into()), ("Amount", "10.5".parse::<rust_decimal::Decimal>().unwrap().into())],
+            &[
+                ("Code", "A1".into()),
+                (
+                    "Amount",
+                    "10.5".parse::<rust_decimal::Decimal>().unwrap().into(),
+                ),
+            ],
         )
         .unwrap();
         assert_eq!(
@@ -1374,7 +1410,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            sql.contains("ON DUPLICATE KEY UPDATE `Code`=VALUES(`Code`), `Amount`=VALUES(`Amount`)"),
+            sql.contains(
+                "ON DUPLICATE KEY UPDATE `Code`=VALUES(`Code`), `Amount`=VALUES(`Amount`)"
+            ),
             "{sql}"
         );
 
@@ -1449,7 +1487,10 @@ mod tests {
         // SQL Server：DELETE TOP (n)
         let (sql, _) =
             delete_batched_sql_named(DatabaseKind::SqlServer, "DH_Order", &filter, 100).unwrap();
-        assert_eq!(sql, "DELETE TOP (100) FROM [DH_Order] WHERE ([Status] = @p0)");
+        assert_eq!(
+            sql,
+            "DELETE TOP (100) FROM [DH_Order] WHERE ([Status] = @p0)"
+        );
 
         // PostgreSQL：ctid 子查询
         let (sql, _) =
@@ -1479,13 +1520,9 @@ mod tests {
         );
 
         // 无 WHERE：全表分批删除（不带 WHERE 子句）
-        let (sql, params) = delete_batched_sql_named(
-            DatabaseKind::MySql,
-            "DH_Order",
-            &Where::default(),
-            7,
-        )
-        .unwrap();
+        let (sql, params) =
+            delete_batched_sql_named(DatabaseKind::MySql, "DH_Order", &Where::default(), 7)
+                .unwrap();
         assert_eq!(sql, "DELETE FROM `DH_Order` LIMIT 7");
         assert!(params.is_empty());
 
@@ -1524,9 +1561,13 @@ mod tests {
     fn update_generation_with_params_order() {
         let t = table();
         let filter = Where::new().eq("Id", 7);
-        let (sql, params) =
-            update_sql(DatabaseKind::SqlServer, &t, &[("Status", 2.into()), ("Code", "B".into())], &filter)
-                .unwrap();
+        let (sql, params) = update_sql(
+            DatabaseKind::SqlServer,
+            &t,
+            &[("Status", 2.into()), ("Code", "B".into())],
+            &filter,
+        )
+        .unwrap();
         assert_eq!(
             sql,
             "UPDATE [DH_Order] SET [Status] = @p0, [Code] = @p1 WHERE ([Id] = @p2)"
@@ -1545,10 +1586,19 @@ mod tests {
     #[test]
     fn count_and_select_with_paging() {
         let t = table();
-        let (sql, _) = count_sql(DatabaseKind::Sqlite, &t, Some(&Where::new().eq("Status", 1)));
-        assert_eq!(sql, "SELECT COUNT(*) FROM \"DH_Order\" WHERE (\"Status\" = ?)");
+        let (sql, _) = count_sql(
+            DatabaseKind::Sqlite,
+            &t,
+            Some(&Where::new().eq("Status", 1)),
+        );
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM \"DH_Order\" WHERE (\"Status\" = ?)"
+        );
 
-        let q = Query::new().filter(Where::new().eq("Status", 1)).page(2, 10);
+        let q = Query::new()
+            .filter(Where::new().eq("Status", 1))
+            .page(2, 10);
         let (sql, params) = select_sql(DatabaseKind::Sqlite, &t, &q);
         assert_eq!(
             sql,
@@ -1567,7 +1617,10 @@ mod tests {
     #[test]
     fn select_expression_and_take() {
         let t = table();
-        let q = Query::new().column("Status").column("COUNT(*) AS Cnt").take(5);
+        let q = Query::new()
+            .column("Status")
+            .column("COUNT(*) AS Cnt")
+            .take(5);
         let (sql, _) = select_sql(DatabaseKind::Sqlite, &t, &q);
         assert_eq!(
             sql,
@@ -1580,9 +1633,14 @@ mod tests {
         let t = table();
 
         // 默认风格仍为 2012+ OFFSET..FETCH（与 DH.NCode 现行行为一致）
-        let q = Query::new().filter(Where::new().eq("Status", 1)).page(3, 10);
+        let q = Query::new()
+            .filter(Where::new().eq("Status", 1))
+            .page(3, 10);
         let (sql, _) = select_sql(DatabaseKind::SqlServer, &t, &q);
-        assert!(sql.contains("OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY"), "{sql}");
+        assert!(
+            sql.contains("OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY"),
+            "{sql}"
+        );
 
         // 切换 MSPageSplit 的 ROW_NUMBER 风格（SQL Server 2005/2008）
         let q = q.page_style(crate::dialect::PageStyle::RowNumber);
@@ -1668,10 +1726,6 @@ mod tests {
             &[("Code", "A".into())],
         )
         .unwrap();
-        assert_eq!(
-            sql,
-            "INSERT INTO \"DH_Order_202609\" (\"Code\") VALUES (?)"
-        );
+        assert_eq!(sql, "INSERT INTO \"DH_Order_202609\" (\"Code\") VALUES (?)");
     }
 }
-

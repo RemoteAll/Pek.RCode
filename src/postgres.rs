@@ -53,7 +53,9 @@ impl PostgresSession {
         let config = build_config(&settings);
 
         let client = if settings.ssl_mode == PgSslMode::Disable {
-            config.connect(NoTls).map_err(|e| connect_error(&settings, e))?
+            config
+                .connect(NoTls)
+                .map_err(|e| connect_error(&settings, e))?
         } else {
             connect_with_tls(&config, &settings)?
         };
@@ -137,7 +139,9 @@ fn parse_settings(cs: &ConnectionString) -> Result<PostgresSettings> {
     // 客户端证书：rustls 后端支持 PEM；native-tls 仅 PKCS#12，明确报错而非静默忽略
     #[cfg(feature = "tls-rustls")]
     let (ssl_client_cert, ssl_client_key) = (
-        cs.get("ssl certificate").or(cs.get("sslcert")).map(str::to_string),
+        cs.get("ssl certificate")
+            .or(cs.get("sslcert"))
+            .map(str::to_string),
         cs.get("ssl key").or(cs.get("sslkey")).map(str::to_string),
     );
     #[cfg(not(feature = "tls-rustls"))]
@@ -208,10 +212,11 @@ fn parse_settings(cs: &ConnectionString) -> Result<PostgresSettings> {
         .to_string();
 
     let connect_timeout = match cs.get("timeout").or(cs.get("connect timeout")) {
-        Some(v) => Some(Duration::from_secs(
-            v.parse::<u64>()
-                .map_err(|e| Error::Model(format!("无效的 Timeout \"{v}\"：{e}")))?,
-        )),
+        Some(v) => {
+            Some(Duration::from_secs(v.parse::<u64>().map_err(|e| {
+                Error::Model(format!("无效的 Timeout \"{v}\"：{e}"))
+            })?))
+        }
         None => Some(Duration::from_secs(15)),
     };
 
@@ -262,7 +267,9 @@ fn build_config(settings: &PostgresSettings) -> PgConfig {
 /// 如 `Search Path=tenant1, public` → `-c search_path="tenant1, public"`。
 fn search_path_options(value: &str) -> String {
     let v = value.trim();
-    if v.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\') {
+    if v.chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+    {
         format!(
             "-c search_path=\"{}\"",
             v.replace('\\', "\\\\").replace('"', "\\\"")
@@ -360,9 +367,9 @@ fn build_rustls_config(settings: &PostgresSettings) -> Result<rustls::ClientConf
             match &settings.ssl_root_cert {
                 Some(path) => {
                     for cert in load_pem_certs(path)? {
-                        roots.add(cert).map_err(|e| {
-                            Error::Model(format!("根证书不受信任（{path}）：{e}"))
-                        })?;
+                        roots
+                            .add(cert)
+                            .map_err(|e| Error::Model(format!("根证书不受信任（{path}）：{e}")))?;
                     }
                 }
                 None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
@@ -386,7 +393,8 @@ fn build_rustls_config(settings: &PostgresSettings) -> Result<rustls::ClientConf
 /// 读取 PEM 证书链（空文件回退为 DER 单证书）。
 #[cfg(feature = "tls-rustls")]
 fn load_pem_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let bytes = std::fs::read(path).map_err(|e| Error::Model(format!("读取证书失败（{path}）：{e}")))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| Error::Model(format!("读取证书失败（{path}）：{e}")))?;
     let mut certs = rustls_pemfile::certs(&mut bytes.as_slice())
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::Model(format!("解析 PEM 证书失败（{path}）：{e}")))?;
@@ -399,7 +407,8 @@ fn load_pem_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'s
 /// 读取 PEM/DER 私钥。
 #[cfg(feature = "tls-rustls")]
 fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    let bytes = std::fs::read(path).map_err(|e| Error::Model(format!("读取私钥失败（{path}）：{e}")))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| Error::Model(format!("读取私钥失败（{path}）：{e}")))?;
     if let Some(key) = rustls_pemfile::private_key(&mut bytes.as_slice())
         .map_err(|e| Error::Model(format!("解析 PEM 私钥失败（{path}）：{e}")))?
     {
@@ -564,7 +573,9 @@ fn pg_to_dbvalue(row: &postgres::Row, index: usize, ty: &Type) -> Result<DbValue
         T::BYTEA => read!(Vec<u8>, DbValue::Blob),
         T::TIMESTAMP => read!(NaiveDateTime, DbValue::DateTime),
         T::TIMESTAMPTZ => read!(DateTime<Utc>, |v| DbValue::DateTime(v.naive_utc())),
-        T::DATE => read!(chrono::NaiveDate, |v| DbValue::DateTime(v.and_time(chrono::NaiveTime::MIN))),
+        T::DATE => read!(chrono::NaiveDate, |v| DbValue::DateTime(
+            v.and_time(chrono::NaiveTime::MIN)
+        )),
         T::TIME => read!(chrono::NaiveTime, |v| DbValue::Text(
             v.format("%H:%M:%S%.6f").to_string()
         )),
@@ -602,13 +613,15 @@ impl SqlSession for PostgresSession {
 
     fn execute(&mut self, sql: &str, params: &[DbValue]) -> Result<u64> {
         let bound: Vec<PgParam> = params.iter().map(PgParam).collect();
-        let refs: Vec<&(dyn ToSql + Sync)> = bound.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        let refs: Vec<&(dyn ToSql + Sync)> =
+            bound.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
         self.client.execute(sql, &refs).map_err(map_err)
     }
 
     fn query(&mut self, sql: &str, params: &[DbValue]) -> Result<RowSet> {
         let bound: Vec<PgParam> = params.iter().map(PgParam).collect();
-        let refs: Vec<&(dyn ToSql + Sync)> = bound.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        let refs: Vec<&(dyn ToSql + Sync)> =
+            bound.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
         // 预编译后取列信息：空结果集也能返回列名（与其它驱动行为一致）
         let statement = self.client.prepare(sql).map_err(map_err)?;
@@ -617,7 +630,11 @@ impl SqlSession for PostgresSession {
             .iter()
             .map(|c| c.name().to_string())
             .collect();
-        let types: Vec<Type> = statement.columns().iter().map(|c| c.type_().clone()).collect();
+        let types: Vec<Type> = statement
+            .columns()
+            .iter()
+            .map(|c| c.type_().clone())
+            .collect();
 
         let rows = self.client.query(&statement, &refs).map_err(map_err)?;
 
@@ -727,16 +744,19 @@ mod tests {
         );
         assert_eq!(search_path_options("public"), "-c search_path=public");
         // 内部引号/反斜杠转义
-        assert_eq!(
-            search_path_options("a\"b"),
-            "-c search_path=\"a\\\"b\""
-        );
+        assert_eq!(search_path_options("a\"b"), "-c search_path=\"a\\\"b\"");
 
         // SearchPath 与 Current Schema 变体（Npgsql / JDBC 风格）
         let cs = ConnectionString::parse("Server=x;provider=postgresql;SearchPath=app");
-        assert_eq!(parse_settings(&cs).unwrap().search_path.as_deref(), Some("app"));
+        assert_eq!(
+            parse_settings(&cs).unwrap().search_path.as_deref(),
+            Some("app")
+        );
         let cs = ConnectionString::parse("Server=x;provider=postgresql;Current Schema=app");
-        assert_eq!(parse_settings(&cs).unwrap().search_path.as_deref(), Some("app"));
+        assert_eq!(
+            parse_settings(&cs).unwrap().search_path.as_deref(),
+            Some("app")
+        );
 
         // 未提供时不影响（None）
         let cs = ConnectionString::parse("Server=x;provider=postgresql");

@@ -144,8 +144,8 @@ impl DatabaseFile {
         if !path.is_file() {
             return Ok(None);
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("读取 {FILE_NAME} 失败：{e}"))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("读取 {FILE_NAME} 失败：{e}"))?;
         let doc = dhrust::config::toml::parse_document(&text)?;
         let json = dhrust::config::toml::document_to_json(&doc)?;
         let mut file: DatabaseFile =
@@ -248,8 +248,7 @@ pub fn resolve_connection(base: &Path, conn: &str) -> Result<String, String> {
                 base.join(p)
             };
             if let Some(dir) = abs.parent() {
-                std::fs::create_dir_all(dir)
-                    .map_err(|e| format!("创建数据目录失败：{e}"))?;
+                std::fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
             }
             parts.push(format!("Data Source={}", abs.display()));
             has_source = true;
@@ -382,12 +381,10 @@ impl Databases {
     /// 需要驱动包的连接：按 `[DriverStore]` 分发（未配置且无缓存/预置时给出明确错误）。
     pub fn store(&self, name: &str) -> Result<Arc<SharedStore>, String> {
         let name = name.trim();
-        let entry = self.file.connections.get(name).ok_or_else(|| {
-            format!(
-                "连接不存在：{name}（可用：{}）",
-                self.names().join(", ")
-            )
-        })?;
+        let entry =
+            self.file.connections.get(name).ok_or_else(|| {
+                format!("连接不存在：{name}（可用：{}）", self.names().join(", "))
+            })?;
         let raw = resolve_connection(&self.base, entry.connection_string())?;
         let (store, _) = store::get_or_open_scoped(&self.base, name, || {
             let conn = self.prepare_conn(&raw)?;
@@ -563,7 +560,10 @@ ConnectionString = "Server=x;Provider=MySql"
         assert_eq!(file.default_name(), "main");
         assert_eq!(file.names(), vec!["log", "main", "simple"]);
         assert_eq!(file.connections["main"].note(), "主库");
-        assert_eq!(file.driver_store.as_ref().unwrap().url, "http://127.0.0.1:5502");
+        assert_eq!(
+            file.driver_store.as_ref().unwrap().url,
+            "http://127.0.0.1:5502"
+        );
         assert_eq!(file.driver_store.as_ref().unwrap().pub_key, "abc");
         assert_eq!(
             connection_label("Server=x;Provider=MySQL"),

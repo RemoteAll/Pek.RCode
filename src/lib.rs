@@ -148,9 +148,9 @@ pub mod shards;
 pub mod show_in;
 pub mod simulation;
 pub mod snowflake;
+pub mod sql_template;
 pub mod sqlbuild;
 pub mod sqlite;
-pub mod sql_template;
 pub mod statistics;
 pub mod store;
 #[cfg(feature = "driver-tdengine")]
@@ -177,4 +177,3 @@ pub use query::{Query, Where};
 pub use session::{DbRow, RowSet, SqlSession};
 pub use types::DataType;
 pub use value::DbValue;
-

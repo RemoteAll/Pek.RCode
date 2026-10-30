@@ -153,10 +153,7 @@ pub fn clear() {
 
 /// 注册表快照（`Arc::clone`，不复制元素）。
 fn snapshot() -> Arc<Vec<Arc<dyn EntityInterceptor>>> {
-    registry()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    registry().read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// 当前注册的拦截器（公开查询；返回克隆列表）。
@@ -274,7 +271,10 @@ fn set_item(table: &TableMeta, values: &mut Vec<(String, DbValue)>, name: &str, 
     if table.column(name).is_none() {
         return;
     }
-    match values.iter_mut().find(|(key, _)| key.eq_ignore_ascii_case(name)) {
+    match values
+        .iter_mut()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+    {
         Some((_, existing)) => {
             let is_default = match existing {
                 DbValue::Null => true,
@@ -292,7 +292,12 @@ fn set_item(table: &TableMeta, values: &mut Vec<(String, DbValue)>, name: &str, 
 }
 
 /// 更新场景：调用方未显式传入时补全（对应 `SetNoDirtyItem`；表中不存在该列时跳过）。
-fn set_no_dirty(table: &TableMeta, values: &mut Vec<(String, DbValue)>, name: &str, value: DbValue) {
+fn set_no_dirty(
+    table: &TableMeta,
+    values: &mut Vec<(String, DbValue)>,
+    name: &str,
+    value: DbValue,
+) {
     if table.column(name).is_none() {
         return;
     }
@@ -311,7 +316,10 @@ fn set_item_cow<'a>(
     if table.column(name).is_none() {
         return;
     }
-    match values.iter_mut().find(|(key, _)| key.eq_ignore_ascii_case(name)) {
+    match values
+        .iter_mut()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+    {
         Some((_, existing)) => {
             let is_default = match existing {
                 DbValue::Null => true,
@@ -449,10 +457,17 @@ impl UserInterceptor {
             return None;
         }
         let mut name = std::env::var("USERNAME").unwrap_or_default();
-        if name.is_empty() || name.eq_ignore_ascii_case("root") || name.eq_ignore_ascii_case("Administrator") {
+        if name.is_empty()
+            || name.eq_ignore_ascii_case("root")
+            || name.eq_ignore_ascii_case("Administrator")
+        {
             name = std::env::var("COMPUTERNAME").unwrap_or_default();
         }
-        if name.is_empty() { None } else { Some((0, name)) }
+        if name.is_empty() {
+            None
+        } else {
+            Some((0, name))
+        }
     }
 }
 
@@ -602,7 +617,13 @@ impl EntityInterceptor for TraceInterceptor {
 
         let max_length = table
             .column("TraceId")
-            .map(|col| if col.length > 0 { col.length as usize } else { 50 })
+            .map(|col| {
+                if col.length > 0 {
+                    col.length as usize
+                } else {
+                    50
+                }
+            })
             .unwrap_or(50);
 
         let value = if self.allow_merge {
@@ -662,7 +683,13 @@ impl EntityInterceptor for TraceInterceptor {
 
         let max_length = table
             .column("TraceId")
-            .map(|col| if col.length > 0 { col.length as usize } else { 50 })
+            .map(|col| {
+                if col.length > 0 {
+                    col.length as usize
+                } else {
+                    50
+                }
+            })
             .unwrap_or(50);
 
         let value = if self.allow_merge {
@@ -809,8 +836,9 @@ mod tests {
     #[test]
     fn user_interceptor_fills_current_user() {
         let table = table();
-        let interceptors: Vec<Arc<dyn EntityInterceptor>> =
-            vec![Arc::new(UserInterceptor::with_provider(Arc::new(FixedUser)))];
+        let interceptors: Vec<Arc<dyn EntityInterceptor>> = vec![Arc::new(
+            UserInterceptor::with_provider(Arc::new(FixedUser)),
+        )];
 
         let mut values: Vec<(String, DbValue)> = Vec::new();
         apply_to(&interceptors, &table, DataMethod::Insert, &mut values);
@@ -889,7 +917,10 @@ mod tests {
         TraceContext::set_current(None);
         let mut values: Vec<(String, DbValue)> = Vec::new();
         apply_to(&interceptors, &table, DataMethod::Insert, &mut values);
-        assert!(!values.iter().any(|(k, _)| k == "TraceId"), "无 TraceId 时不填");
+        assert!(
+            !values.iter().any(|(k, _)| k == "TraceId"),
+            "无 TraceId 时不填"
+        );
     }
 
     #[test]

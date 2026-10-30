@@ -96,7 +96,8 @@ impl DirtyCollection {
     /// 移除指定列（忽略大小写），返回是否移除。
     pub fn remove(&mut self, name: &str) -> bool {
         let before = self.items.len();
-        self.items.retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+        self.items
+            .retain(|(key, _)| !key.eq_ignore_ascii_case(name));
         self.items.len() != before
     }
 
@@ -279,8 +280,8 @@ impl Eq for DirtyState {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn dirty_collection_tracks_keys_and_old_values() {
@@ -288,15 +289,15 @@ mod tests {
         assert!(dirty.is_empty());
 
         assert!(dirty.set("Code", DbValue::Text("old".into())));
-        assert!(!dirty.set("code", DbValue::Text("其它".into())), "重复登记应保留最早旧值");
+        assert!(
+            !dirty.set("code", DbValue::Text("其它".into())),
+            "重复登记应保留最早旧值"
+        );
         assert!(dirty.add("Status"));
 
         assert_eq!(dirty.len(), 2);
         assert!(dirty.contains("CODE"));
-        assert_eq!(
-            dirty.old_value("Code"),
-            Some(&DbValue::Text("old".into()))
-        );
+        assert_eq!(dirty.old_value("Code"), Some(&DbValue::Text("old".into())));
         assert_eq!(dirty.old_value("Status"), Some(&DbValue::Null));
         assert_eq!(dirty.names(), vec!["Code", "Status"]);
 
@@ -314,7 +315,12 @@ mod tests {
         assert_eq!(state.len(), 2);
 
         // 持锁遍历：顺序与登记一致，无需为取列名分配字符串
-        let seen = state.with_columns(|items| items.iter().map(|(name, _)| name.to_string()).collect::<Vec<_>>());
+        let seen = state.with_columns(|items| {
+            items
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect::<Vec<_>>()
+        });
         assert_eq!(seen, vec!["Status", "Code"]);
 
         state.clear();

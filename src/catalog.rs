@@ -716,10 +716,15 @@ fn map_postgres_type(
         }
         "text" | "citext" | "json" | "jsonb" | "uuid" | "xml" | "inet" | "cidr" | "macaddr"
         | "interval" | "tsvector" | "tsquery" => (DataType::String, 0, 0, 0),
-        "timestamp without time zone" | "timestamp" | "timestamp with time zone" | "timestamptz"
-        | "date" | "time without time zone" | "time" | "time with time zone" | "timetz" => {
-            (DataType::DateTime, 0, 0, 0)
-        }
+        "timestamp without time zone"
+        | "timestamp"
+        | "timestamp with time zone"
+        | "timestamptz"
+        | "date"
+        | "time without time zone"
+        | "time"
+        | "time with time zone"
+        | "timetz" => (DataType::DateTime, 0, 0, 0),
         "bytea" => (DataType::Binary, 0, 0, 0),
         // 数组与自定义类型兜底为文本
         _ => (DataType::String, 0, 0, 0),
@@ -954,7 +959,10 @@ fn read_oracle(session: &mut dyn SqlSession) -> Result<Vec<TableInfo>> {
             .get(&table_name)
             .map(|cols| cols.iter().any(|c| c == &column_name))
             .unwrap_or(false);
-        let single_pk = pk_map.get(&table_name).map(|c| c.len() == 1).unwrap_or(false);
+        let single_pk = pk_map
+            .get(&table_name)
+            .map(|c| c.len() == 1)
+            .unwrap_or(false);
         let type_lower = text(row, 2).to_ascii_lowercase();
         let (base, _) = split_type_params(&type_lower);
         let identity = has_seq && is_pk && single_pk && is_numeric_type(base);
@@ -1073,7 +1081,10 @@ fn map_oracle_type(
             let (p, s) = if precision > 0 {
                 (precision, scale)
             } else {
-                (args.first().copied().unwrap_or(0), args.get(1).copied().unwrap_or(0))
+                (
+                    args.first().copied().unwrap_or(0),
+                    args.get(1).copied().unwrap_or(0),
+                )
             };
             match (p, s) {
                 (1, 0) => (DataType::Boolean, 0, 0, 0),
@@ -1088,7 +1099,11 @@ fn map_oracle_type(
         "binary_float" => (DataType::Single, 0, 0, 0),
         "binary_double" | "float" => (DataType::Double, 0, 0, 0),
         "varchar2" | "nvarchar2" | "char" | "nchar" => {
-            let len = if char_length > 0 { char_length } else { data_length };
+            let len = if char_length > 0 {
+                char_length
+            } else {
+                data_length
+            };
             (DataType::String, len, 0, 0)
         }
         "clob" | "nclob" | "long" | "rowid" | "xmltype" => (DataType::String, 0, 0, 0),
@@ -1234,8 +1249,13 @@ fn map_duckdb_type(raw_type: &str) -> (DataType, i32, i32, i32) {
             (DataType::String, args.first().copied().unwrap_or(0), 0, 0)
         }
         "text" | "uuid" | "json" | "interval" | "time" => (DataType::String, 0, 0, 0),
-        "timestamp" | "timestamp_s" | "timestamp_ms" | "timestamp_ns" | "date"
-        | "timestamp with time zone" | "timestamptz" => (DataType::DateTime, 0, 0, 0),
+        "timestamp"
+        | "timestamp_s"
+        | "timestamp_ms"
+        | "timestamp_ns"
+        | "date"
+        | "timestamp with time zone"
+        | "timestamptz" => (DataType::DateTime, 0, 0, 0),
         "blob" | "bytea" | "bitstring" => (DataType::Binary, 0, 0, 0),
         _ => (DataType::String, 0, 0, 0),
     }
@@ -1252,11 +1272,7 @@ fn text_true(value: &str) -> bool {
 /// 空文本 → None。
 fn opt_text(row: &DbRow, i: usize) -> Option<String> {
     let value = text(row, i);
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1867,7 +1883,12 @@ fn read_iris(session: &mut dyn SqlSession) -> Result<Vec<TableInfo>> {
 }
 
 /// IRIS 类型名 → 模型类型。
-fn map_iris_type(type_name: &str, length: i32, precision: i32, scale: i32) -> (DataType, i32, i32, i32) {
+fn map_iris_type(
+    type_name: &str,
+    length: i32,
+    precision: i32,
+    scale: i32,
+) -> (DataType, i32, i32, i32) {
     let upper = type_name.trim().to_ascii_uppercase();
     match upper.as_str() {
         "TINYINT" => (DataType::Byte, 0, 0, 0),
@@ -1971,9 +1992,7 @@ fn map_clickhouse_type(raw_type: &str) -> (DataType, i32, i32, i32, bool) {
             args.first().copied().unwrap_or(18),
             args.get(1).copied().unwrap_or(4),
         ),
-        "string" | "fixedstring" => {
-            (DataType::String, args.first().copied().unwrap_or(0), 0, 0)
-        }
+        "string" | "fixedstring" => (DataType::String, args.first().copied().unwrap_or(0), 0, 0),
         "enum8" | "enum16" | "uuid" | "ipv4" | "ipv6" | "json" => (DataType::String, 0, 0, 0),
         "date" | "date32" | "datetime" | "datetime32" | "datetime64" => {
             (DataType::DateTime, 0, 0, 0)
@@ -2002,10 +2021,7 @@ fn read_tdengine(session: &mut dyn SqlSession) -> Result<Vec<TableInfo>> {
         if name.is_empty() {
             continue;
         }
-        let describe = session.query(
-            &format!("DESCRIBE `{}`", name.replace('`', "``")),
-            &[],
-        )?;
+        let describe = session.query(&format!("DESCRIBE `{}`", name.replace('`', "``")), &[])?;
         let mut columns = Vec::new();
         for d in &describe.rows {
             let column_name = text(d, 0);
@@ -2186,7 +2202,10 @@ mod tests {
 
     #[test]
     fn mysql_type_mapping() {
-        assert_eq!(map_mysql_type("tinyint(1)", 0, 0, false).0, DataType::Boolean);
+        assert_eq!(
+            map_mysql_type("tinyint(1)", 0, 0, false).0,
+            DataType::Boolean
+        );
         assert_eq!(map_mysql_type("tinyint", 0, 0, false).0, DataType::Byte);
         assert_eq!(map_mysql_type("int", 10, 0, false).0, DataType::Int32);
         assert_eq!(map_mysql_type("bigint", 19, 0, false).0, DataType::Int64);
@@ -2199,7 +2218,10 @@ mod tests {
             (DataType::String, 50, 0, 0)
         );
         assert_eq!(map_mysql_type("longtext", 0, 0, false).0, DataType::String);
-        assert_eq!(map_mysql_type("datetime", 0, 0, false).0, DataType::DateTime);
+        assert_eq!(
+            map_mysql_type("datetime", 0, 0, false).0,
+            DataType::DateTime
+        );
         assert_eq!(map_mysql_type("longblob", 0, 0, false).0, DataType::Binary);
         assert_eq!(
             map_mysql_type("enum('N','Y')", 0, 0, false).0,
@@ -2214,10 +2236,7 @@ mod tests {
 
     #[test]
     fn postgres_type_mapping() {
-        assert_eq!(
-            map_postgres_type("integer", 0, 0, 0).0,
-            DataType::Int32
-        );
+        assert_eq!(map_postgres_type("integer", 0, 0, 0).0, DataType::Int32);
         assert_eq!(
             map_postgres_type("character varying", 50, 0, 0),
             (DataType::String, 50, 0, 0)
@@ -2236,8 +2255,14 @@ mod tests {
         );
         assert_eq!(map_postgres_type("bytea", 0, 0, 0).0, DataType::Binary);
         assert_eq!(map_postgres_type("boolean", 0, 0, 0).0, DataType::Boolean);
-        assert_eq!(map_postgres_type("double precision", 0, 0, 0).0, DataType::Double);
-        assert_eq!(map_postgres_type("text", 0, 0, 0), (DataType::String, 0, 0, 0));
+        assert_eq!(
+            map_postgres_type("double precision", 0, 0, 0).0,
+            DataType::Double
+        );
+        assert_eq!(
+            map_postgres_type("text", 0, 0, 0),
+            (DataType::String, 0, 0, 0)
+        );
     }
 
     #[test]
@@ -2267,13 +2292,19 @@ mod tests {
             map_oracle_type("VARCHAR2", 50, 50, 0, 0),
             (DataType::String, 50, 0, 0)
         );
-        assert_eq!(map_oracle_type("CLOB", 0, 0, 0, 0), (DataType::String, 0, 0, 0));
+        assert_eq!(
+            map_oracle_type("CLOB", 0, 0, 0, 0),
+            (DataType::String, 0, 0, 0)
+        );
         assert_eq!(
             map_oracle_type("TIMESTAMP(6)", 11, 0, 0, 0).0,
             DataType::DateTime
         );
         assert_eq!(map_oracle_type("BLOB", 0, 0, 0, 0).0, DataType::Binary);
-        assert_eq!(map_oracle_type("BINARY_DOUBLE", 8, 0, 0, 0).0, DataType::Double);
+        assert_eq!(
+            map_oracle_type("BINARY_DOUBLE", 8, 0, 0, 0).0,
+            DataType::Double
+        );
     }
 
     #[test]
@@ -2282,7 +2313,10 @@ mod tests {
         assert_eq!(map_duckdb_type("INTEGER").0, DataType::Int32);
         assert_eq!(map_duckdb_type("BIGINT").0, DataType::Int64);
         assert_eq!(map_duckdb_type("VARCHAR(50)").1, 50);
-        assert_eq!(map_duckdb_type("DECIMAL(18,4)"), (DataType::Decimal, 0, 18, 4));
+        assert_eq!(
+            map_duckdb_type("DECIMAL(18,4)"),
+            (DataType::Decimal, 0, 18, 4)
+        );
         assert_eq!(map_duckdb_type("TIMESTAMP").0, DataType::DateTime);
         assert_eq!(map_duckdb_type("BLOB").0, DataType::Binary);
         assert_eq!(map_duckdb_type("HUGEINT").0, DataType::Decimal);
@@ -2295,18 +2329,13 @@ mod tests {
             .format("%H%M%S%.6f")
             .to_string()
             .replace('.', "");
-        let dir = std::env::temp_dir().join(format!(
-            "rcode-catalog-{}-{stamp}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rcode-catalog-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("catalog.db");
 
-        let dal = crate::dal::Dal::open(&format!(
-            "Data Source={};Provider=SQLite",
-            db.display()
-        ))
-        .unwrap();
+        let dal = crate::dal::Dal::open(&format!("Data Source={};Provider=SQLite", db.display()))
+            .unwrap();
         let mut session = dal.open_session().unwrap();
         session
             .execute(

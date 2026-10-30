@@ -62,9 +62,9 @@ fn reverse_roundtrip_with_production_fixture() {
         );
 
         for col in &src.columns {
-            let actual = got.column(&col.name).unwrap_or_else(|| {
-                panic!("表 {table_name} 反向结果缺少列 {}", col.name)
-            });
+            let actual = got
+                .column(&col.name)
+                .unwrap_or_else(|| panic!("表 {table_name} 反向结果缺少列 {}", col.name));
             assert_eq!(
                 actual.data_type, col.data_type,
                 "列 {table_name}.{} 类型",

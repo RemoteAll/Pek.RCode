@@ -8,11 +8,7 @@
 //!
 //! 用法见 `rcodegen --help`。
 
-use std::{
-    env, fs,
-    path::PathBuf,
-    process::ExitCode,
-};
+use std::{env, fs, path::PathBuf, process::ExitCode};
 
 use pek_rcode::{
     Dal, codegen,
@@ -153,7 +149,11 @@ fn run(opts: &Options) -> Result<(), String> {
                     codegen::biz_file_name(table),
                     codegen::generate_biz(table),
                 ),
-                _ => ("entity", codegen::file_name(table), codegen::generate(table)),
+                _ => (
+                    "entity",
+                    codegen::file_name(table),
+                    codegen::generate(table),
+                ),
             })
             .collect();
 
@@ -169,8 +169,9 @@ fn run(opts: &Options) -> Result<(), String> {
                                 if opts.dry_run {
                                     println!("[将合并] {}", path.display());
                                 } else {
-                                    dhrust::io::write_all_text(&path, &merged)
-                                        .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+                                    dhrust::io::write_all_text(&path, &merged).map_err(|e| {
+                                        format!("写入 {} 失败：{e}", path.display())
+                                    })?;
                                     println!("[合并] {}", path.display());
                                 }
                                 updated += 1;
@@ -216,7 +217,10 @@ fn run(opts: &Options) -> Result<(), String> {
         println!("（--dry-run 模式，未写入任何文件）");
     }
     println!("输出目录：{}", out_dir.display());
-    println!("生成 {created}，更新 {updated}，未变化 {unchanged}，跳过 {}", skipped.len());
+    println!(
+        "生成 {created}，更新 {updated}，未变化 {unchanged}，跳过 {}",
+        skipped.len()
+    );
     if !skipped.is_empty() {
         println!("以下文件不是本工具生成的（内容已变化但未覆盖，可用 --force 强制覆盖）：");
         for name in &skipped {
@@ -246,15 +250,14 @@ fn run_reverse(opts: &Options, conn: &str) -> Result<(), String> {
     }
 
     let model = dal.read_model().map_err(|e| e.to_string())?;
-    let out = opts.out.clone().unwrap_or_else(|| PathBuf::from("Model.xml"));
+    let out = opts
+        .out
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("Model.xml"));
 
     if opts.dry_run {
         println!("（--dry-run 模式，未写入文件）");
-        println!(
-            "将反向生成 {} 张表 → {}",
-            model.tables.len(),
-            out.display()
-        );
+        println!("将反向生成 {} 张表 → {}", model.tables.len(), out.display());
         return Ok(());
     }
 
