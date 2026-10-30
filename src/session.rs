@@ -292,6 +292,50 @@ impl DbRow {
             .zip(self.values.iter())
             .collect()
     }
+
+    // ————— 便捷取值（各应用最常写的三行；避免每处再抄一份）—————
+
+    /// 读文本列：**仅 `Text`**，其它类型（含 `DateTime`）返回空串。
+    ///
+    /// 时间列请用 [`DbRow::time_text`]——`DbValue::as_str()` 只认 `Text`，
+    /// 对 `DateTime` 一律返回 `None`，直接用会得到「时间列为空」这种静默错误。
+    pub fn text(&self, name: &str) -> String {
+        self.get_by_name(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// 读时间列 → `YYYY-MM-DD HH:MM:SS`（空值/零值返回空串，不显示 1970-01-01）。
+    ///
+    /// 兼容三种存储形态：`DateTime`（模型 `DataType="DateTime"` 的标准形态）、
+    /// 文本日期（旧库/手工导入）、Unix 秒（如 `logs.Time`）。
+    /// 统一到**秒**精度，便于直接做「早于/晚于」字符串比较（邀请过期判断等）。
+    pub fn time_text(&self, name: &str) -> String {
+        let Some(value) = self.get_by_name(name) else {
+            return String::new();
+        };
+        if let Some(dt) = value.as_datetime() {
+            if dt.and_utc().timestamp() <= 0 {
+                return String::new();
+            }
+            return dhrust::times::format_datetime_with_digits(&dt, 0);
+        }
+        if let DbValue::Int(secs) = value {
+            if *secs <= 0 {
+                return String::new();
+            }
+            return dhrust::times::from_unix_timestamp(*secs)
+                .map(|dt| dhrust::times::format_datetime_with_digits(&dt, 0))
+                .unwrap_or_default();
+        }
+        String::new()
+    }
+
+    /// 读整数列（类型不符/缺列返回 0）。
+    pub fn i64(&self, name: &str) -> i64 {
+        self.get_by_name(name).and_then(|v| v.as_i64()).unwrap_or(0)
+    }
 }
 
 /// 数据库会话：执行 SQL、管理事务。
@@ -390,5 +434,61 @@ pub trait SqlSession: Send {
     /// 仅无 SQL 型目录的驱动（如 ODBC 桥的 Access）实现本方法。
     fn catalog_tables(&mut self) -> Result<Option<Vec<crate::catalog::TableInfo>>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDateTime;
+
+    fn row_of(pairs: &[(&str, DbValue)]) -> DbRow {
+        let columns: Vec<String> = pairs.iter().map(|(k, _)| (*k).to_string()).collect();
+        let values: Vec<DbValue> = pairs.iter().map(|(_, v)| v.clone()).collect();
+        DbRow::new(Arc::new(columns), values)
+    }
+
+    /// 回归：`DateTime` 列用 `as_str()` 读会静默得到空串——`time_text` 必须取到值
+    /// （各应用曾因此在「加入时间/创建时间」上反复出现空白列）。
+    #[test]
+    fn time_text_reads_datetime_column() {
+        let dt = NaiveDateTime::parse_from_str("2026-10-30 19:43:58", "%Y-%m-%d %H:%M:%S").unwrap();
+        let row = row_of(&[("JoinedAt", DbValue::DateTime(dt))]);
+        assert_eq!(row.time_text("JoinedAt"), "2026-10-30 19:43:58");
+        // 旧口径（as_str）在 DateTime 列上确实是空的（用例有效性）
+        assert_eq!(row.text("JoinedAt"), "");
+    }
+
+    /// 文本日期（旧库/手工导入）也要能读
+    #[test]
+    fn time_text_reads_text_datetime() {
+        let row = row_of(&[("ExpireAt", DbValue::Text("2026-11-06 10:00:00".into()))]);
+        assert_eq!(row.time_text("ExpireAt"), "2026-11-06 10:00:00");
+    }
+
+    /// Unix 秒（如 logs.Time）也要能读
+    #[test]
+    fn time_text_reads_unix_seconds() {
+        let row = row_of(&[("Time", DbValue::Int(1_800_000_000))]);
+        assert_eq!(row.time_text("Time").len(), 19);
+    }
+
+    /// 空值/缺列/零值 → 空串（不显示 1970-01-01）
+    #[test]
+    fn time_text_blank_for_empty() {
+        let row = row_of(&[("At", DbValue::Null), ("Zero", DbValue::Int(0))]);
+        assert_eq!(row.time_text("At"), "");
+        assert_eq!(row.time_text("Zero"), "");
+        assert_eq!(row.time_text("Missing"), "");
+    }
+
+    /// text / i64：类型不符分别是空串 / 0
+    #[test]
+    fn text_and_i64_fallbacks() {
+        let row = row_of(&[("Name", DbValue::Text("甲".into())), ("Count", DbValue::Int(3))]);
+        assert_eq!(row.text("Name"), "甲");
+        assert_eq!(row.text("Count"), "");
+        assert_eq!(row.i64("Count"), 3);
+        assert_eq!(row.i64("Missing"), 0);
     }
 }
