@@ -835,26 +835,69 @@ impl DatabaseKind {
     /// <param name="col">列</param>
     /// <returns>ALTER COLUMN 语句（与 DH.NCode 各驱动 `AlterColumnSQL` 对齐）</returns>
     pub fn alter_column_sql(&self, table: &TableMeta, col: &ColumnMeta) -> Option<String> {
+        // 历史行为保持不变：SQL Server 写模型可空性，其余方言不写可空性子句。
+        // 自动执行的结构同步请改用 [`DatabaseKind::alter_column_sql_keep`]（保留库端现状）。
+        let nullable = match self {
+            DatabaseKind::SqlServer => Some(col.nullable),
+            _ => None,
+        };
+        self.alter_column_sql_keep(table, col, nullable, false)
+    }
+
+    /// 生成修改列类型的语句，**并按库端现状保留可空性与自增属性**（结构同步自动执行时使用）。
+    ///
+    /// 必要性：MySQL 的 `MODIFY COLUMN` 与 SQL Server 的 `ALTER COLUMN` 都要求**显式重复**
+    /// 可空性，未写即按可空重建列——只改类型会把原来的 `NOT NULL` 悄悄丢掉（MySQL 还会丢掉
+    /// `AUTO_INCREMENT`）。这里传入的是**数据库当前值**而非模型值，语义是「只改类型、其余不动」。
+    ///
+    /// 注意：MySQL 的 `DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP` 不在本函数能力范围内
+    /// （目录只读得到 `COLUMN_DEFAULT`，读不到 `EXTRA` 的 `on update`）——调用方应对有默认值的
+    /// 列改用人工确认的路径，而不是自动执行。
+    /// <param name="table">表</param>
+    /// <param name="col">模型列（提供目标类型）</param>
+    /// <param name="keep_nullable">库端当前可空性（`None` = 不写该子句）</param>
+    /// <param name="keep_identity">库端当前是否自增（MySQL 需重复 `AUTO_INCREMENT`）</param>
+    /// <returns>ALTER 语句；`None` 表示该数据库不支持直接改列</returns>
+    pub fn alter_column_sql_keep(
+        &self,
+        table: &TableMeta,
+        col: &ColumnMeta,
+        keep_nullable: Option<bool>,
+        keep_identity: bool,
+    ) -> Option<String> {
         let t = self.quote(table.effective_table_name());
         let c = self.quote(table.effective_column_name(col));
         let ty = self.field_type(col);
+        let null_sql = match keep_nullable {
+            Some(true) => " NULL",
+            Some(false) => " NOT NULL",
+            None => "",
+        };
         match self {
-            // SQL Server：Alter Column（显式可空性）
+            // SQL Server：Alter Column（必须重复可空性）
             DatabaseKind::SqlServer => {
-                let null_sql = if col.nullable { "NULL" } else { "NOT NULL" };
-                Some(format!("Alter Table {t} Alter Column {c} {ty} {null_sql}"))
+                Some(format!("Alter Table {t} Alter Column {c} {ty}{null_sql}"))
             }
-            // Oracle / 达梦 / DB2（Oracle 兼容模式）：Modify 列定义
+            // Oracle / 达梦 / DB2（Oracle 兼容模式）：Modify 列定义（默认值/可空性由库保留）
             DatabaseKind::Oracle | DatabaseKind::DaMeng | DatabaseKind::Db2 => {
                 Some(format!("Alter Table {t} Modify {c} {ty}"))
             }
-            // MySQL / HANA / IRIS / TDengine / ClickHouse：Modify Column
-            DatabaseKind::MySql
-            | DatabaseKind::Hana
+            // MySQL：Modify Column（不写 NULL/NOT NULL 即变成可空，必须显式带上）
+            DatabaseKind::MySql => {
+                let auto = if keep_identity { " AUTO_INCREMENT" } else { "" };
+                Some(format!(
+                    "Alter Table {t} Modify Column {c} {ty}{null_sql}{auto}"
+                ))
+            }
+            // HANA / IRIS / TDengine / ClickHouse：Modify Column（自增语义各异，不追加）
+            DatabaseKind::Hana
             | DatabaseKind::Iris
             | DatabaseKind::TDengine
-            | DatabaseKind::ClickHouse => Some(format!("Alter Table {t} Modify Column {c} {ty}")),
+            | DatabaseKind::ClickHouse => {
+                Some(format!("Alter Table {t} Modify Column {c} {ty}{null_sql}"))
+            }
             // PG 系（含 KingBase/VastBase/HighGo/DuckDB）：ALTER COLUMN .. TYPE ..
+            // （PG 改类型不动可空性与默认值，无需重复）
             DatabaseKind::PostgreSql | DatabaseKind::DuckDb => {
                 Some(format!("ALTER TABLE {t} ALTER COLUMN {c} TYPE {ty}"))
             }

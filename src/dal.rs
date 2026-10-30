@@ -1100,13 +1100,23 @@ impl Dal {
         Ok(true)
     }
 
-    /// 按模型同步数据库结构（建表 / 补列 / 补索引 / 放宽字符串长度；`Full` 档含修改与删除），返回本次变更清单。
+    /// 按模型同步数据库结构（建表 / 补列 / 补索引 / 放宽列长度与精度；`Full` 档含修改与删除），
+    /// 返回本次变更清单。
+    ///
+    /// 列的结构差异**只有一套判定与执行**：判定见 `classify_column_change`（类型 / 长度 / 精度，
+    /// 命中即返回），执行见 [`Dal::apply_column_changes`]（按档位与安全边界统一处理）；
+    /// 索引同样只有一套（`sync_table_indexes`，与 [`Dal::sync_indexes`] 共用）。
     ///
     /// 档位语义（与 DH.NCode 的 [`Migration`] 一致）：
     /// - `Off`：跳过（返回空报告）
     /// - `ReadOnly`：只检查、不执行；将 DDL 收集到 [`SchemaReport::pending_sql`] 供人工执行
-    /// - `On`（缺省）：创建类（建表 / 补列 / 补索引）+ **字符串列长度放宽**（不缩窄、不改类型、不删除）
-    /// - `Full`：在 `On` 基础上允许修改列类型与长度（含缩窄）、删除多余列/索引（**删除类动作仅此档允许**）
+    /// - `On`（缺省）：创建类（建表 / 补列 / 补索引）+ **列长度/精度放宽**
+    ///   （如 `varchar(20)`→`varchar(50)`、`datetime`→`datetime(3)`；不缩窄、不改类型、不删除）
+    /// - `Full`：在 `On` 基础上允许修改列类型与长度/精度（含缩窄）、删除多余列/索引
+    ///   （**删除类动作仅此档允许**）
+    ///
+    /// 安全边界：自动改列时保留库端现状（可空性 / 自增）；MySQL 上该列若有 `DEFAULT` 则**不自动执行**
+    /// （`MODIFY COLUMN` 会丢默认值与 `ON UPDATE`），改在 `notes` 里给出可直接执行的 SQL。
     ///
     /// 表级档位（`<Table Migration="...">`）只能收紧、不能放大：生效档 = `min(表级, 全局)`。
     ///
@@ -1175,77 +1185,109 @@ impl Dal {
             {
                 continue;
             }
-            let existing =
-                match crate::catalog::read_indexes(session.as_mut(), self.kind, table_name) {
-                    Ok(indexes) => indexes,
-                    Err(Error::Unsupported(_)) => continue,
-                    Err(e) => return Err(e),
-                };
-            for idx in &table.indexes {
-                if idx.columns.is_empty() {
-                    continue;
-                }
-                let unique_exists = existing
-                    .iter()
-                    .any(|e| e.unique && same_index(&e.columns, &idx.columns));
-                if unique_exists
-                    || (!idx.unique
-                        && existing
-                            .iter()
-                            .any(|e| same_index(&e.columns, &idx.columns)))
-                {
-                    continue;
-                }
-                let want_name = self.kind.index_name(table, idx);
-                if idx.unique
-                    && let Some(plain) = existing.iter().find(|e| {
-                        !e.unique
-                            && same_index(&e.columns, &idx.columns)
-                            && e.name.eq_ignore_ascii_case(&want_name)
-                    })
-                    && let Some(drop_sql) = self.kind.drop_index_sql(&plain.name, Some(table_name))
-                {
-                    self.exec_ddl(session.as_mut(), Migration::On, &mut report, &drop_sql)?;
-                    report
-                        .dropped_indexes
-                        .push((table_name.to_string(), plain.name.clone()));
-                }
-                if let Some(sql) = self.kind.create_index_sql(table, idx) {
-                    self.exec_ddl(session.as_mut(), Migration::On, &mut report, &sql)?;
-                    report
-                        .added_indexes
-                        .push((table_name.to_string(), want_name));
-                }
-            }
-            // 清理多余索引：**按模型为准，该清的清**
-            // - 模型里没有该列组合的索引 → 删除；
-            // - 同列已有唯一索引时，残留的普通同列索引属于冗余 → 删除；
-            // - 主键/系统索引（`sqlite_autoindex*`、`*_pkey` 等）跳过。
-            // 索引增删不改变数据，放在默认档（`On`）执行。
-            for e in &existing {
-                if is_primary_index_name(&e.name) {
-                    continue;
-                }
-                let in_model = table
-                    .indexes
-                    .iter()
-                    .any(|idx| same_index(&idx.columns, &e.columns));
-                let redundant = !e.unique
-                    && existing
-                        .iter()
-                        .any(|o| o.unique && same_index(&o.columns, &e.columns));
-                if in_model && !redundant {
-                    continue;
-                }
-                if let Some(sql) = self.kind.drop_index_sql(&e.name, Some(table_name)) {
-                    self.exec_ddl(session.as_mut(), Migration::On, &mut report, &sql)?;
-                    report
-                        .dropped_indexes
-                        .push((table_name.to_string(), e.name.clone()));
-                }
-            }
+            self.sync_table_indexes(
+                session.as_mut(),
+                table,
+                table_name,
+                Migration::On,
+                &mut report,
+            )?;
         }
         Ok(report)
+    }
+
+    /// **已存在表的索引对齐（唯一实现）**：补缺失 / 普通→唯一升级 / 清理多余。
+    ///
+    /// [`Dal::sync_schema_inner`] 与 [`Dal::sync_indexes`] 共用它——两处以前各写了一份，
+    /// 容易出现“一边加了清理、另一边没加”的口径漂移。
+    ///
+    /// 口径：
+    /// - 同列且同序视为已存在（忽略命名差异）；**额外比较 `unique`**：模型要唯一而库里同列只是普通索引
+    ///   → 先删同名再建唯一（否则 `Unique=True` 改了模型也会静默跳过）；反向不降级；
+    /// - 清理多余索引：模型里没有该列组合、或同列已有唯一索引而残留普通索引 → 删除；
+    ///   主键/系统索引（`sqlite_autoindex*`、`*_pkey` 等）跳过；
+    /// - 索引增删不改数据，**宽度档位（`On`）即执行**，只读档收集到 `pending_sql`；
+    /// - 目录不可用（`Unsupported`）→ 静默跳过，不阻断结构同步。
+    ///
+    /// # 参数
+    /// - `session`：当前会话
+    /// - `table`：模型表
+    /// - `table_name`：物理表名（表已在库中存在）
+    /// - `mode`：该表生效档位（由调用方按全局/表级收紧后传入）
+    /// - `report`：结构报告（累计补/删索引）
+    fn sync_table_indexes(
+        &self,
+        session: &mut dyn SqlSession,
+        table: &TableMeta,
+        table_name: &str,
+        mode: Migration,
+        report: &mut SchemaReport,
+    ) -> Result<()> {
+        let existing = match crate::catalog::read_indexes(session, self.kind, table_name) {
+            Ok(indexes) => indexes,
+            // 目录不可用：跳过索引补齐（不阻断结构同步）
+            Err(Error::Unsupported(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for idx in &table.indexes {
+            if idx.columns.is_empty() {
+                continue;
+            }
+            let unique_exists = existing
+                .iter()
+                .any(|e| e.unique && same_index(&e.columns, &idx.columns));
+            if unique_exists
+                || (!idx.unique && existing.iter().any(|e| same_index(&e.columns, &idx.columns)))
+            {
+                // 已有同列唯一索引；或模型不要求唯一而库里已有同列索引（不降级）
+                continue;
+            }
+            let want_name = self.kind.index_name(table, idx);
+            // 模型要求唯一但库里只有同列普通索引 → 同名时先删再建
+            if idx.unique
+                && let Some(plain) = existing.iter().find(|e| {
+                    !e.unique
+                        && same_index(&e.columns, &idx.columns)
+                        && e.name.eq_ignore_ascii_case(&want_name)
+                })
+                && let Some(drop_sql) = self.kind.drop_index_sql(&plain.name, Some(table_name))
+            {
+                self.exec_ddl(session, mode, report, &drop_sql)?;
+                report
+                    .dropped_indexes
+                    .push((table_name.to_string(), plain.name.clone()));
+            }
+            if let Some(sql) = self.kind.create_index_sql(table, idx) {
+                self.exec_ddl(session, mode, report, &sql)?;
+                report
+                    .added_indexes
+                    .push((table_name.to_string(), want_name));
+            }
+        }
+        // 清理多余索引：模型里没有该列组合，或同列已有唯一索引而残留普通索引（冗余）
+        for e in &existing {
+            if is_primary_index_name(&e.name) {
+                continue;
+            }
+            let in_model = table
+                .indexes
+                .iter()
+                .any(|idx| same_index(&idx.columns, &e.columns));
+            let redundant = !e.unique
+                && existing
+                    .iter()
+                    .any(|o| o.unique && same_index(&o.columns, &e.columns));
+            if in_model && !redundant {
+                continue;
+            }
+            if let Some(sql) = self.kind.drop_index_sql(&e.name, Some(table_name)) {
+                self.exec_ddl(session, mode, report, &sql)?;
+                report
+                    .dropped_indexes
+                    .push((table_name.to_string(), e.name.clone()));
+            }
+        }
+        Ok(())
     }
 
     /// 结构同步实现：`include_network = false` 时保持 C# 对齐的网络空实现。
@@ -1334,87 +1376,10 @@ impl Dal {
                 }
             }
 
-            // 既存表：补齐模型定义中缺失的索引（同列且同序即视为已存在，避免与其它工具命名差异重复建）
-            //
-            // **唯一性升级**：模型要求唯一、库里同列只有普通索引时，同列判断会误以为"已存在"
-            // 而永远不建唯一约束（历史坑：改模型 Unique=True 后 `sync_schema` 静默跳过）。
-            // 这里额外比较 `unique`：不一致则先删同名索引再建唯一索引；反向（库里唯一、模型普通）不降级。
+            // 既存表：索引对齐（补缺失 / 普通→唯一升级 / 清理多余）——与 `sync_indexes` 共用同一实现
             if crate::catalog::supports_index_catalog(self.kind) {
-                match crate::catalog::read_indexes(session.as_mut(), self.kind, table_name) {
-                    Ok(existing_indexes) => {
-                        for idx in &table.indexes {
-                            if idx.columns.is_empty() {
-                                continue;
-                            }
-                            let unique_exists = existing_indexes
-                                .iter()
-                                .any(|e| e.unique && same_index(&e.columns, &idx.columns));
-                            if unique_exists
-                                || (!idx.unique
-                                    && existing_indexes
-                                        .iter()
-                                        .any(|e| same_index(&e.columns, &idx.columns)))
-                            {
-                                // 已有同列唯一索引；或模型不要求唯一而库里已有同列索引（不降级）
-                                continue;
-                            }
-                            // 模型要求唯一但库里只有同列普通索引 → 同名时先删再建
-                            let want_name = self.kind.index_name(table, idx);
-                            if idx.unique
-                                && let Some(existing) = existing_indexes.iter().find(|e| {
-                                    !e.unique
-                                        && same_index(&e.columns, &idx.columns)
-                                        && e.name.eq_ignore_ascii_case(&want_name)
-                                })
-                                && let Some(drop_sql) =
-                                    self.kind.drop_index_sql(&existing.name, Some(table_name))
-                            {
-                                self.exec_ddl(&mut *session, mode, &mut report, &drop_sql)?;
-                                report
-                                    .dropped_indexes
-                                    .push((table_name.to_string(), existing.name.clone()));
-                            }
-                            if let Some(sql) = self.kind.create_index_sql(table, idx) {
-                                self.exec_ddl(&mut *session, mode, &mut report, &sql)?;
-                                report
-                                    .added_indexes
-                                    .push((table_name.to_string(), want_name));
-                            }
-                        }
-                        // 清理多余索引：**按模型为准，该清的清**
-                        // - 模型里没有该列组合的索引 → 删除；
-                        // - 同列已有唯一索引时，残留的普通同列索引属冗余 → 删除；
-                        // - 主键/系统索引（`sqlite_autoindex*`、`*_pkey` 等）跳过；
-                        // - 索引增删不改数据，默认档（`On`）即执行，只读档收集 SQL。
-                        for e in &existing_indexes {
-                            if is_primary_index_name(&e.name) {
-                                continue;
-                            }
-                            let in_model = table
-                                .indexes
-                                .iter()
-                                .any(|idx| same_index(&idx.columns, &e.columns));
-                            let redundant = !e.unique
-                                && existing_indexes
-                                    .iter()
-                                    .any(|o| o.unique && same_index(&o.columns, &e.columns));
-                            if in_model && !redundant {
-                                continue;
-                            }
-                            if let Some(sql) = self.kind.drop_index_sql(&e.name, Some(table_name)) {
-                                self.exec_ddl(&mut *session, mode, &mut report, &sql)?;
-                                report
-                                    .dropped_indexes
-                                    .push((table_name.to_string(), e.name.clone()));
-                            }
-                        }
-                    }
-                    // 目录不可用：跳过索引补齐（不阻断结构同步）
-                    Err(Error::Unsupported(_)) => {}
-                    Err(e) => return Err(e),
-                }
+                self.sync_table_indexes(&mut *session, table, table_name, mode, &mut report)?;
             }
-
             // 序列型自增（Oracle/DB2/Firebird/DuckDB）：补齐历史表缺失的序列
             if table.identity().is_some()
                 && matches!(
@@ -1432,17 +1397,15 @@ impl Dal {
         // 先归还本轮的会话，后面的比对/对齐会各开一次（顺序执行，连接池可复用同一物理连接）
         drop(session);
 
-        // 列长度对齐（字符串列）：**`On` 档即允许放宽**——对齐 C# `CheckColumnsChange` 里
-        // `IsColumnLengthChanged` 传的是 `@readonly`，只有类型变化/删除才带 `onlyCreate`。
-        // 缩窄（含“明确长度 → 不限/大文本”）仍需 `Full` 档。
+        // 列结构对齐（长度 / 精度 / 类型）、删多余列索引，都从同一份 `diff` 驱动：
+        // 1) `Full` 档先做删除类动作（删索引→删列，先删引用再删被引用）；
+        // 2) 再统一执行列变更（放宽在 `On` 档、类型变更与缩窄在 `Full` 档）。
         if self.migration != Migration::Off {
             let diff = self.diff_schema()?;
-            self.apply_length_changes(&mut report, &diff)?;
-
-            // Full 档：修改列类型 + 删除多余列/索引（删除类动作仅此档允许；对应 C# 的 onlyCreate=false 分支）
             if self.migration == Migration::Full {
                 self.apply_full_changes(&mut report, &diff)?;
             }
+            self.apply_column_changes(&mut report, &diff)?;
         }
 
         Ok(report)
@@ -1470,15 +1433,24 @@ impl Dal {
         Ok(())
     }
 
-    /// 字符串列长度对齐（**`On` 档可放宽、`Full` 档可缩窄**）。
+    /// **列结构对齐的唯一执行入口**：类型变更 / 字符串长度 / 精度小数位，全部走这里。
     ///
-    /// 与 DH.NCode 对齐：C# `CheckColumnsChange` 里长度扩大走 `PerformSchema(sb, @readonly, …)`，
-    /// 不带 `onlyCreate`，即**默认 `On` 档也会执行**；缩窄/任意差异（`IsColumnChanged`）只在 `Full`。
+    /// 输入是 [`SchemaDiff::column_changes`]（由 [`Dal::classify_column_change`] 统一判定产出），
+    /// 因此新增一类“列规格差异”只需要在判定函数里多一个分支，**不需要再写一个 apply 函数**。
     ///
-    /// 不支持 `ALTER COLUMN` 的数据库（SQLite/Firebird/Access 等）只记 `notes` 留给人工——
-    /// C# 对这些库走 `ReBuildTable` 重建表，本库暂不自动重建（避免动数据）。
-    fn apply_length_changes(&self, report: &mut SchemaReport, diff: &SchemaDiff) -> Result<()> {
-        if diff.length_mismatches.is_empty() {
+    /// 执行口径（与 DH.NCode 档位语义一致）：
+    /// - 放宽（长度变大 / 精度变大）→ `On` 档即执行（不丢数据、不截断）；
+    /// - 缩窄、基础类型变更 → 仅 `Full` 档；
+    /// - `ReadOnly` → 只收集到 `pending_sql`；
+    /// - 表级档位只能收紧（`<Table Migration="...">`）。
+    ///
+    /// 安全边界：
+    /// - 自动执行时**保留库端现状**（可空性 / 自增），不用模型值覆盖；
+    /// - MySQL 上该列若有 `DEFAULT`，**不自动执行**（`MODIFY COLUMN` 会丢掉 `DEFAULT` 与
+    ///   `ON UPDATE CURRENT_TIMESTAMP`，而目录读不到后者）→ 输出可直接执行的 SQL 让人确认；
+    /// - 不支持直接改列的库（SQLite 等）→ `notes` 提示人工（避免动数据重建表）。
+    fn apply_column_changes(&self, report: &mut SchemaReport, diff: &SchemaDiff) -> Result<()> {
+        if diff.column_changes.is_empty() {
             return Ok(());
         }
         let model = self
@@ -1486,9 +1458,10 @@ impl Dal {
             .as_ref()
             .ok_or_else(|| Error::Model("尚未加载数据模型，无法同步结构".into()))?;
         let mut session = self.open_session()?;
+        let db_columns = self.db_column_map(session.as_mut())?;
 
-        for m in &diff.length_mismatches {
-            let Some(table) = model.table(&m.table) else {
+        for change in &diff.column_changes {
+            let Some(table) = model.table(&change.table) else {
                 continue;
             };
             // 表级档位只能收紧：Off 的表不动
@@ -1496,60 +1469,107 @@ impl Dal {
             if mode == Migration::Off {
                 continue;
             }
-            // 缩窄（含“明确长度 → 不限”）仅 Full 档允许（对齐 C# `IsColumnChanged` 的 onlyCreate 闸门）
-            if !m.widening && mode != Migration::Full {
+            // 类型变更与所有缩窄：只有 Full 档允许（对齐 C# `IsColumnChanged` 的 onlyCreate 闸门）
+            let full_only = change.kind == ColumnChangeKind::Type || !change.widening;
+            if full_only && mode != Migration::Full {
                 continue;
             }
-            let Some(col) = table.column(&m.column) else {
+            let Some(col) = table.column(&change.column) else {
                 continue;
             };
             // MySQL 单行 65535 字节预算：放宽到超宽 varchar 与补列同样会炸行（ERROR 1118）
-            if self.kind == DatabaseKind::MySql && !mode.is_readonly() && col.is_wide_varchar() {
+            if change.kind == ColumnChangeKind::Length
+                && self.kind == DatabaseKind::MySql
+                && !mode.is_readonly()
+                && col.is_wide_varchar()
+            {
                 report.notes.push(format!(
-                    "{}.{}：长度 {} → {} 超过 MySQL 安全阈值 {} 字符，请改用 DataType=\"Text\" 或人工调整",
-                    m.table,
-                    m.column,
-                    m.actual,
-                    m.expected,
+                    "{} 超过 MySQL 安全阈值 {} 字符，请改用 DataType=\"Text\" 或人工调整",
+                    change.label(),
                     crate::model::MYSQL_SAFE_VARCHAR_CHARS
                 ));
                 continue;
             }
-            let Some(sql) = self.kind.alter_column_sql(table, col) else {
+            let db_col = db_columns.get(&(
+                change.table.to_ascii_lowercase(),
+                change.column.to_ascii_lowercase(),
+            ));
+            // MySQL 的 `MODIFY COLUMN` 会把 `DEFAULT`（及 `ON UPDATE CURRENT_TIMESTAMP`）一起丢掉，
+            // 而目录读不到 `EXTRA` 里的 `on update`——宁可给 SQL 让人确认，也不静默改掉默认值。
+            if self.kind == DatabaseKind::MySql
+                && db_col.and_then(|c| c.default_value.as_ref()).is_some()
+            {
+                let sql = self
+                    .kind
+                    .alter_column_sql_keep(table, col, db_col.map(|c| c.nullable), false)
+                    .unwrap_or_default();
                 report.notes.push(format!(
-                    "{}.{}：长度 {} → {} 需人工处理（该数据库不支持直接改列，如 SQLite 需重建表）",
-                    m.table, m.column, m.actual, m.expected
+                    "{} 未自动执行（该列有默认值，MySQL 改列会丢默认值/ON UPDATE），请人工确认后执行：{sql}",
+                    change.label()
+                ));
+                continue;
+            }
+            let Some(sql) = self.kind.alter_column_sql_keep(
+                table,
+                col,
+                db_col.map(|c| c.nullable),
+                db_col.map(|c| c.identity).unwrap_or(false),
+            ) else {
+                report.notes.push(format!(
+                    "{} 需人工处理（该数据库不支持直接改列，如 SQLite 需重建表）",
+                    change.label()
                 ));
                 continue;
             };
             match self.exec_ddl(&mut *session, mode, report, &sql) {
                 Ok(()) => report
                     .altered_columns
-                    .push((m.table.clone(), m.column.clone())),
+                    .push((change.table.clone(), change.column.clone())),
                 Err(e) => report
                     .notes
-                    .push(format!("{}.{}：调整列长度失败（{e}）", m.table, m.column)),
+                    .push(format!("{} 执行失败（{e}）", change.label())),
             }
         }
         Ok(())
     }
 
-    /// `Full` 档的修改/删除执行：基于 [`Dal::diff_schema`] 的预检结果。
+    /// 读库端列目录并转成 `(表, 列) → ColumnInfo`（键小写）；目录不支持时返回空表。
     ///
-    /// 顺序与 XCode 一致：**先删多余索引，再删多余列**（否则索引引用会阻止删列），最后修改列类型。
+    /// 用途：自动改列时保留**库端现状**（可空性/自增/默认值），而不是用模型值去覆盖。
+    fn db_column_map(
+        &self,
+        session: &mut dyn SqlSession,
+    ) -> Result<HashMap<(String, String), ColumnInfo>> {
+        let mut map = HashMap::new();
+        match crate::catalog::read_tables(session, self.kind, None) {
+            Ok(tables) => {
+                for t in tables {
+                    let tname = t.name.to_ascii_lowercase();
+                    for c in t.columns {
+                        map.insert((tname.clone(), c.name.to_ascii_lowercase()), c);
+                    }
+                }
+            }
+            // 目录不可用：不影响“改列”，只是拿不到库端属性（退回不写可空性）
+            Err(Error::Unsupported(_)) => {}
+            Err(e) => return Err(e),
+        }
+        Ok(map)
+    }
+
+    /// `Full` 档的**删除类**动作：多余索引 + 多余列（列规格变更见 [`Dal::apply_column_changes`]）。
+    ///
     /// 说明：
     /// - 表级档位收紧到 `Full` 以下的表不动（只能收紧、不能放大）
     /// - 模型外的多余表**从不自动删除**（与 XCode 相同：迁移只处理模型中声明的表）
     /// - 单条失败不中断整体（记入 [`SchemaReport::notes`]，对齐 C# `CheckAllTables` 的逐表容错）
+    /// - 顺序：先删索引再删列，否则索引引用会阻止删列
     fn apply_full_changes(&self, report: &mut SchemaReport, diff: &SchemaDiff) -> Result<()> {
         let model = self
             .model
             .as_ref()
             .ok_or_else(|| Error::Model("尚未加载数据模型，无法同步结构".into()))?;
-        if diff.extra_indexes.is_empty()
-            && diff.extra_columns.is_empty()
-            && diff.type_mismatches.is_empty()
-        {
+        if diff.extra_indexes.is_empty() && diff.extra_columns.is_empty() {
             return Ok(());
         }
 
@@ -1601,36 +1621,6 @@ impl Dal {
             }
         }
 
-        // 3) 修改列类型（仅基础类型不同时触发；长度/精度差异见 diff_schema 的宽松比较）
-        for mismatch in &diff.type_mismatches {
-            let tname = &mismatch.table;
-            if !allowed(tname) {
-                continue;
-            }
-            let Some(table) = model.table(tname) else {
-                continue;
-            };
-            let Some(col) = table.column(&mismatch.column) else {
-                continue;
-            };
-            let Some(sql) = self.kind.alter_column_sql(table, col) else {
-                report.notes.push(format!(
-                    "{tname}.{}：类型 {} → {} 需人工处理（该数据库不支持直接修改列类型，如 SQLite 需重建表）",
-                    mismatch.column, mismatch.actual, mismatch.expected
-                ));
-                continue;
-            };
-            match self.exec_ddl(&mut *session, Migration::Full, report, &sql) {
-                Ok(()) => report
-                    .altered_columns
-                    .push((tname.clone(), mismatch.column.clone())),
-                Err(e) => report.notes.push(format!(
-                    "{tname}.{}：修改列类型失败（{e}）",
-                    mismatch.column
-                )),
-            }
-        }
-
         Ok(())
     }
 
@@ -1672,6 +1662,82 @@ impl Dal {
         // 其余（含 `0` = 不限的任一方向）归 `Full` 档，避免默认档误缩窄。
         let widening = col.length > 0 && db_col.length > 0 && col.length > db_col.length;
         Some((col.length, db_col.length, widening))
+    }
+
+    /// 精度/小数位差异判定（基础类型相同、仅括号参数不同）。
+    ///
+    /// 返回 `(模型预期类型文本, 库实际类型文本, 是否放宽)`；无差异或不归本函数处理时返回 `None`。
+    /// - 只处理 `DateTime`（小数秒位数，即模型 `Scale`）与 `Decimal`（精度/小数位）；
+    /// - 字符串长度走 [`Dal::string_length_change`]、基础类型不同走 `type_mismatches`，此处均不处理；
+    /// - 放宽定义：`DateTime` 小数秒变大；`Decimal` 精度与小数位均不变小且至少一项变大。
+    ///   放宽不丢数据（已有行原值不变，新行精度更高），因此和长度放宽一样在 `On` 档自动执行。
+    fn precision_change(
+        &self,
+        col: &ColumnMeta,
+        db_col: &ColumnInfo,
+    ) -> Option<(String, String, bool)> {
+        let expected = self.kind.field_type(col);
+        precision_change_of(
+            col.data_type,
+            &expected,
+            &db_col.raw_type,
+            db_col.precision,
+            db_col.scale,
+        )
+    }
+
+    /// **列结构差异的唯一判定入口**：基础类型变更 → 字符串长度 → 精度/小数位，命中即返回。
+    ///
+    /// 新增一类“列规格差异”时只改这里（外加 `dialect` 的类型生成），不要再加 `apply_*` 函数：
+    /// 执行侧只看 [`ColumnChangeInfo`]（种类 / 库现状 / 模型期望 / 是否放宽）。
+    ///
+    /// # 参数
+    /// - `table`：模型表
+    /// - `col`：模型列
+    /// - `db_col`：库端列目录信息
+    ///
+    /// # 返回值
+    /// 有差异时返回统一形态的变更描述；无差异（或无需处理，如两侧都是大文本）返回 `None`
+    fn classify_column_change(
+        &self,
+        table: &TableMeta,
+        col: &ColumnMeta,
+        db_col: &ColumnInfo,
+    ) -> Option<ColumnChangeInfo> {
+        let tname = table.effective_table_name().to_string();
+        let cname = table.effective_column_name(col).to_string();
+        let expected = self.kind.field_type(col);
+        if !same_base_type(&expected, &db_col.raw_type) {
+            return Some(ColumnChangeInfo {
+                table: tname,
+                column: cname,
+                kind: ColumnChangeKind::Type,
+                expected,
+                actual: db_col.raw_type.clone(),
+                widening: false,
+            });
+        }
+        if let Some((model_len, db_len, widening)) = self.string_length_change(col, db_col) {
+            return Some(ColumnChangeInfo {
+                table: tname,
+                column: cname,
+                kind: ColumnChangeKind::Length,
+                expected: model_len.to_string(),
+                actual: db_len.to_string(),
+                widening,
+            });
+        }
+        if let Some((expected_spec, actual_spec, widening)) = self.precision_change(col, db_col) {
+            return Some(ColumnChangeInfo {
+                table: tname,
+                column: cname,
+                kind: ColumnChangeKind::Precision,
+                expected: expected_spec,
+                actual: actual_spec,
+                widening,
+            });
+        }
+        None
     }
 
     /// 结构比对：模型 vs 数据库（只读），并生成可直接执行的 ALTER 脚本（dry-run 输出）。
@@ -1717,41 +1783,61 @@ impl Dal {
                                         diff.alter_sql.push(self.kind.add_column_sql(table, col));
                                     }
                                     Some(db_col) => {
-                                        let expected = self.kind.field_type(col);
-                                        if !same_base_type(&expected, &db_col.raw_type) {
-                                            // `Full` 档专用：修改类预检脚本（dry-run 导出；执行前请确认数据影响）
-                                            if let Some(sql) =
-                                                self.kind.alter_column_sql(table, col)
-                                            {
-                                                diff.full_sql.push(sql);
-                                            }
-                                            diff.type_mismatches.push(ColumnTypeMismatch {
-                                                table: tname.to_string(),
-                                                column: cname.to_string(),
-                                                expected,
-                                                actual: db_col.raw_type.clone(),
-                                            });
-                                        } else if let Some((model_len, db_len, widening)) =
-                                            self.string_length_change(col, db_col)
+                                        // 列结构差异**统一在 `classify_column_change` 里判定**（类型/长度/精度），
+                                        // 这里只负责落库：放宽的长度/精度进 `alter_sql`（`On` 档执行），
+                                        // 类型变更与所有缩窄进 `full_sql`（`Full` 档执行）。
+                                        if let Some(change) =
+                                            self.classify_column_change(table, col, db_col)
                                         {
-                                            // 长度差异：**扩大在 `On` 档即执行**（对齐 C# `IsColumnLengthChanged`），
-                                            // 缩窄只在 `Full` 档（`IsColumnChanged`）
+                                            let execute_now = change.widening
+                                                && change.kind != ColumnChangeKind::Type;
                                             if let Some(sql) =
                                                 self.kind.alter_column_sql(table, col)
                                             {
-                                                if widening {
+                                                if execute_now {
                                                     diff.alter_sql.push(sql);
                                                 } else {
                                                     diff.full_sql.push(sql);
                                                 }
                                             }
-                                            diff.length_mismatches.push(ColumnLengthMismatch {
-                                                table: tname.to_string(),
-                                                column: cname.to_string(),
-                                                expected: model_len,
-                                                actual: db_len,
-                                                widening,
-                                            });
+                                            // 兼容视图：三个 `*_mismatches` 仍按原口径填写（既有消费方/报告在用）
+                                            match change.kind {
+                                                ColumnChangeKind::Type => {
+                                                    diff.type_mismatches.push(ColumnTypeMismatch {
+                                                        table: change.table.clone(),
+                                                        column: change.column.clone(),
+                                                        expected: change.expected.clone(),
+                                                        actual: change.actual.clone(),
+                                                    });
+                                                }
+                                                ColumnChangeKind::Length => {
+                                                    if let Some((model_len, db_len, widening)) =
+                                                        self.string_length_change(col, db_col)
+                                                    {
+                                                        diff.length_mismatches.push(
+                                                            ColumnLengthMismatch {
+                                                                table: change.table.clone(),
+                                                                column: change.column.clone(),
+                                                                expected: model_len,
+                                                                actual: db_len,
+                                                                widening,
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                                ColumnChangeKind::Precision => {
+                                                    diff.precision_mismatches.push(
+                                                        ColumnPrecisionMismatch {
+                                                            table: change.table.clone(),
+                                                            column: change.column.clone(),
+                                                            expected: change.expected.clone(),
+                                                            actual: change.actual.clone(),
+                                                            widening: change.widening,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                            diff.column_changes.push(change);
                                         }
                                     }
                                 }
@@ -2056,6 +2142,11 @@ pub struct SchemaDiff {
     pub type_mismatches: Vec<ColumnTypeMismatch>,
     /// 字符串列长度差异（扩大可由 `On` 档直接执行，缩窄仅 `Full` 档）
     pub length_mismatches: Vec<ColumnLengthMismatch>,
+    /// 精度/小数位差异（如 `datetime` 与 `datetime(3)`；扩大可由 `On` 档直接执行，缩窄仅 `Full` 档）
+    pub precision_mismatches: Vec<ColumnPrecisionMismatch>,
+    /// **列变更统一列表**（[`Dal::apply_column_changes`] 的唯一输入；上方三个 `*_mismatches`
+    /// 保留为报告/兼容视图，三种差异同时只会在本列表出现一次）
+    pub column_changes: Vec<ColumnChangeInfo>,
     /// 可直接执行的补齐类脚本（建表 / 加列 / 建索引；任何非 `Off` 档均可用）
     pub alter_sql: Vec<String>,
     /// 修改/删除类脚本（**仅 `Full` 档可执行**：改列类型、删多余列/索引；dry-run 预览用，执行前请确认数据影响）
@@ -2073,7 +2164,68 @@ impl SchemaDiff {
             && self.extra_indexes.is_empty()
             && self.type_mismatches.is_empty()
             && self.length_mismatches.is_empty()
+            && self.precision_mismatches.is_empty()
+            && self.column_changes.is_empty()
     }
+}
+
+/// 列结构差异的种类（判定一次、执行一次；新增种类时只需在
+/// [`Dal::classify_column_change`] 加分支，不必再加执行函数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnChangeKind {
+    /// 基础类型不同（如 `int` → `nvarchar(50)`）：仅 `Full` 档
+    Type,
+    /// 字符串长度差异（放宽可在 `On` 档，缩窄仅 `Full` 档）
+    Length,
+    /// 精度/小数位差异（`datetime` → `datetime(3)`、`decimal(18,2)` → `decimal(18,4)`）
+    Precision,
+}
+
+/// 单列结构变更（统一形态：检测一处产出、执行一处消费）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnChangeInfo {
+    /// 表名（物理名）
+    pub table: String,
+    /// 列名（物理名）
+    pub column: String,
+    /// 变更种类
+    pub kind: ColumnChangeKind,
+    /// 模型期望值（类型文本或长度文本）
+    pub expected: String,
+    /// 库端现值（类型文本或长度文本）
+    pub actual: String,
+    /// 是否为放宽（`true` 时 `On` 档即执行；类型变更恒 `false`）
+    pub widening: bool,
+}
+
+impl ColumnChangeInfo {
+    /// 报告/日志用的一句话描述：`表.列 种类 库现值 → 模型期望`。
+    pub fn label(&self) -> String {
+        let kind = match self.kind {
+            ColumnChangeKind::Type => "类型",
+            ColumnChangeKind::Length => "长度",
+            ColumnChangeKind::Precision => "精度",
+        };
+        format!(
+            "{}.{}：{kind} {} → {}",
+            self.table, self.column, self.actual, self.expected
+        )
+    }
+}
+
+/// 列精度/小数位差异（模型预期 vs 数据库实际；基础类型相同，仅括号参数不同）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnPrecisionMismatch {
+    /// 表名
+    pub table: String,
+    /// 列名
+    pub column: String,
+    /// 模型预期类型文本（按方言生成，如 `datetime(3)`）
+    pub expected: String,
+    /// 数据库实际原始类型（如 `datetime`）
+    pub actual: String,
+    /// 是否为放宽（`true` 时 `On` 档即会执行，`false` 需 `Full`）
+    pub widening: bool,
 }
 
 /// 字符串列长度差异（模型预期 vs 数据库实际；`0` 表示不限长度/大文本）。
@@ -2166,6 +2318,67 @@ fn same_base_type(expected: &str, actual: &str) -> bool {
             | ("blob", "bytea")
             | ("bytea", "blob")
     )
+}
+
+/// 取类型文本的括号参数：`datetime(3)` → `[3]`，`decimal(18,2)` → `[18,2]`；无括号返回空。
+fn type_params(text: &str) -> Vec<i32> {
+    let Some(start) = text.find('(') else {
+        return Vec::new();
+    };
+    let rest = &text[start + 1..];
+    let Some(end) = rest.find(')') else {
+        return Vec::new();
+    };
+    rest[..end]
+        .split(',')
+        .filter_map(|p| p.trim().parse::<i32>().ok())
+        .collect()
+}
+
+/// 精度/小数位差异判定（纯函数，便于单测）。
+///
+/// # 参数
+/// - `data_type`：模型列类型
+/// - `expected`：模型按方言生成的类型文本（如 `datetime(3)`）
+/// - `actual_raw`：库端原始类型文本（如 `datetime`）
+/// - `db_precision` / `db_scale`：库端目录精度/小数位（裸 `decimal` 由目录给出 10/0）
+///
+/// # 返回值
+/// `(模型类型文本, 库类型文本, 是否放宽)`；无差异/不归本函数处理时 `None`。
+fn precision_change_of(
+    data_type: crate::types::DataType,
+    expected: &str,
+    actual_raw: &str,
+    db_precision: i32,
+    db_scale: i32,
+) -> Option<(String, String, bool)> {
+    match data_type {
+        // 小数秒位数：`datetime` / `datetime(0)` 视为 0；`datetime(3)` → 3
+        crate::types::DataType::DateTime => {
+            let e = type_params(expected).first().copied().unwrap_or(0).max(0);
+            let a = type_params(actual_raw).first().copied().unwrap_or(0).max(0);
+            if e == a {
+                None
+            } else {
+                Some((expected.to_string(), actual_raw.to_string(), e > a))
+            }
+        }
+        // 精度/小数位：库端取目录值（比解析类型文本更可靠，裸 `decimal` 也能拿到 10/0）
+        crate::types::DataType::Decimal => {
+            let params = type_params(expected);
+            let ep = params.first().copied().unwrap_or(0).max(0);
+            let es = params.get(1).copied().unwrap_or(0).max(0);
+            let (ap, a_scale) = (db_precision.max(0), db_scale.max(0));
+            if ep == ap && es == a_scale {
+                None
+            } else {
+                let widening =
+                    ep >= ap && es >= a_scale && (ep > ap || es > a_scale);
+                Some((expected.to_string(), actual_raw.to_string(), widening))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// 表操作句柄（绑定模型中的某张表）。
@@ -4272,6 +4485,187 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 精度/小数位差异判定（纯函数，覆盖放宽/缩窄/无差异/不归本函数四类）。
+    #[test]
+    fn precision_change_rules() {
+        use crate::types::DataType;
+        // datetime → datetime(3)：放宽（`On` 档即自动执行）
+        assert_eq!(
+            precision_change_of(DataType::DateTime, "datetime(3)", "datetime", 0, 0),
+            Some(("datetime(3)".into(), "datetime".into(), true))
+        );
+        // datetime(3) → datetime：缩窄（仅 Full 档）
+        assert_eq!(
+            precision_change_of(DataType::DateTime, "datetime", "datetime(3)", 0, 0),
+            Some(("datetime".into(), "datetime(3)".into(), false))
+        );
+        // 无差异
+        assert_eq!(
+            precision_change_of(DataType::DateTime, "datetime(3)", "datetime(3)", 0, 0),
+            None
+        );
+        assert_eq!(
+            precision_change_of(DataType::DateTime, "datetime", "datetime", 0, 0),
+            None
+        );
+        // decimal：精度与小数位均放大 → 放宽
+        assert_eq!(
+            precision_change_of(DataType::Decimal, "decimal(18,4)", "decimal(18,2)", 18, 2),
+            Some(("decimal(18,4)".into(), "decimal(18,2)".into(), true))
+        );
+        // 只加整数位 → 放宽
+        assert_eq!(
+            precision_change_of(DataType::Decimal, "decimal(20,2)", "decimal(18,2)", 18, 2),
+            Some(("decimal(20,2)".into(), "decimal(18,2)".into(), true))
+        );
+        // 小数位变小 → 缩窄（可能截断小数）
+        assert_eq!(
+            precision_change_of(DataType::Decimal, "decimal(18,1)", "decimal(18,2)", 18, 2),
+            Some(("decimal(18,1)".into(), "decimal(18,2)".into(), false))
+        );
+        // 精度升、小数位降 → 仍属缩窄（不因“某一项变大”就算放宽）
+        assert_eq!(
+            precision_change_of(DataType::Decimal, "decimal(20,1)", "decimal(18,2)", 18, 2),
+            Some(("decimal(20,1)".into(), "decimal(18,2)".into(), false))
+        );
+        assert_eq!(
+            precision_change_of(DataType::Decimal, "decimal(18,2)", "decimal(18,2)", 18, 2),
+            None
+        );
+        // 字符串/二进制不归本函数（走 string_length_change / type_mismatches）
+        assert_eq!(
+            precision_change_of(DataType::String, "varchar(100)", "varchar(20)", 0, 0),
+            None
+        );
+    }
+
+    /// 类型文本括号参数解析。
+    #[test]
+    fn type_params_parse_bracket_arguments() {
+        assert_eq!(type_params("datetime(3)"), vec![3]);
+        assert_eq!(type_params("decimal(18,2)"), vec![18, 2]);
+        assert_eq!(type_params("datetime"), Vec::<i32>::new());
+        assert_eq!(type_params("DECIMAL( 20 , 6 )"), vec![20, 6]);
+    }
+
+    /// `SchemaDiff::column_changes` 必须与三个兼容视图**同源一致**：
+    /// 检测只有一处（`classify_column_change`）、执行只有一处（`apply_column_changes`）。
+    /// 以后再加一类列差异如果只加视图不加统一列表，本用例会失败。
+    #[test]
+    fn column_changes_is_the_single_source_of_truth() {
+        const M4: &str = r#"<EntityModel><Tables><Table Name="T4" TableName="DH_T4">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            <Column Name="Code" DataType="String" Length="50" />
+            <Column Name="Flag" DataType="String" Length="10" />
+          </Columns>
+        </Table></Tables></EntityModel>"#;
+
+        let dir = temp_dir("column-changes");
+        let db = dir.join("test.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+        // Code：库 20、模型 50 → 长度放宽；Flag：库 int、模型 nvarchar(10) → 类型差异
+        {
+            let setup = Dal::open(&conn).unwrap();
+            let mut session = setup.open_session().unwrap();
+            session
+                .execute(
+                    "CREATE TABLE \"DH_T4\" (\"Id\" integer PRIMARY KEY AUTOINCREMENT, \
+                     \"Code\" nvarchar(20), \"Flag\" int)",
+                    &[],
+                )
+                .unwrap();
+            drop(session);
+            setup.clear_pool();
+            drop(setup);
+        }
+
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(M4).unwrap()).unwrap();
+        let diff = dal.diff_schema().unwrap();
+
+        assert_eq!(diff.column_changes.len(), 2, "{diff:?}");
+        // 统一列表与兼容视图一一对应
+        assert_eq!(diff.length_mismatches.len(), 1, "{diff:?}");
+        assert_eq!(diff.type_mismatches.len(), 1, "{diff:?}");
+        assert_eq!(
+            diff.length_mismatches.len()
+                + diff.type_mismatches.len()
+                + diff.precision_mismatches.len(),
+            diff.column_changes.len(),
+            "统一列表与三个兼容视图必须同源：{diff:?}"
+        );
+
+        let code = diff
+            .column_changes
+            .iter()
+            .find(|c| c.column == "Code")
+            .expect("Code 应有长度放宽");
+        assert_eq!(code.kind, ColumnChangeKind::Length);
+        assert!(code.widening);
+        assert!(code.label().contains("长度 20 → 50"), "{}", code.label());
+
+        let flag = diff
+            .column_changes
+            .iter()
+            .find(|c| c.column == "Flag")
+            .expect("Flag 应有类型差异");
+        assert_eq!(flag.kind, ColumnChangeKind::Type);
+        assert!(!flag.widening, "类型变更不属放宽");
+
+        // SQLite 不支持 `ALTER COLUMN`：两类差异都**不生成可执行 DDL**（改由 notes 提示人工），
+        // 与归并前的行为一致；可执行 DDL 的方言由 `alter_column_sql_keep_preserves_nullability` 覆盖。
+        assert!(diff.alter_sql.is_empty(), "{diff:?}");
+        assert!(diff.full_sql.is_empty(), "{diff:?}");
+
+        dal.clear_pool();
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 自动改列必须**保留库端可空性/自增**：MySQL 的 `MODIFY COLUMN` 不写 `NULL/NOT NULL`
+    /// 会把 `NOT NULL` 悄悄变成可空（历史实现的老问题），这里用 SQL 文本把口径固化。
+    #[test]
+    fn alter_column_sql_keep_preserves_nullability() {
+        const M: &str = r#"<EntityModel><Tables><Table Name="T" TableName="DH_T">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Nullable="False" />
+            <Column Name="LogTime" DataType="DateTime" Scale="3" Nullable="False" />
+          </Columns>
+        </Table></Tables></EntityModel>"#;
+        let model = EntityModel::parse(M).unwrap();
+        let table = model.table("T").unwrap();
+        let col = table.column("LogTime").unwrap();
+
+        // MySQL：库端 NOT NULL + 自增 → 两条子句都要保留
+        assert_eq!(
+            DatabaseKind::MySql.alter_column_sql_keep(table, col, Some(false), true),
+            Some(
+                "Alter Table `DH_T` Modify Column `LogTime` datetime(3) NOT NULL AUTO_INCREMENT"
+                    .into()
+            )
+        );
+        // MySQL：库端可空 → 写 NULL（而不是省略）
+        assert_eq!(
+            DatabaseKind::MySql.alter_column_sql_keep(table, col, Some(true), false),
+            Some("Alter Table `DH_T` Modify Column `LogTime` datetime(3) NULL".into())
+        );
+        // 旧接口行为不变（MySQL 不写可空性）
+        assert_eq!(
+            DatabaseKind::MySql.alter_column_sql(table, col),
+            Some("Alter Table `DH_T` Modify Column `LogTime` datetime(3)".into())
+        );
+        // PG 改类型本身不动可空性，不追加子句
+        assert_eq!(
+            DatabaseKind::PostgreSql.alter_column_sql_keep(table, col, Some(false), false),
+            Some("ALTER TABLE \"DH_T\" ALTER COLUMN \"LogTime\" TYPE timestamp(3)".into())
+        );
+        // SQLite：不支持直接改列 → None（由调用方提示人工处理）
+        assert_eq!(
+            DatabaseKind::Sqlite.alter_column_sql_keep(table, col, Some(false), false),
+            None
+        );
+    }
+
     #[test]
     fn migration_off_skips_and_readonly_collects() {
         let dir = temp_dir("migration-off");
@@ -4496,10 +4890,9 @@ mod tests {
         let report = dal.sync_schema().unwrap();
         assert!(report.altered_columns.is_empty());
         assert!(
-            report
-                .notes
-                .iter()
-                .any(|n| n.contains("不支持直接修改列类型")),
+            report.notes.iter().any(|n| n.contains("不支持直接改列")
+                && n.contains("nvarchar(50)")
+                && n.contains("DH_T2.Code")),
             "{report:?}"
         );
 
