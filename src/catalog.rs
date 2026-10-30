@@ -171,6 +171,21 @@ fn text(row: &DbRow, i: usize) -> String {
         .to_string()
 }
 
+/// 第 i 列为文本；**兼容驱动返回二进制**（关键修复，见下）。
+///
+/// MySQL 8 的 `information_schema.COLUMNS` 里 `COLUMN_TYPE` / `COLUMN_KEY` / `COLUMN_COMMENT`
+/// 等列是 **binary charset**，驱动回来是 `DbValue::Blob`；旧的 `text()` 只认 `DbValue::Text`，
+/// 于是 `raw_type` 恒为空串 → **所有列都被判成"类型不一致"**，`sync_schema` 在 MySQL 上
+/// 永远不会自动改列/放宽长度（2026-10-30 用本机 MySQL 8.0.29 实测抓到：
+/// `diff` 里 `actual: ""`，`datetime` → `datetime(3)` 因此不生效）。
+fn text_any(row: &DbRow, i: usize) -> String {
+    match row.get(i) {
+        Some(DbValue::Text(s)) => s.clone(),
+        Some(DbValue::Blob(bytes)) => String::from_utf8_lossy(bytes).to_string(),
+        _ => String::new(),
+    }
+}
+
 /// 第 i 列为整数（缺省/空值 → 0）。
 fn int(row: &DbRow, i: usize) -> i64 {
     row.get(i).and_then(DbValue::as_i64).unwrap_or(0)
@@ -420,11 +435,11 @@ fn read_mysql(session: &mut dyn SqlSession) -> Result<Vec<TableInfo>> {
         let Some(table) = result.iter_mut().find(|t| t.name == table_name) else {
             continue;
         };
-        let raw_type = text(row, 2);
-        let nullable = text(row, 3).eq_ignore_ascii_case("YES");
+        let raw_type = text_any(row, 2);
+        let nullable = text_any(row, 3).eq_ignore_ascii_case("YES");
         let default_value = row.get(4).and_then(DbValue::as_str).map(str::to_string);
-        let identity = text(row, 5).to_ascii_lowercase().contains("auto_increment");
-        let primary_key = text(row, 6).eq_ignore_ascii_case("PRI");
+        let identity = text_any(row, 5).to_ascii_lowercase().contains("auto_increment");
+        let primary_key = text_any(row, 6).eq_ignore_ascii_case("PRI");
         let precision = int(row, 7) as i32;
         let scale = int(row, 8) as i32;
         let (data_type, length, precision, scale) =
@@ -440,7 +455,7 @@ fn read_mysql(session: &mut dyn SqlSession) -> Result<Vec<TableInfo>> {
             primary_key,
             nullable: nullable || primary_key,
             default_value,
-            description: text(row, 9),
+            description: text_any(row, 9),
         });
     }
 
@@ -2179,6 +2194,26 @@ fn map_influx_type(field_type: &str) -> (DataType, i32, i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **回归用例（2026-10-30 本机 MySQL 8.0.29 实测抓到）**：
+    /// `information_schema.COLUMNS.COLUMN_TYPE` 是 binary charset，驱动回来是 `Blob`；
+    /// 旧实现只认 `Text` → `raw_type` 恒为空 → 所有列都被判成"类型不一致"，
+    /// `sync_schema` 在 MySQL 上**永远不会自动改列/放宽长度**（`datetime(3)` 因此不生效）。
+    #[test]
+    fn text_any_reads_blob_columns() {
+        let row = DbRow::new(
+            std::sync::Arc::new(vec!["COLUMN_TYPE".to_string(), "COLUMN_NAME".to_string()]),
+            vec![
+                DbValue::Blob(b"datetime".to_vec()),
+                DbValue::Text("LogTime".to_string()),
+            ],
+        );
+        assert_eq!(text_any(&row, 0), "datetime", "Blob 必须能按 UTF-8 读出");
+        assert_eq!(text_any(&row, 1), "LogTime", "Text 行为不变");
+        assert_eq!(text_any(&row, 9), "", "越界返回空串而不是 panic");
+        // 对照：旧口径（只认 Text）就是空串 —— 这正是曾经的线上行为
+        assert_eq!(row.get(0).and_then(DbValue::as_str).unwrap_or(""), "");
+    }
 
     #[test]
     fn sqlite_type_mapping() {
