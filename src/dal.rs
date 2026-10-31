@@ -1075,12 +1075,11 @@ impl Dal {
             self.log_sql(&stmt);
             session.execute(&stmt, &[])?;
         }
-        for index in &cloned.indexes {
-            if let Some(sql) = self.kind.create_index_sql(&cloned, index) {
-                self.log_sql(&sql);
-                session.execute(&sql, &[])?;
-            }
-        }
+        // **不要再单独循环建索引**：`create_table_sql` 返回的语句列表**已经包含**
+        // 该表的全部索引 DDL（见 `dialect::create_table_sql` 末尾的 `for idx in &table.indexes`）。
+        // 旧实现在这里又建了一遍，SQLite 下直接报
+        // `index ix_{分表}_xxx already exists`（索引名是库级唯一的），
+        // 导致「按天分表」永远建不起来（HlktechIoT 2026-10-31 实测）。
         // 序列型自增（Oracle/DB2/Firebird/DuckDB）：补建 `SEQ_{表名}` 序列
         if cloned.identity().is_some()
             && matches!(
