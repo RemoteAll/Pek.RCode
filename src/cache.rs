@@ -594,6 +594,9 @@ fn limit_suffix(kind: DatabaseKind, top: usize) -> Option<String> {
         DatabaseKind::Sqlite
         | DatabaseKind::MySql
         | DatabaseKind::PostgreSql
+        | DatabaseKind::KingBase
+        | DatabaseKind::HighGo
+        | DatabaseKind::VastBase
         | DatabaseKind::DuckDb
         | DatabaseKind::ClickHouse
         | DatabaseKind::Hana

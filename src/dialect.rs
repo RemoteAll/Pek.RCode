@@ -25,6 +25,19 @@ pub enum DatabaseKind {
     SqlServer,
     /// PostgreSQL（含 HighGo/KingBase/VastBase）
     PostgreSql,
+    /// 人大金仓 KingBase（C# `DatabaseType.KingBase = 13`）
+    ///
+    /// 同 PG 协议，**方言行为目前委托给 [`DatabaseKind::PostgreSql`]**；
+    /// C# 侧是独立实现类（`KingBase.cs` 612 行），其覆写点待逐项移植（见 [`DATABASE_TYPES`] 注释）。
+    KingBase,
+    /// 瀚高 HighGo（C# `DatabaseType.HighGo = 14`）
+    ///
+    /// 同 PG 协议，方言行为委托 [`DatabaseKind::PostgreSql`]；C# `HighGo.cs` 474 行的品牌差异待移植。
+    HighGo,
+    /// 海量 VastBase（C# `DatabaseType.VastBase = 16`）
+    ///
+    /// 同 PG 协议，方言行为委托 [`DatabaseKind::PostgreSql`]；C# `VastBase.cs` 1080 行的品牌差异待移植。
+    VastBase,
     /// Oracle
     Oracle,
     /// DuckDB（内嵌分析数据库）
@@ -53,11 +66,14 @@ pub enum DatabaseKind {
 
 impl DatabaseKind {
     /// 全部已建模的数据库类型。
-    pub const ALL: [DatabaseKind; 16] = [
+    pub const ALL: [DatabaseKind; 19] = [
         DatabaseKind::Sqlite,
         DatabaseKind::MySql,
         DatabaseKind::SqlServer,
         DatabaseKind::PostgreSql,
+        DatabaseKind::KingBase,
+        DatabaseKind::HighGo,
+        DatabaseKind::VastBase,
         DatabaseKind::Oracle,
         DatabaseKind::DuckDb,
         DatabaseKind::Firebird,
@@ -72,6 +88,28 @@ impl DatabaseKind {
         DatabaseKind::Access,
     ];
 
+    /// 是否 PostgreSQL 协议族（含国产 PG 系：KingBase / HighGo / VastBase）。
+    ///
+    /// **判断方言行为一律用该方法**，不要写 `matches!(kind, DatabaseKind::PostgreSql | ...)`——
+    /// 后者在新增族内品牌时会静默漏掉（已踩：加变体后不当渲染会从 `TRUE` 退化成 `1`）。
+    pub fn is_postgres_family(&self) -> bool {
+        matches!(
+            self,
+            DatabaseKind::PostgreSql
+                | DatabaseKind::KingBase
+                | DatabaseKind::HighGo
+                | DatabaseKind::VastBase
+        )
+    }
+
+    /// 是否 MySQL 协议族（含 NovaDb）。
+    ///
+    /// NovaDb 在 [`DatabaseKind`] 里**不单独建变体**（用户 2026-11-01 明确「NovaDb 这个就不需要了」），
+    /// 由 `from_provider` / `from_remote_name` 直接归并到 [`DatabaseKind::MySql`]。
+    pub fn is_mysql_family(&self) -> bool {
+        matches!(self, DatabaseKind::MySql)
+    }
+
     /// 显示名称。
     ///
     /// 与 C# `DatabaseType` 枚举名逐字保持一致（如 `SQLite`/`PostgreSQL`/`DuckDB`/`IRIS`），
@@ -83,6 +121,11 @@ impl DatabaseKind {
             DatabaseKind::MySql => "MySql",
             DatabaseKind::SqlServer => "SqlServer",
             DatabaseKind::PostgreSql => "PostgreSQL",
+            // 国产 PG 系：**返回品牌名**（不是 `PostgreSQL`）—— C# `DbClient` 按它反序列化 `DatabaseType`，
+            // 归并成 PostgreSQL 会让远端丢失品牌信息
+            DatabaseKind::KingBase => "KingBase",
+            DatabaseKind::HighGo => "HighGo",
+            DatabaseKind::VastBase => "VastBase",
             DatabaseKind::Oracle => "Oracle",
             DatabaseKind::DuckDb => "DuckDB",
             DatabaseKind::Firebird => "Firebird",
@@ -141,6 +184,9 @@ impl DatabaseKind {
             DatabaseKind::Sqlite
                 | DatabaseKind::MySql
                 | DatabaseKind::PostgreSql
+                | DatabaseKind::KingBase
+                | DatabaseKind::HighGo
+                | DatabaseKind::VastBase
                 | DatabaseKind::SqlServer
                 | DatabaseKind::DuckDb
         )
@@ -155,7 +201,11 @@ impl DatabaseKind {
         match self {
             DatabaseKind::Sqlite | DatabaseKind::DuckDb => 32_766,
             DatabaseKind::SqlServer => 2_100,
-            DatabaseKind::MySql | DatabaseKind::PostgreSql => 65_535,
+            DatabaseKind::MySql
+            | DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => 65_535,
             _ => 0,
         }
     }
@@ -169,6 +219,9 @@ impl DatabaseKind {
             DatabaseKind::Sqlite
                 | DatabaseKind::MySql
                 | DatabaseKind::PostgreSql
+                | DatabaseKind::KingBase
+                | DatabaseKind::HighGo
+                | DatabaseKind::VastBase
                 | DatabaseKind::DuckDb
         )
     }
@@ -192,8 +245,11 @@ impl DatabaseKind {
                 Ok(DatabaseKind::SqlServer)
             }
             "postgresql" | "postgres" | "pgsql" | "npgsql" => Ok(DatabaseKind::PostgreSql),
-            // 国产 PostgreSQL 系（瀚高/金仓/海量）：同协议，复用 PostgreSQL 驱动
-            "highgo" | "kingbase" | "kingbasees" | "vastbase" => Ok(DatabaseKind::PostgreSql),
+            // 国产 PG 系（金仓/瀚高/海量）：**返回各自的品牌变体**（不是 `PostgreSql`）——
+            // 方言行为委托 PG 族（`is_postgres_family`），但 `name()` 要能回传品牌名
+            "highgo" => Ok(DatabaseKind::HighGo),
+            "kingbase" | "kingbasees" => Ok(DatabaseKind::KingBase),
+            "vastbase" => Ok(DatabaseKind::VastBase),
             "oracle" | "system.data.oracleclient" | "oracle.manageddataaccess" => {
                 Ok(DatabaseKind::Oracle)
             }
@@ -234,37 +290,15 @@ impl DatabaseKind {
     pub fn from_remote_name(name: &str) -> Result<Self> {
         let lower = name.trim().to_ascii_lowercase();
 
-        // 兼容 C# `DatabaseType` 枚举的数值序列（NewLife JSON 可能序列化为数字）
+        // 兼容 C# `DatabaseType` 枚举的数值序列（NewLife JSON 可能序列化为数字）：
+        // 数字 → 枚举名的对照走 [`DATABASE_TYPES`] 单一来源，避免两处清单漂移
         if let Ok(code) = lower.parse::<i32>() {
-            let mapped = match code {
-                1 => "access",
-                2 => "sqlserver",
-                3 => "oracle",
-                4 => "mysql",
-                5 => "sqlce",
-                6 => "sqlite",
-                8 => "postgresql",
-                9 => "dameng",
-                10 => "db2",
-                11 => "tdengine",
-                12 => "hana",
-                13 => "kingbase",
-                14 => "highgo",
-                15 => "iris",
-                16 => "vastbase",
-                17 => "influxdb",
-                18 => "novadb",
-                19 => "clickhouse",
-                20 => "duckdb",
-                21 => "mongodb",
-                100 => "network",
-                _ => {
-                    return Err(Error::Unsupported(format!(
-                        "未知的远端数据库类型编号：{code}"
-                    )));
-                }
+            let Some(name) = database_type_name(code) else {
+                return Err(Error::Unsupported(format!(
+                    "未知的远端数据库类型编号：{code}"
+                )));
             };
-            return Self::from_remote_name(mapped);
+            return Self::from_remote_name(name);
         }
 
         match lower.as_str() {
@@ -272,9 +306,11 @@ impl DatabaseKind {
             "mysql" | "mariadb" | "novadb" | "nova" => Ok(DatabaseKind::MySql),
             "sqlserver" | "mssql" => Ok(DatabaseKind::SqlServer),
             "oracle" => Ok(DatabaseKind::Oracle),
-            "postgresql" | "postgres" | "kingbase" | "highgo" | "vastbase" => {
-                Ok(DatabaseKind::PostgreSql)
-            }
+            "postgresql" | "postgres" => Ok(DatabaseKind::PostgreSql),
+            // 国产 PG 系：远端报品牌名时**保留品牌变体**（方言行为委托 PG 族）
+            "kingbase" | "kingbasees" => Ok(DatabaseKind::KingBase),
+            "highgo" => Ok(DatabaseKind::HighGo),
+            "vastbase" => Ok(DatabaseKind::VastBase),
             "duckdb" => Ok(DatabaseKind::DuckDb),
             "firebird" | "fb" => Ok(DatabaseKind::Firebird),
             "clickhouse" => Ok(DatabaseKind::ClickHouse),
@@ -317,7 +353,10 @@ impl DatabaseKind {
     pub fn placeholder(&self, index: usize) -> String {
         match self {
             DatabaseKind::SqlServer => format!("@p{index}"),
-            DatabaseKind::PostgreSql => format!("${}", index + 1),
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => format!("${}", index + 1),
             DatabaseKind::Oracle => format!(":{}", index + 1),
             _ => "?".to_string(),
         }
@@ -352,7 +391,10 @@ impl DatabaseKind {
                 out.push_str("@p");
                 let _ = write!(out, "{index}");
             }
-            DatabaseKind::PostgreSql => {
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => {
                 out.push('$');
                 let _ = write!(out, "{}", index + 1);
             }
@@ -370,8 +412,11 @@ impl DatabaseKind {
             DatabaseKind::Sqlite => None, // INTEGER PRIMARY KEY AUTOINCREMENT，创建时特殊处理
             DatabaseKind::MySql => Some(" AUTO_INCREMENT".into()),
             DatabaseKind::SqlServer => Some(" IDENTITY(1,1)".into()),
-            // PostgreSQL 的 serial/serial8 是伪类型，需要替换列类型（见 identity_type）
-            DatabaseKind::PostgreSql => None,
+            // PostgreSQL / 国产 PG 系：serial/serial8 是伪类型，需要替换列类型（见 identity_type）
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => None,
             // Oracle/DB2/Firebird 自增由独立序列承担（XCode 约定 SEQ_{表名}），列本身无内联属性
             DatabaseKind::Oracle | DatabaseKind::Db2 | DatabaseKind::Firebird => None,
             // DuckDB：序列 + DEFAULT nextval（与 PostgreSQL 函数同源）
@@ -392,11 +437,23 @@ impl DatabaseKind {
     /// 自增列的列类型改写（`serial`/`COUNTER` 等伪类型需整体替换原类型）。
     fn identity_type(&self, col: &ColumnMeta) -> Option<String> {
         match self {
-            // 与 DH.NCode 对齐：PostgreSQL 自增使用 serial（Int32）/serial8（Int64）
-            DatabaseKind::PostgreSql if col.identity && col.data_type == DataType::Int64 => {
+            // 与 DH.NCode 对齐：PostgreSQL 系自增使用 serial（Int32）/serial8（Int64）
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase
+                if col.identity && col.data_type == DataType::Int64 =>
+            {
                 Some("serial8".into())
             }
-            DatabaseKind::PostgreSql if col.identity => Some("serial".into()),
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase
+                if col.identity =>
+            {
+                Some("serial".into())
+            }
             // Access 自增为 COUNTER（32 位）；Int64 自增在 ACE 中降级为 BIGINT
             DatabaseKind::Access if col.identity && col.data_type == DataType::Int64 => None,
             DatabaseKind::Access if col.identity => Some("COUNTER".into()),
@@ -415,6 +472,10 @@ impl DatabaseKind {
             DatabaseKind::MySql => "SELECT LAST_INSERT_ID()",
             DatabaseKind::SqlServer => "SELECT SCOPE_IDENTITY()",
             DatabaseKind::PostgreSql => "SELECT lastval()",
+            // 国产 PG 系：协议与 PostgreSQL 一致
+            DatabaseKind::KingBase | DatabaseKind::HighGo | DatabaseKind::VastBase => {
+                "SELECT lastval()"
+            }
             DatabaseKind::Oracle => "SELECT \"SEQ_<表名>\".CURRVAL FROM DUAL",
             DatabaseKind::DuckDb => "SELECT currval('<SEQ_表名>')",
             DatabaseKind::Firebird => "SELECT GEN_ID(\"SEQ_<表名>\", 0) FROM RDB$DATABASE",
@@ -501,7 +562,11 @@ impl DatabaseKind {
                 DataType::DateTime => datetime_spec_mssql(col.scale),
                 DataType::Binary => "varbinary(max)".into(),
             },
-            DatabaseKind::PostgreSql => match t {
+            // PostgreSQL 与国产 PG 系（金仓/瀚高/海量）类型映射一致
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => match t {
                 DataType::Boolean => "boolean".into(),
                 DataType::Byte | DataType::Int16 => "smallint".into(),
                 DataType::Int32 => "integer".into(),
@@ -850,9 +915,8 @@ impl DatabaseKind {
     /// 可空性，未写即按可空重建列——只改类型会把原来的 `NOT NULL` 悄悄丢掉（MySQL 还会丢掉
     /// `AUTO_INCREMENT`）。这里传入的是**数据库当前值**而非模型值，语义是「只改类型、其余不动」。
     ///
-    /// 注意：MySQL 的 `DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP` 不在本函数能力范围内
-    /// （目录只读得到 `COLUMN_DEFAULT`，读不到 `EXTRA` 的 `on update`）——调用方应对有默认值的
-    /// 列改用人工确认的路径，而不是自动执行。
+    /// 注意：本函数**不处理默认值**。MySQL 上要连 `DEFAULT` 与 `ON UPDATE CURRENT_TIMESTAMP`
+    /// 一起保留，请改用 [`DatabaseKind::alter_column_sql_keep_full`]。
     /// <param name="table">表</param>
     /// <param name="col">模型列（提供目标类型）</param>
     /// <param name="keep_nullable">库端当前可空性（`None` = 不写该子句）</param>
@@ -898,12 +962,63 @@ impl DatabaseKind {
             }
             // PG 系（含 KingBase/VastBase/HighGo/DuckDB）：ALTER COLUMN .. TYPE ..
             // （PG 改类型不动可空性与默认值，无需重复）
-            DatabaseKind::PostgreSql | DatabaseKind::DuckDb => {
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase
+            | DatabaseKind::DuckDb => {
                 Some(format!("ALTER TABLE {t} ALTER COLUMN {c} TYPE {ty}"))
             }
             // SQLite（需重建表）、Firebird、Access、文档库：不支持直接改列
             _ => None,
         }
+    }
+
+    /// 同 [`DatabaseKind::alter_column_sql_keep`]，但**把库端的默认值与 `ON UPDATE` 一并保留**。
+    ///
+    /// # 为什么需要
+    ///
+    /// MySQL 的 `MODIFY COLUMN` 会把没写出来的 `DEFAULT` 和 `ON UPDATE CURRENT_TIMESTAMP`
+    /// 一起丢掉——所以早期实现遇到「有默认值的列」就直接跳过、只给人工 SQL，
+    /// 于是「列加宽」这类安全变更也会被卡住。既然 `information_schema.COLUMNS` 的
+    /// `COLUMN_DEFAULT` 与 `EXTRA` 都能读到，就应该照原样拼回去，让它**能自动执行**。
+    ///
+    /// # 参数
+    /// - `keep_default`：库端 `COLUMN_DEFAULT` 原文（`None` = 该列无默认值）
+    /// - `default_is_expression`：默认值是**表达式**（MySQL 8 的 `EXTRA` 含 `DEFAULT_GENERATED`）。
+    ///   为真时**原样拼接不加引号**（如 `CURRENT_TIMESTAMP`、`(uuid())`）；为假按列类型渲染字面量
+    /// - `keep_on_update`：库端 `EXTRA` 含 `on update CURRENT_TIMESTAMP`
+    ///
+    /// 只有 MySQL 需要重复默认值（其它方言改列本就保留默认值），其余方言直接返回
+    /// [`DatabaseKind::alter_column_sql_keep`] 的结果。
+    pub fn alter_column_sql_keep_full(
+        &self,
+        table: &TableMeta,
+        col: &ColumnMeta,
+        keep_nullable: Option<bool>,
+        keep_identity: bool,
+        keep_default: Option<&str>,
+        default_is_expression: bool,
+        keep_on_update: bool,
+    ) -> Option<String> {
+        let mut sql = self.alter_column_sql_keep(table, col, keep_nullable, keep_identity)?;
+        if *self != DatabaseKind::MySql {
+            return Some(sql);
+        }
+        if let Some(default) = keep_default.map(str::trim).filter(|d| !d.is_empty()) {
+            let rendered = if default_is_expression {
+                // 表达式默认值（CURRENT_TIMESTAMP / (uuid()) / (CURRENT_DATE + INTERVAL 1 DAY)）
+                // 不能再加引号，否则语义从「表达式」变成「固定字符串」
+                default.to_string()
+            } else {
+                render_default(self, default, col)
+            };
+            sql.push_str(&format!(" DEFAULT {rendered}"));
+        }
+        if keep_on_update {
+            sql.push_str(" ON UPDATE CURRENT_TIMESTAMP");
+        }
+        Some(sql)
     }
 
     /// 生成建表语句（表 + 索引）。
@@ -1123,6 +1238,9 @@ impl DatabaseKind {
             DatabaseKind::Sqlite
             | DatabaseKind::MySql
             | DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase
             | DatabaseKind::DuckDb
             | DatabaseKind::ClickHouse
             | DatabaseKind::TDengine
@@ -1216,6 +1334,74 @@ impl DatabaseKind {
         }
         self.apply_paging(sql, order_sql, offset, size)
     }
+}
+
+/// C# `DH.NCode` 的 `DatabaseType` **权威清单**（枚举值, 枚举名, 中文说明）。
+///
+/// # 为什么需要这张表
+///
+/// Rust 侧把国产/衍生库**按协议归并**了（见下表），枚举数量必然少于 C#。
+/// 但「与 C# 互操作」不能因此丢品牌：`provider=network` 的远端会回传 C# 的枚举名或数值，
+/// 解析对不对直接决定用哪套方言。把清单固化在这里，作为解析与校验的**单一来源**，
+/// 避免像以前那样在 `from_remote_name` 里手写一份数字映射（两处清单早晚漂）。
+///
+/// # 与 [`DatabaseKind`] 的**有意差异**（要改先读这段）
+///
+/// | C# `DatabaseType` | Rust `DatabaseKind` | 差异原因 |
+/// |---|---|---|
+/// | `KingBase`(13) / `HighGo`(14) / `VastBase`(16) | 归并为 [`DatabaseKind::PostgreSql`] | 同 PG 协议；但 C# 是**独立实现类**，各有 SQL 差异（见下） |
+/// | `NovaDb`(18) | 归并为 [`DatabaseKind::MySql`] | 连接串/语法/自增均与 MySQL 一致 |
+/// | `SqlCe`(5) | 无（`from_provider` 明确报错） | SSCE 运行时已停更，Rust 生态无可用驱动 |
+/// | （无） | 多出 [`DatabaseKind::Firebird`] | C# 里该枚举项被注释掉，但 `Firebird.cs` 实现仍在 |
+///
+/// **归并只影响方言选择，不影响品牌识别**：`from_remote_name` 仍认全品牌名。
+/// ⚠️ 已知差距：C# 的 `HighGo`(474 行) / `KingBase`(612) / `VastBase`(1080) / `NovaDb`(509)
+/// 都覆写了 `FormatValue` / `FormatLike` / `GetFieldType` / 索引与注释 SQL 等，
+/// 归并到 PG/MySQL 后**这些品牌差异不会生效**。需要精确对齐某个国产品牌时，
+/// 应按 C# 补独立变体，而不是继续往 PG 分支里加 `if provider == "HighGo"`。
+pub const DATABASE_TYPES: [(i32, &str, &str); 22] = [
+    (0, "None", "无效值"),
+    (1, "Access", "Access 文件数据库"),
+    (2, "SqlServer", "SqlServer 数据库"),
+    (3, "Oracle", "Oracle 数据库"),
+    (4, "MySql", "MySql 数据库"),
+    (5, "SqlCe", "SqlCe 数据库"),
+    (6, "SQLite", "SQLite 数据库"),
+    (8, "PostgreSQL", "PostgreSQL 数据库"),
+    (9, "DaMeng", "达梦数据库"),
+    (10, "DB2", "DB2 数据库"),
+    (11, "TDengine", "TDengine 数据库"),
+    (12, "Hana", "Hana 数据库"),
+    (13, "KingBase", "人大金仓(KingBase) 数据库"),
+    (14, "HighGo", "瀚高(HighGo) 数据库"),
+    (15, "IRIS", "InterSystems IRIS 数据库"),
+    (16, "VastBase", "VastBase 数据库"),
+    (17, "InfluxDB", "InfluxDB 时序数据库"),
+    (18, "NovaDb", "NovaDb 数据库"),
+    (19, "ClickHouse", "ClickHouse 列式分析数据库"),
+    (20, "DuckDB", "DuckDB 嵌入式 OLAP 数据库"),
+    (21, "MongoDB", "MongoDB 文档数据库"),
+    (100, "Network", "网络虚拟数据库"),
+];
+
+/// 按 C# `DatabaseType` 枚举名（大小写不敏感）取枚举值；未知名返回 `None`。
+///
+/// 用于把「远端报来的类型名」原样转成 C# 数值（如日志/审计里记录远端真实品牌）。
+/// <param name="name">枚举名，如 `KingBase` / `SQLite`</param>
+pub fn database_type_code(name: &str) -> Option<i32> {
+    let lower = name.trim().to_ascii_lowercase();
+    DATABASE_TYPES
+        .iter()
+        .find(|(_, n, _)| n.to_ascii_lowercase() == lower)
+        .map(|(code, _, _)| *code)
+}
+
+/// 按 C# `DatabaseType` 枚举值取枚举名；未知值返回 `None`。
+pub fn database_type_name(code: i32) -> Option<&'static str> {
+    DATABASE_TYPES
+        .iter()
+        .find(|(c, _, _)| *c == code)
+        .map(|(_, n, _)| *n)
 }
 
 /// 分页风格（仅 SQL Server 区分；对应 C# `MSPageSplit`（2005/2008）与 2012+ 两套算法）。
@@ -1372,14 +1558,14 @@ fn render_default(kind: &DatabaseKind, default: &str, col: &ColumnMeta) -> Strin
     if col.data_type == DataType::Boolean {
         return match trimmed.to_ascii_lowercase().as_str() {
             "true" | "1" => {
-                if matches!(*kind, DatabaseKind::PostgreSql | DatabaseKind::DuckDb) {
+                if kind.is_postgres_family() || *kind == DatabaseKind::DuckDb {
                     "TRUE".into()
                 } else {
                     "1".into()
                 }
             }
             "false" | "0" => {
-                if matches!(*kind, DatabaseKind::PostgreSql | DatabaseKind::DuckDb) {
+                if kind.is_postgres_family() || *kind == DatabaseKind::DuckDb {
                     "FALSE".into()
                 } else {
                     "0".into()
@@ -1491,11 +1677,107 @@ mod tests {
             DatabaseKind::from_provider("nova").unwrap(),
             DatabaseKind::MySql
         );
+        // 国产 PG 系：**保留品牌变体**（不再归并成 PostgreSql），方言行为仍委托 PG 族
         assert_eq!(
             DatabaseKind::from_provider("kingbase").unwrap(),
-            DatabaseKind::PostgreSql
+            DatabaseKind::KingBase
         );
+        assert_eq!(
+            DatabaseKind::from_provider("kingbasees").unwrap(),
+            DatabaseKind::KingBase
+        );
+        assert_eq!(
+            DatabaseKind::from_provider("highgo").unwrap(),
+            DatabaseKind::HighGo
+        );
+        assert_eq!(
+            DatabaseKind::from_provider("vastbase").unwrap(),
+            DatabaseKind::VastBase
+        );
+        for p in ["postgresql", "kingbase", "highgo", "vastbase"] {
+            let k = DatabaseKind::from_provider(p).unwrap();
+            assert!(k.is_postgres_family(), "{p} 应属 PG 族");
+            // 品牌保真：name() 必须回品牌名（C# DbClient 按它反序列化 DatabaseType）
+            assert_ne!(k.name(), "PostgreSql", "{p} 的 name() 不能塌成 PostgreSql");
+        }
         assert!(DatabaseKind::from_provider("network").is_err());
+    }
+
+    /// 国产 PG 系（金仓/瀚高/海量）的方言产物必须与 PostgreSQL **逐字节一致**。
+    ///
+    /// 背景：2026-11-01 给 `DatabaseKind` 补了这三个品牌变体（原来归并成 `PostgreSql`）。
+    /// 加变体的真正风险不是编译不过，而是**散落的 `matches!(kind, PostgreSql | …)` 漏掉新变体**
+    /// → 静默走兜底分支（如布尔默认值从 `TRUE` 退化成 `1`、插入后拿不到 `RETURNING` 的主键）。
+    /// 本用例把「族内行为等同」钉住，以后漏改会直接红。
+    #[test]
+    fn postgres_family_brands_behave_like_postgres() {
+        let table = sample_table();
+        let code = table.column("Code").unwrap();
+        let title = table.column("Title").unwrap();
+        let pg = DatabaseKind::PostgreSql;
+
+        for brand in [
+            DatabaseKind::KingBase,
+            DatabaseKind::HighGo,
+            DatabaseKind::VastBase,
+        ] {
+            assert!(brand.is_postgres_family(), "{brand:?} 应属 PG 族");
+            assert_eq!(brand.field_type(code), pg.field_type(code), "{brand:?} 类型映射");
+            assert_eq!(brand.field_type(title), pg.field_type(title), "{brand:?} 大文本类型");
+            assert_eq!(brand.placeholder(0), pg.placeholder(0), "{brand:?} 参数占位符");
+            assert_eq!(
+                brand.alter_column_sql(&table, code),
+                pg.alter_column_sql(&table, code),
+                "{brand:?} 改列语句"
+            );
+            assert_eq!(
+                brand.last_identity_sql(),
+                pg.last_identity_sql(),
+                "{brand:?} 自增回读"
+            );
+            assert_eq!(
+                brand.identity_clause(code),
+                pg.identity_clause(code),
+                "{brand:?} 自增修饰"
+            );
+            assert_eq!(
+                brand.apply_paging("SELECT * FROM T", "ORDER BY \"Id\"", 20, 10),
+                pg.apply_paging("SELECT * FROM T", "ORDER BY \"Id\"", 20, 10),
+                "{brand:?} 分页"
+            );
+            assert_eq!(
+                brand.max_statement_params(),
+                pg.max_statement_params(),
+                "{brand:?} 参数上限"
+            );
+            assert_eq!(
+                brand.supports_multi_upsert(),
+                pg.supports_multi_upsert(),
+                "{brand:?} 多行 Upsert"
+            );
+            assert_eq!(
+                brand.supports_multi_row_insert(),
+                pg.supports_multi_row_insert(),
+                "{brand:?} 多行插入"
+            );
+        }
+
+        // 布尔默认值渲染也走 PG 分支（`TRUE` 而不是 `1`）——这条最容易被漏掉的 matches! 命中
+        let mut ok = table.column("Ok").unwrap().clone();
+        ok.default_value = Some("True".into());
+        let mut t = table.clone();
+        t.columns = vec![ok];
+        for brand in [
+            DatabaseKind::KingBase,
+            DatabaseKind::HighGo,
+            DatabaseKind::VastBase,
+        ] {
+            let sql = brand.create_table_sql(&t).remove(0);
+            assert!(
+                sql.contains("DEFAULT TRUE"),
+                "{brand:?} 布尔默认值应渲染成 TRUE：{sql}"
+            );
+        }
     }
 
     #[test]
@@ -1788,6 +2070,62 @@ mod tests {
         let mysql = DatabaseKind::MySql.add_column_sql(&sample_table(), &col);
         assert!(mysql.contains("DEFAULT ''"), "{mysql}");
         assert!(!mysql.contains("('')"), "变长列不应包成表达式：{mysql}");
+    }
+
+    #[test]
+    fn mysql_alter_full_keeps_default_and_on_update() {
+        // 目标：MySQL 改列时**默认值与 ON UPDATE 都要照原样拼回去**，
+        // 这样「有默认值的列」也能随 `sync_schema` 自动加宽，而不是一律交人工。
+        const M: &str = r#"<EntityModel><Tables><Table Name="T" TableName="DH_T">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Nullable="False" />
+            <Column Name="Code" DataType="String" Length="100" Nullable="False" />
+            <Column Name="Updated" DataType="DateTime" Nullable="False" />
+          </Columns>
+        </Table></Tables></EntityModel>"#;
+        let model = EntityModel::parse(M).unwrap();
+        let table = model.table("T").unwrap();
+        let code = table.column("Code").unwrap();
+        let updated = table.column("Updated").unwrap();
+
+        // ① 字面量默认值：按列类型渲染（字符串加引号），可空性照样保留
+        let sql = DatabaseKind::MySql
+            .alter_column_sql_keep_full(table, code, Some(false), false, Some("abc"), false, false)
+            .expect("MySQL 应支持改列");
+        assert!(sql.contains("NOT NULL"), "{sql}");
+        assert!(sql.contains("DEFAULT 'abc'"), "{sql}");
+        assert!(!sql.contains("ON UPDATE"), "{sql}");
+
+        // ② 表达式默认值 + ON UPDATE：原样拼、绝不能加引号
+        let sql = DatabaseKind::MySql
+            .alter_column_sql_keep_full(
+                table,
+                updated,
+                Some(false),
+                false,
+                Some("CURRENT_TIMESTAMP"),
+                true,
+                true,
+            )
+            .expect("MySQL 应支持改列");
+        assert!(sql.contains("DEFAULT CURRENT_TIMESTAMP"), "{sql}");
+        assert!(sql.contains("ON UPDATE CURRENT_TIMESTAMP"), "{sql}");
+        assert!(!sql.contains("'CURRENT_TIMESTAMP'"), "表达式默认值不能加引号：{sql}");
+
+        // ③ 没有默认值时与旧方法逐字节一致（不引入回归）
+        assert_eq!(
+            DatabaseKind::MySql.alter_column_sql_keep_full(
+                table, code, Some(true), false, None, false, false
+            ),
+            DatabaseKind::MySql.alter_column_sql_keep(table, code, Some(true), false)
+        );
+
+        // ④ 非 MySQL 方言：默认值本就由库保留，不追加任何子句
+        assert_eq!(
+            DatabaseKind::PostgreSql
+                .alter_column_sql_keep_full(table, code, None, false, Some("abc"), false, true),
+            DatabaseKind::PostgreSql.alter_column_sql_keep(table, code, None, false)
+        );
     }
 
     #[test]

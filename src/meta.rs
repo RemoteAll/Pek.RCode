@@ -83,7 +83,10 @@ impl Dal {
                     escape_text(&name)
                 )
             }
-            DatabaseKind::PostgreSql => format!(
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => format!(
                 "SELECT datname FROM pg_database WHERE datname = '{}'",
                 escape_text(&name)
             ),
@@ -173,9 +176,12 @@ impl Dal {
                     escape_text(file)
                 ),
             },
-            // PG 系（含 KingBase/HighGo/VastBase，Rust 统一映射为 PostgreSql）；
+            // PG 系（KingBase/HighGo/VastBase 现已是独立变体，行为仍走 PG 实现）；
             // VastBase 不支持 `IF NOT EXISTS`/`ENCODING` 子句（对齐 C# `VastBaseMetaData.CreateDatabaseSQL`）
-            DatabaseKind::PostgreSql => {
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => {
                 pg_create_database_sql(kind, name, self.connection_string().provider())
             }
             DatabaseKind::Oracle => {
@@ -254,6 +260,9 @@ impl Dal {
             }
             DatabaseKind::MySql
             | DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase
             | DatabaseKind::Hana
             | DatabaseKind::Iris
             | DatabaseKind::TDengine => {
@@ -425,6 +434,9 @@ impl Dal {
             | DatabaseKind::DaMeng
             | DatabaseKind::Db2
             | DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase
             | DatabaseKind::Iris => format!("Comment On Table {tname} is '{text}'"),
             DatabaseKind::SqlServer => format!(
                 "EXEC dbo.sp_addextendedproperty @name=N'MS_Description', @value=N'{text}', \
@@ -452,7 +464,10 @@ impl Dal {
             DatabaseKind::Oracle
             | DatabaseKind::DaMeng
             | DatabaseKind::Db2
-            | DatabaseKind::PostgreSql => format!("Comment On Table {tname} is ''"),
+            | DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => format!("Comment On Table {tname} is ''"),
             DatabaseKind::SqlServer => format!(
                 "EXEC dbo.sp_dropextendedproperty @name=N'MS_Description', \
                  @level0type=N'SCHEMA',@level0name=N'dbo', @level1type=N'TABLE',@level1name=N'{}'",
@@ -483,6 +498,9 @@ impl Dal {
             | DatabaseKind::DaMeng
             | DatabaseKind::Db2
             | DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase
             | DatabaseKind::Iris => format!("Comment On Column {tname}.{cname} is '{text}'"),
             DatabaseKind::SqlServer => format!(
                 "EXEC dbo.sp_addextendedproperty @name=N'MS_Description', @value=N'{text}', \
@@ -512,7 +530,10 @@ impl Dal {
             DatabaseKind::Oracle
             | DatabaseKind::DaMeng
             | DatabaseKind::Db2
-            | DatabaseKind::PostgreSql => format!("Comment On Column {tname}.{cname} is ''"),
+            | DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => format!("Comment On Column {tname}.{cname} is ''"),
             DatabaseKind::SqlServer => format!(
                 "EXEC dbo.sp_dropextendedproperty @name=N'MS_Description', \
                  @level0type=N'SCHEMA',@level0name=N'dbo', @level1type=N'TABLE',@level1name=N'{}', \

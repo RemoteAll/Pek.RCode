@@ -331,7 +331,12 @@ fn multi_write_impl(
         BatchWriteMode::InsertIgnore => match kind {
             DatabaseKind::Sqlite | DatabaseKind::DuckDb => ("INSERT OR IGNORE INTO", String::new()),
             DatabaseKind::MySql => ("INSERT IGNORE INTO", String::new()),
-            DatabaseKind::PostgreSql => ("INSERT INTO", " ON CONFLICT DO NOTHING".into()),
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => {
+                ("INSERT INTO", " ON CONFLICT DO NOTHING".into())
+            }
             _ => {
                 return Err(Error::Unsupported(format!(
                     "{kind:?} 不支持多行 InsertIgnore 批量写入"
@@ -374,7 +379,12 @@ fn multi_write_impl(
                 .collect();
 
             match kind {
-                DatabaseKind::Sqlite | DatabaseKind::DuckDb | DatabaseKind::PostgreSql => {
+                DatabaseKind::Sqlite
+                | DatabaseKind::DuckDb
+                | DatabaseKind::PostgreSql
+                | DatabaseKind::KingBase
+                | DatabaseKind::HighGo
+                | DatabaseKind::VastBase => {
                     // 冲突列：显式指定优先（外部唯一键 upsert），否则用模型主键
                     let target: Vec<String> = match conflict_columns {
                         Some(cols) if !cols.is_empty() => cols
@@ -448,7 +458,12 @@ fn multi_write_impl(
     // 零中间分配拼接：直接写入预分配缓冲（每行不再建 Vec/format 字符串）
     // 单个占位符最长约 8 字符（`@p123456` / `$123456`），其余方言 1 字符
     let slot = match kind {
-        DatabaseKind::PostgreSql | DatabaseKind::Oracle | DatabaseKind::SqlServer => 8,
+        DatabaseKind::PostgreSql
+        | DatabaseKind::KingBase
+        | DatabaseKind::HighGo
+        | DatabaseKind::VastBase
+        | DatabaseKind::Oracle
+        | DatabaseKind::SqlServer => 8,
         _ => 1,
     };
     let mut sql = String::with_capacity(
@@ -983,7 +998,10 @@ pub fn delete_batched_sql_named(
             }
             sql
         }
-        DatabaseKind::PostgreSql => {
+        DatabaseKind::PostgreSql
+        | DatabaseKind::KingBase
+        | DatabaseKind::HighGo
+        | DatabaseKind::VastBase => {
             let mut inner = format!("SELECT ctid FROM {t}");
             if has_where {
                 inner.push_str(" WHERE ");

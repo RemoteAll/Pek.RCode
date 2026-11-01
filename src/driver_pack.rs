@@ -795,6 +795,13 @@ fn component_id_for(kind: DatabaseKind) -> Option<String> {
         DatabaseKind::Db2 | DatabaseKind::DaMeng | DatabaseKind::Iris | DatabaseKind::Access => {
             "odbc".to_string()
         }
+        // 国产 PG 系：KingBase / HighGo 与 PostgreSQL 同协议，**共用 `dbserver-postgresql` 组件**
+        // （平台没有 dbserver-kingbase / dbserver-highgo 包；按 `name()` 推导会去下一个不存在的包，
+        //  表现为「驱动下载失败 / 连不上库」——这类坑加品牌变体时最容易踩）
+        // VastBase 平台有独立组件，由 `component_id_for_provider` 特判
+        DatabaseKind::KingBase | DatabaseKind::HighGo | DatabaseKind::VastBase => {
+            "postgresql".to_string()
+        }
         other => other.name().to_ascii_lowercase(),
     };
     Some(format!("dbserver-{slug}"))
@@ -1390,6 +1397,37 @@ mod tests {
         assert!(resolve_provider_kind(&net).is_err());
         let unknown = ConnectionString::parse("Server=x;Provider=NoSuchDb");
         assert!(resolve_provider_kind(&unknown).is_err());
+    }
+
+    /// 国产 PG 系必须拿到**存在的**驱动组件。
+    ///
+    /// 背景：`component_id_for` 原来按 `kind.name()` 推导组件 id，给 `DatabaseKind` 补
+    /// KingBase/HighGo 变体后，`name()` 变成品牌名 → 推出 `dbserver-kingbase` / `dbserver-highgo`
+    /// 这两个平台**根本没有**的包，表现为「驱动下载失败 / 连不上库」。
+    /// 本用例钉住：金仓/瀚高 → `dbserver-postgresql`，海量 → 独立组件 `dbserver-vastbase`。
+    #[test]
+    fn postgres_family_brands_share_existing_component() {
+        for p in ["kingbase", "kingbasees", "highgo", "postgresql", "postgres"] {
+            let kind = DatabaseKind::from_provider(p).unwrap();
+            assert_eq!(
+                component_id_for_provider(kind, p).as_deref(),
+                Some("dbserver-postgresql"),
+                "{p} 必须复用 PostgreSQL 驱动组件"
+            );
+        }
+        // 海量：平台有独立组件
+        let vast = DatabaseKind::from_provider("vastbase").unwrap();
+        assert_eq!(
+            component_id_for_provider(vast, "vastbase").as_deref(),
+            Some("dbserver-vastbase")
+        );
+        // NovaDb 归并到 MySQL（不单独建变体），组件仍是 dbserver-mysql
+        let nova = DatabaseKind::from_provider("novadb").unwrap();
+        assert_eq!(nova, DatabaseKind::MySql);
+        assert_eq!(
+            component_id_for_provider(nova, "novadb").as_deref(),
+            Some("dbserver-mysql")
+        );
     }
 
     #[test]

@@ -82,6 +82,9 @@ pub fn supports_index_catalog(kind: DatabaseKind) -> bool {
         DatabaseKind::Sqlite
             | DatabaseKind::MySql
             | DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase
             | DatabaseKind::SqlServer
             | DatabaseKind::Oracle
             | DatabaseKind::DuckDb
@@ -109,7 +112,11 @@ pub fn read_tables(
     let mut tables = match kind {
         DatabaseKind::Sqlite => read_sqlite(session)?,
         DatabaseKind::MySql => read_mysql(session)?,
-        DatabaseKind::PostgreSql => read_postgres(session)?,
+        // 国产 PG 系（金仓/瀚高/海量）：方向与 PostgreSQL 一致
+        DatabaseKind::PostgreSql
+        | DatabaseKind::KingBase
+        | DatabaseKind::HighGo
+        | DatabaseKind::VastBase => read_postgres(session)?,
         DatabaseKind::SqlServer => read_mssql(session)?,
         DatabaseKind::Oracle | DatabaseKind::DaMeng => read_oracle(session)?,
         DatabaseKind::DuckDb => read_duckdb(session)?,
@@ -140,7 +147,10 @@ pub fn read_indexes(
     match kind {
         DatabaseKind::Sqlite => sqlite_indexes(session, table),
         DatabaseKind::MySql => mysql_indexes(session, table),
-        DatabaseKind::PostgreSql => postgres_indexes(session, table),
+        DatabaseKind::PostgreSql
+        | DatabaseKind::KingBase
+        | DatabaseKind::HighGo
+        | DatabaseKind::VastBase => postgres_indexes(session, table),
         DatabaseKind::SqlServer => mssql_indexes(session, table),
         DatabaseKind::Oracle | DatabaseKind::DaMeng => {
             oracle_indexes(session, table).map(|(idx, _)| idx)

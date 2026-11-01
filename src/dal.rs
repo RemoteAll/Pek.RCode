@@ -387,7 +387,12 @@ fn create_session(kind: DatabaseKind, conn_str: &ConnectionString) -> Result<Box
         }
         DatabaseKind::MySql => open_mysql(conn_str),
         DatabaseKind::SqlServer => open_sqlserver(conn_str),
-        DatabaseKind::PostgreSql => open_postgres(conn_str),
+        // 国产 PG 系（金仓/瀚高/海量）：同 PG 协议，复用 PostgreSQL 驱动
+        // （连接串里的 provider 仍写各自品牌；`DatabaseKind::name()` 保留品牌名）
+        DatabaseKind::PostgreSql
+        | DatabaseKind::KingBase
+        | DatabaseKind::HighGo
+        | DatabaseKind::VastBase => open_postgres(conn_str),
         DatabaseKind::Oracle => open_oracle(conn_str),
         DatabaseKind::DuckDb => {
             #[cfg(feature = "duckdb")]
@@ -1458,6 +1463,9 @@ impl Dal {
             .ok_or_else(|| Error::Model("尚未加载数据模型，无法同步结构".into()))?;
         let mut session = self.open_session()?;
         let db_columns = self.db_column_map(session.as_mut())?;
+        // MySQL 的 `EXTRA`（`on update CURRENT_TIMESTAMP` / `DEFAULT_GENERATED` / 生成列标记）
+        // 不在 `ColumnInfo` 里，单独读一次；其它方言为空表。
+        let mysql_extra = self.mysql_column_extra(session.as_mut());
 
         for change in &diff.column_changes {
             let Some(table) = model.table(&change.table) else {
@@ -1493,26 +1501,38 @@ impl Dal {
                 change.table.to_ascii_lowercase(),
                 change.column.to_ascii_lowercase(),
             ));
-            // MySQL 的 `MODIFY COLUMN` 会把 `DEFAULT`（及 `ON UPDATE CURRENT_TIMESTAMP`）一起丢掉，
-            // 而目录读不到 `EXTRA` 里的 `on update`——宁可给 SQL 让人确认，也不静默改掉默认值。
+            // MySQL 的 `MODIFY COLUMN` 会把 `DEFAULT` 与 `ON UPDATE CURRENT_TIMESTAMP` 一起丢掉，
+            // 所以要从 `EXTRA` 把这两项读回来再拼进 DDL —— **有默认值不再等于「不自动执行」**。
+            let extra = mysql_extra
+                .get(&(
+                    change.table.to_ascii_lowercase(),
+                    change.column.to_ascii_lowercase(),
+                ))
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            // 生成列（`VIRTUAL/STORED GENERATED`）的表达式不在目录里，改类型会破坏它 → 仍交人工
             if self.kind == DatabaseKind::MySql
-                && db_col.and_then(|c| c.default_value.as_ref()).is_some()
+                && (extra.contains("virtual generated") || extra.contains("stored generated"))
             {
                 let sql = self
                     .kind
                     .alter_column_sql_keep(table, col, db_col.map(|c| c.nullable), false)
                     .unwrap_or_default();
                 report.notes.push(format!(
-                    "{} 未自动执行（该列有默认值，MySQL 改列会丢默认值/ON UPDATE），请人工确认后执行：{sql}",
+                    "{} 未自动执行（该列是生成列，改类型会破坏生成表达式），请人工确认后执行：{sql}",
                     change.label()
                 ));
                 continue;
             }
-            let Some(sql) = self.kind.alter_column_sql_keep(
+            let Some(sql) = self.kind.alter_column_sql_keep_full(
                 table,
                 col,
                 db_col.map(|c| c.nullable),
                 db_col.map(|c| c.identity).unwrap_or(false),
+                db_col.and_then(|c| c.default_value.as_deref()),
+                // MySQL 8 的表达式默认值（CURRENT_TIMESTAMP 等）：原样拼，不加引号
+                extra.contains("default_generated"),
+                extra.contains("on update"),
             ) else {
                 report.notes.push(format!(
                     "{} 需人工处理（该数据库不支持直接改列，如 SQLite 需重建表）",
@@ -1554,6 +1574,54 @@ impl Dal {
             Err(e) => return Err(e),
         }
         Ok(map)
+    }
+
+    /// MySQL：读 `information_schema.COLUMNS` 的 `EXTRA`，键同样是 `(小写表名, 小写列名)`。
+    ///
+    /// # 为什么单独读而不放进 `ColumnInfo`
+    ///
+    /// `ColumnInfo` 是所有方言共用的列目录结构，为一项**目前只有 MySQL 改列路径需要**的信息
+    /// 给它加字段，要连带改十几处构造点、且是对外 `pub` 结构的破坏性变更；
+    /// 这里只在「确实有列变更」时才查一次，开销可忽略，破坏面为零。
+    ///
+    /// 读不到的项（无权限 / 老版本无该列）一律返回空表，调用方按「没有默认值/无 on update」处理，
+    /// 与旧行为一致。
+    fn mysql_column_extra(
+        &self,
+        session: &mut dyn SqlSession,
+    ) -> HashMap<(String, String), String> {
+        let mut map = HashMap::new();
+        if self.kind != DatabaseKind::MySql {
+            return map;
+        }
+        let Ok(set) = session.query(
+            "SELECT TABLE_NAME, COLUMN_NAME, EXTRA FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE()",
+            &[],
+        ) else {
+            return map;
+        };
+        for row in &set.rows {
+            let table = row
+                .get(0)
+                .and_then(DbValue::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let column = row
+                .get(1)
+                .and_then(DbValue::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let extra = row
+                .get(2)
+                .and_then(DbValue::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !table.is_empty() && !column.is_empty() && !extra.is_empty() {
+                map.insert((table, column), extra);
+            }
+        }
+        map
     }
 
     /// `Full` 档的**删除类**动作：多余索引 + 多余列（列规格变更见 [`Dal::apply_column_changes`]）。
@@ -2533,10 +2601,7 @@ impl<'a> TableRef<'a> {
         let identity = self.table.identity();
 
         if let Some(id_col) = identity
-            && matches!(
-                self.dal.kind,
-                DatabaseKind::PostgreSql | DatabaseKind::DuckDb
-            )
+            && (self.dal.kind.is_postgres_family() || self.dal.kind == DatabaseKind::DuckDb)
         {
             sql.push_str(" RETURNING ");
             sql.push_str(
