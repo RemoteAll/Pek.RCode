@@ -128,59 +128,62 @@ fn sync_schema_never_downgrades_unique_index() {
         assert_eq!(device_index_unique(&dal), Some(true), "不应降级为普通索引");
     }
 
-    /// 「该清的清」：模型里没有的索引由 `sync_indexes` 自动删除（主键/系统索引除外）。
-    #[test]
-    fn sync_indexes_drops_extra_index_not_in_model() {
-        let (dir, conn) = temp_conn("drop-extra");
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
-        {
-            let dal =
-                Dal::open_with_model(&conn, EntityModel::parse(MODEL_PLAIN).unwrap()).unwrap();
-            dal.sync_schema().unwrap();
-            // 手工加一个模型里没有的索引，模拟历史遗留
-            let mut session = dal.open_session().unwrap();
-            session
-                .execute("create index ix_extra_pings on DeviceOnline(Pings)", &[])
-                .unwrap();
-        }
+/// 「该清的清」：模型里没有的索引由 `sync_indexes` 自动删除（主键/系统索引除外）。
+///
+/// 注意：本函数原来是**写在 `sync_schema_never_downgrades_unique_index` 函数体内**的，
+/// 内层 `#[test]` 不生效（编译器报 `cannot test inner items`、函数 `never used`），
+/// 也就是这条用例**从未真正跑过**。已提到模块级。
+#[test]
+fn sync_indexes_drops_extra_index_not_in_model() {
+    let (dir, conn) = temp_conn("drop-extra");
 
-        {
-            // 模型只有 DeviceId 索引 → Pings 的索引属"多余"，应被清理
-            let dal =
-                Dal::open_with_model(&conn, EntityModel::parse(MODEL_PLAIN).unwrap()).unwrap();
-            let report = dal.sync_indexes().unwrap();
-            assert!(
-                report
-                    .dropped_indexes
-                    .iter()
-                    .any(|(_, name)| name.to_lowercase().contains("extra")),
-                "应删除模型外的索引：{:?}",
-                report.dropped_indexes
-            );
-
-            let mut session = dal.open_session().unwrap();
-            let rows = session
-                .query("pragma index_list('DeviceOnline')", &[])
-                .unwrap();
-            let names: Vec<String> = rows
-                .rows
-                .iter()
-                .filter_map(|r| {
-                    r.get_by_name("name")
-                        .and_then(|v| v.as_str().map(|s| s.to_lowercase()))
-                })
-                .collect();
-            assert!(
-                !names.iter().any(|n| n.contains("extra")),
-                "多余索引应已被删除：{names:?}"
-            );
-            assert!(
-                names.iter().any(|n| n.contains("deviceid")),
-                "模型里的索引必须保留：{names:?}"
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
+    {
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL_PLAIN).unwrap()).unwrap();
+        dal.sync_schema().unwrap();
+        // 手工加一个模型里没有的索引，模拟历史遗留
+        let mut session = dal.open_session().unwrap();
+        session
+            .execute("create index ix_extra_pings on DeviceOnline(Pings)", &[])
+            .unwrap();
     }
+
+    {
+        // 模型只有 DeviceId 索引 → Pings 的索引属"多余"，应被清理
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL_PLAIN).unwrap()).unwrap();
+        let report = dal.sync_indexes().unwrap();
+        assert!(
+            report
+                .dropped_indexes
+                .iter()
+                .any(|(_, name)| name.to_lowercase().contains("extra")),
+            "应删除模型外的索引：{:?}",
+            report.dropped_indexes
+        );
+
+        let mut session = dal.open_session().unwrap();
+        let rows = session
+            .query("pragma index_list('DeviceOnline')", &[])
+            .unwrap();
+        let names: Vec<String> = rows
+            .rows
+            .iter()
+            .filter_map(|r| {
+                r.get_by_name("name")
+                    .and_then(|v| v.as_str().map(|s| s.to_lowercase()))
+            })
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains("extra")),
+            "多余索引应已被删除：{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("deviceid")),
+            "模型里的索引必须保留：{names:?}"
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -15,7 +15,8 @@
 
 #![cfg(feature = "driver-mysql")]
 
-use pek_rcode::{Dal, EntityModel, SqlSession};
+// `dyn SqlSession` 的方法可直接调用，不需要把 trait 引进来
+use pek_rcode::{Dal, EntityModel};
 
 /// 目标表模型：`LogTime` 声明 `Scale="3"`（毫秒）。
 const MODEL: &str = r#"<EntityModel><Tables><Table Name="OpLog" TableName="Hlk_OpLogAlterTest">
