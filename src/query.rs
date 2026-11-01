@@ -51,6 +51,22 @@ pub struct Cond {
 }
 
 /// WHERE 条件构建器（多个条件之间为 AND）。
+///
+/// # 注意：比较运算一律不匹配 NULL
+///
+/// [`Where::eq`] / [`Where::ne`] / [`Where::gt`] / [`Where::ge`] / [`Where::lt`] / [`Where::le`]
+/// 渲染出来就是字面 SQL 比较（`"col" <= ?`）。SQL 中 `NULL` 参与比较的结果是 `NULL`
+/// （不是 `true`/`false`），所以 **`NULL` 行永远不会被比较条件命中**，而 `AND` 只要挂上一条就整体不成。
+///
+/// 可空列该这样写：
+///
+/// - 「为空 / 非空」→ [`Where::is_null`] / [`Where::not_null`]；
+/// - 「为空**或**满足阀值」（如软删除列 `DeletedAt` 的「未删除」）→
+///   [`Where::raw`]：`raw("(DeletedAt IS NULL OR DeletedAt <= ?)", vec![…])`。
+///
+/// 反例（真实踩过）：用 `le("DeletedAt", "2000-01-01 00:00:00")` 想表达「未删除」，
+/// 结果**把所有未删除的行全筛掉了**——列表恒 0 条、分类计数全 0，
+/// 而按主键取详情却一切正常（因为它不带这个条件），极难定位。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Where {
     conds: Vec<Cond>,
@@ -97,32 +113,32 @@ impl Where {
         self
     }
 
-    /// `列 = 值`
+    /// `列 = 值`（**不匹配 `NULL` 行**，见 [`Where`] 的 NULL 说明）
     pub fn eq(self, column: impl Into<String>, value: impl Into<DbValue>) -> Self {
         self.and_raw(column, Op::Eq, vec![value.into()])
     }
 
-    /// `列 <> 值`
+    /// `列 <> 值`（**不匹配 `NULL` 行**；想含空值请补 [`Where::is_null`]）
     pub fn ne(self, column: impl Into<String>, value: impl Into<DbValue>) -> Self {
         self.and_raw(column, Op::Ne, vec![value.into()])
     }
 
-    /// `列 > 值`
+    /// `列 > 值`（**不匹配 `NULL` 行**，见 [`Where`] 的 NULL 说明）
     pub fn gt(self, column: impl Into<String>, value: impl Into<DbValue>) -> Self {
         self.and_raw(column, Op::Gt, vec![value.into()])
     }
 
-    /// `列 >= 值`
+    /// `列 >= 值`（**不匹配 `NULL` 行**，见 [`Where`] 的 NULL 说明）
     pub fn ge(self, column: impl Into<String>, value: impl Into<DbValue>) -> Self {
         self.and_raw(column, Op::Ge, vec![value.into()])
     }
 
-    /// `列 < 值`
+    /// `列 < 值`（**不匹配 `NULL` 行**，见 [`Where`] 的 NULL 说明）
     pub fn lt(self, column: impl Into<String>, value: impl Into<DbValue>) -> Self {
         self.and_raw(column, Op::Lt, vec![value.into()])
     }
 
-    /// `列 <= 值`
+    /// `列 <= 值`（**不匹配 `NULL` 行**；「未删除」这类语义用 [`Where::is_null`]）
     pub fn le(self, column: impl Into<String>, value: impl Into<DbValue>) -> Self {
         self.and_raw(column, Op::Le, vec![value.into()])
     }
