@@ -3,6 +3,8 @@
 # 用法：powershell -NoProfile -ExecutionPolicy Bypass -File tools/continuity/sync-memory.ps1
 #       也可显式指定项目根：... -ProjectPath <项目根目录>
 #       本机记忆为空且镜像已存在时默认跳过（防稀疏记忆覆盖完整镜像），-Force 强制写入。
+# 合并规则（2026-11-05 起）：按 `## <文件名>` 小节合并——同名以本机记忆为准；
+#       仅镜像存在的历史小节原样保留并标注来源，避免“整文件覆盖”丢内容（本项目曾丢 2 个小节）。
 # 说明：本脚本含中文，必须以 UTF-8 with BOM 保存（Windows PowerShell 5.1 按 GBK 读无 BOM 会报语法错误）。
 
 param(
@@ -83,52 +85,69 @@ if ($files.Count -eq 0 -and -not $Force -and (Test-Path $outFile)) {
     }
 }
 
-# ———— 合并模式：保留镜像中「本次未同步」的章节（防稀疏记忆覆盖完整镜像）————
-# 历史事故（2026-10-19）：旧版为全量覆盖，本机只新建 1 个记忆文件就同步，
-# 导致 docs\项目记忆.md 原有 100+ 行内容被清掉。改为按 `## <文件名>` 章节合并：
-#   同名章节用本机最新内容替换，其余章节原样保留。
-$sections = @{}
+# ---- 合并式写入：先解析既有镜像的小节，本地缺失的小节原样保留（防“直接覆盖”丢内容） ----
+# 镜像小节格式固定为 `## <本机记忆文件名>`，正文为本地记忆文件原文。
+# 坑：正文里也会出现 `## xxx` 标题（如「## PowerShell 坑」），若只认 `## ` 会把一个文件切碎、
+#     越同步越乱（2026-11-05 修）。**只把小节标题形如 `<文件名>.md` 的当作边界**。
+# 坑：解析时若只 TrimEnd，正文开头残留的空行会随每次同步 +1（表现为“又多空白行”）。
+$mirrorNote = '> 保留自仓库镜像：本机 Copilot 工作记忆当前无同名文件（合并写入，未覆盖）。'
+$existing = New-Object 'System.Collections.Specialized.OrderedDictionary'
 if (Test-Path $outFile) {
-    $old = [IO.File]::ReadAllText($outFile, [Text.Encoding]::UTF8)
-    if ($old.Trim().Length -gt 0) {
-        $parts = [regex]::Split($old, '(?m)^## ')
-        for ($i = 1; $i -lt $parts.Count; $i++) {
-            $chunk = $parts[$i]
-            $nl = $chunk.IndexOf("`n")
-            $name = if ($nl -ge 0) { $chunk.Substring(0, $nl).Trim() } else { $chunk.Trim() }
-            if ($name) {
-                $body = if ($nl -ge 0) { $chunk.Substring($nl + 1) } else { '' }
-                $sections[$name] = $body.Trim()
-            }
+    $oldText = [IO.File]::ReadAllText($outFile, [Text.Encoding]::UTF8)
+    $secName = $null
+    $secBody = New-Object System.Text.StringBuilder
+    foreach ($line in ($oldText -split "`r?`n")) {
+        if ($line -match '^##\s+(.+?\.md)\s*$') {
+            if ($secName) { $existing[$secName] = ($secBody.ToString().Trim()) }
+            $secName = $Matches[1]
+            $secBody = New-Object System.Text.StringBuilder
+        } elseif ($secName) {
+            [void]$secBody.AppendLine($line)
         }
     }
+    if ($secName) { $existing[$secName] = ($secBody.ToString().Trim()) }
 }
 
-# 本次同步的文件覆盖同名章节（文件名即章节名）
-foreach ($f in $files) {
-    $sections[$f.Name] = [IO.File]::ReadAllText($f.FullName, [Text.Encoding]::UTF8).Trim()
-}
+# 输出顺序：先按既有镜像顺序（保证 diff 稳定），再追加本地新增的小节
+$order = @()
+foreach ($k in $existing.Keys) { $order += $k }
+foreach ($f in $files) { if ($order -notcontains $f.Name) { $order += $f.Name } }
 
+$localMap = @{}
+foreach ($f in $files) { $localMap[$f.Name] = [IO.File]::ReadAllText($f.FullName, [Text.Encoding]::UTF8) }
+
+$keptCount = 0
 $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("# $projectName · 项目记忆（本机工作记忆同步）")
 [void]$sb.AppendLine('')
-[void]$sb.AppendLine('> 本文由 `tools/continuity/sync-memory.ps1` 自动同步（来源：本机 Copilot 工作记忆）。')
-[void]$sb.AppendLine('> 合并模式：本机未同步的既有章节原样保留（防稀疏覆盖）；同名章节以本机最新内容替换。')
+[void]$sb.AppendLine('> 本文由 `tools/continuity/sync-memory.ps1` 合并同步（来源：本机 Copilot 工作记忆 + 既有镜像）。')
+[void]$sb.AppendLine('> 同名小节以本机记忆为准；仅镜像存在的小节原样保留，不会被覆盖删除。')
+[void]$sb.AppendLine('> 小节标题固定为 `## <本机记忆文件名>.md`；每个小节下的正文为文件原文（正文里的标题不影响合并）。')
 [void]$sb.AppendLine("> 同步时间：" + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
 [void]$sb.AppendLine('')
 
-if ($sections.Count -eq 0) {
+if ($order.Count -eq 0) {
     [void]$sb.AppendLine('（本机工作记忆为空——尚无 repo 记忆文件。）')
 } else {
-    foreach ($name in ($sections.Keys | Sort-Object)) {
+    foreach ($name in $order) {
         [void]$sb.AppendLine("## $name")
         [void]$sb.AppendLine('')
-        [void]$sb.AppendLine($sections[$name])
+        if ($localMap.ContainsKey($name)) {
+            [void]$sb.AppendLine($localMap[$name].Trim())
+        } else {
+            $body = $existing[$name]
+            if (-not $body.Contains($mirrorNote)) { [void]$sb.AppendLine($mirrorNote) }
+            [void]$sb.AppendLine($body)
+            $keptCount++
+        }
         [void]$sb.AppendLine('')
     }
 }
 
+# 归一化：连续空行压成 1 行（旧版本曾把空行越积越多）
+$normalized = [regex]::Replace($sb.ToString(), "(\r?\n){3,}", "`r`n`r`n")
+
 $dir = Split-Path $outFile
 if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
-[IO.File]::WriteAllText($outFile, $sb.ToString(), (New-Object Text.UTF8Encoding($false)))
-Write-Host "[记忆同步] 已同步 $($files.Count) 个记忆文件（合并模式，保留既有 $($sections.Count - $files.Count) 个章节）-> docs\项目记忆.md"
+[IO.File]::WriteAllText($outFile, $normalized, (New-Object Text.UTF8Encoding($false)))
+Write-Host "[记忆同步] 本地记忆 $($files.Count) 个；保留镜像小节 $keptCount 个 -> docs\项目记忆.md"
