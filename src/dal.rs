@@ -1432,7 +1432,18 @@ impl Dal {
             // 只读档：不执行，收集“将执行”的 DDL 供人工处理（对齐 C# `DDL模式[ReadOnly]，请手工创建表`）
             report.pending_sql.push(sql.to_string());
         } else {
-            session.execute(sql, &[])?;
+            match session.execute(sql, &[]) {
+                Ok(_) => {}
+                // **幂等**：多个服务同时启动时，先到者已经完成了同一动作，后到者会收到
+                // 「列/索引已存在」或「要删的对象已不存在」。目标状态已经达成，不能算失败——
+                // 否则本轮后续的表/列/索引全部不再同步（2026-11-06 现场：错误从 1060/1061 变成 1091）。
+                Err(e) if is_idempotent_ddl_error(&e) => {
+                    report
+                        .notes
+                        .push(format!("跳过（目标状态已达成）：{sql}（{e}）"));
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -2339,6 +2350,24 @@ fn same_index(a: &[String], b: &[String]) -> bool {
         && a.iter()
             .zip(b.iter())
             .all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// DDL 的「目标状态已达成」类错误（并发启动 / 重复执行时出现，可以安全跳过）。
+///
+/// - 1060 `Duplicate column name`：补列时另一个进程已经加了；
+/// - 1061 `Duplicate key name`：补索引时另一个进程已经加了；
+/// - 1091 `Can't DROP ...; check that column/key exists`：删索引/列时另一个进程已经删了；
+/// - 1050 `Table already exists`：建表时另一个进程已经建了。
+///
+/// 这些不是权限问题，也不代表结构不对——目标状态已经达成。若当作失败，`sync_schema` 会在
+/// 第一条处中断，后面的表/列/索引本轮都不再同步。
+fn is_idempotent_ddl_error(err: &Error) -> bool {
+    let Error::Db(msg) = err else {
+        return false;
+    };
+    ["ERROR 1060", "ERROR 1061", "ERROR 1091", "ERROR 1050"]
+        .iter()
+        .any(|code| msg.contains(code))
 }
 
 /// 宽松比较列类型：只比较基础类型名（忽略长度/精度/大小写），并处理常见等价别名。
@@ -4065,6 +4094,25 @@ mod tests {
 
         // 无法识别时给出明确错误
         assert!(ConnectionString::parse("Server=x").kind().is_err());
+    }
+
+    /// DDL 的「目标状态已达成」错误必须被识别（并发启动时另一个进程先做了）。
+    ///
+    /// 回归点：2026-11-06 现场多个服务同时启动，`sync_schema` 在
+    /// `1060 Duplicate column / 1061 Duplicate key / 1091 Can't DROP` 处中断，
+    /// 后面的表/列本轮全部不再同步。这些错误码应视为幂等、继续往下走。
+    #[test]
+    fn idempotent_ddl_errors_are_recognized() {
+        for code in ["1060", "1061", "1091", "1050"] {
+            let err = Error::Db(format!(
+                "MySQL 错误：MySqlError {{ ERROR {code} (42000): ... }}"
+            ));
+            assert!(is_idempotent_ddl_error(&err), "{code} 应视为幂等");
+        }
+        assert!(!is_idempotent_ddl_error(&Error::Db(
+            "MySQL 错误：MySqlError { ERROR 1146 (42S02): Table 'x' doesn't exist }".into()
+        )));
+        assert!(!is_idempotent_ddl_error(&Error::Model("x".into())));
     }
 
     #[test]
