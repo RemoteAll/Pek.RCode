@@ -441,12 +441,24 @@ impl ColumnMeta {
 /// 索引定义（`<Index>`）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexMeta {
-    /// 索引名（缺省由生成器编制）
+    /// 索引名（缺省由生成器编制；**表达式索引必须显式给出**）
     pub name: Option<String>,
     /// 组成列（按顺序）
     pub columns: Vec<String>,
     /// 是否唯一索引
     pub unique: bool,
+    /// 表达式索引（MySQL 8.0.13+ 函数索引 / 8.0.17+ JSON 多值索引等）。
+    ///
+    /// 与 `columns` 互斥：设置后生成 `CREATE INDEX … ((表达式))`。
+    /// 典型用途——JSON 列本身不能直接建索引（`ERROR 3152`），必须走表达式：
+    ///
+    /// ```xml
+    /// <!-- 多值索引：`WHERE 'x' MEMBER OF (Payload->'$.tags')` 可走索引 -->
+    /// <Index Name="ix_doc_tags" Expression="CAST(Payload-&gt;'$.tags' AS CHAR(20) ARRAY)" />
+    /// <!-- 函数索引：按 JSON 标量排序/等值 -->
+    /// <Index Name="ix_doc_count" Expression="CAST(Payload-&gt;'$.count' AS UNSIGNED)" />
+    /// ```
+    pub expression: Option<String>,
 }
 
 impl EntityModel {
@@ -606,6 +618,7 @@ impl EntityModel {
                     if idx.unique {
                         write_attr(&mut out, "Unique", Some("True"));
                     }
+                    write_attr(&mut out, "Expression", idx.expression.as_deref());
                     out.push_str(" />\n");
                 }
                 out.push_str("      </Indexes>\n");
@@ -685,7 +698,16 @@ fn parse_table(node: &Node) -> Result<TableMeta> {
             "Indexes" => {
                 for idx_node in child.children().filter(Node::is_element) {
                     if idx_node.tag_name().name() == "Index" {
-                        table.indexes.push(parse_index(&idx_node));
+                        let idx = parse_index(&idx_node);
+                        // 表达式索引在库里读不回表达式（`information_schema.STATISTICS.COLUMN_NAME` 为 NULL），
+                        // 只能按名字做幂等比对，因此必须显式命名
+                        if idx.expression.is_some() && idx.name.is_none() {
+                            return Err(Error::Model(format!(
+                                "表 {} 存在缺少 Name 的表达式索引：Expression 索引必须显式指定 Name（否则无法幂等比对）",
+                                table.name
+                            )));
+                        }
+                        table.indexes.push(idx);
                     }
                 }
             }
@@ -787,6 +809,7 @@ fn parse_index(node: &Node) -> IndexMeta {
         name: attr_string(node, "Name"),
         columns,
         unique: attr_bool(node, "Unique"),
+        expression: attr_string(node, "Expression"),
     }
 }
 
@@ -878,9 +901,10 @@ fn write_name_and_table_name(table: &TableMeta) -> String {
 
 /// XML 属性转义。
 fn escape_attr(v: &str) -> String {
+    // `>` 在属性值里不是必须转义的（XML 规范只要求 `&`、`<` 与引号），
+    // 不转义可让 JSON 路径表达式保持可读：`Expression="Payload->'$.tags'"`
     v.replace('&', "&amp;")
         .replace('<', "&lt;")
-        .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
 
@@ -1189,5 +1213,53 @@ mod tests {
         let bad_type = r#"<EntityModel><Tables><Table Name="T">
             <Columns><Column Name="A" DataType="Guid"/></Columns></Table></Tables></EntityModel>"#;
         assert!(EntityModel::parse(bad_type).is_err());
+    }
+
+    /// 表达式索引（JSON 函数索引 / 多值索引）：解析、写出往返，且必须显式命名。
+    #[test]
+    fn expression_index_roundtrip_and_requires_name() {
+        let xml = r#"<EntityModel><Tables><Table Name="Doc" TableName="doc">
+  <Columns>
+    <Column Name="Id" DataType="Int32" PrimaryKey="True" />
+    <Column Name="Payload" DataType="Json" />
+  </Columns>
+  <Indexes>
+    <Index Name="ix_doc_tags" Expression="CAST(Payload->'$.tags' AS CHAR(20) ARRAY)" />
+    <Index Columns="Id" />
+  </Indexes>
+</Table></Tables></EntityModel>"#;
+        let model = EntityModel::parse(xml).unwrap();
+        let indexes = &model.tables[0].indexes;
+        assert_eq!(indexes.len(), 2);
+        assert_eq!(indexes[0].name.as_deref(), Some("ix_doc_tags"));
+        assert!(indexes[0].columns.is_empty(), "表达式索引不按列名建");
+        assert!(
+            indexes[0]
+                .expression
+                .as_deref()
+                .is_some_and(|e| e.contains("ARRAY")),
+            "{:?}",
+            indexes[0].expression
+        );
+        // 普通列索引不受影响
+        assert!(indexes[1].expression.is_none());
+        assert_eq!(indexes[1].columns, vec!["Id".to_string()]);
+
+        // 往返：Expression 属性必须原样保留
+        let out = model.to_xml();
+        assert!(out.contains(r#"Expression="CAST(Payload->'$.tags' AS CHAR(20) ARRAY)""#), "{out}");
+        let again = EntityModel::parse(&out).unwrap();
+        assert_eq!(
+            again.tables[0].indexes[0].expression,
+            indexes[0].expression
+        );
+
+        // 缺少 Name 的表达式索引无法按名字幂等比对，解析阶段直接拒绝
+        let unnamed = r#"<EntityModel><Tables><Table Name="Doc">
+  <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+  <Indexes><Index Expression="UPPER(Id)" /></Indexes>
+</Table></Tables></EntityModel>"#;
+        let err = EntityModel::parse(unnamed).unwrap_err().to_string();
+        assert!(err.contains("Name"), "{err}");
     }
 }

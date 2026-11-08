@@ -722,7 +722,27 @@ println!("{report}");   // 新建 0 张，补充列 0 个，…；改列：DH_Or
 - 反查时把 `json`/`jsonb` 列识别为 `Json`，否则 `sync_schema` 会把原生 JSON 列误判为 `longtext` 并降级；
 - MySQL 的 JSON 列在协议层字符集是 `binary`（带 `BINARY_FLAG`），驱动必须按文本还原（否则读成 `Blob`）；
 - PostgreSQL 的 `json`/`jsonb` 不在 `String` 的 `FromSql` 白名单里，按原始字节解码为文本（保留原文，不经 serde 重排序）；
-- **MySQL 的 JSON 列不能直接建索引**（`ERROR 3152`），需要生成列 + 函数索引（本库尚未支持生成列，见“与 DH.NCode 的已知差距”）。
+- **MySQL 的 JSON 列不能直接建索引**（`ERROR 3152`），要用 `<Index Expression="...">` 声明函数索引 / 多值索引：
+
+```xml
+<Indexes>
+  <!-- 多值索引：`WHERE 'a' MEMBER OF (Payload->'$.tags')` 可走索引（MySQL 8.0.17+） -->
+  <Index Name="ix_doc_tags" Expression="CAST(Payload->'$.tags' AS CHAR(20) ARRAY)" />
+  <!-- 函数索引（MySQL 8.0.13+）：按 JSON 标量等值/排序 -->
+  <Index Name="ix_doc_count" Expression="CAST(Payload->'$.count' AS UNSIGNED)" />
+</Indexes>
+```
+
+表达式索引的取舍：
+- **必须显式 `Name`**：库里读不回表达式（`information_schema.STATISTICS.COLUMN_NAME` 为 `NULL`），
+  只能按名字做幂等比对；缺 `Name` 在模型解析阶段直接报错；
+- 各方言生成：MySQL `ON t ((expr))` 双层括号，PostgreSQL / SQLite / DuckDB / Oracle 单层；
+  SQL Server 只能用计算列，`create_index_sql` 返回 `None`（不生成）；
+- 反向工程保留表达式的**索引条目**（`columns` 为空），但读不到表达式本身 → 判定「多余」时**保守跳过**，
+  `Migration=Full` 也不会误删这类索引；
+- 坑：MySQL 8.0.28 上，若同一会话先读过 `information_schema`，再建函数/多值索引会误报
+  `ERROR 3107 Generated column can refer only to generated columns defined prior to it`；
+  `COM_RESET_CONNECTION` 无效，`Dal::exec_ddl` 会**换一条物理连接重试一次**。
 
 ---
 

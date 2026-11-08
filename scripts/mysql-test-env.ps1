@@ -245,9 +245,12 @@ switch ($Action) {
         }
         New-Item -ItemType Directory -Force $base | Out-Null
         $server = Join-Path $dist "bin\$($spec.Server)"
+        # stdout 也必须重定向：只重定向 stderr 时 mysqld 会继承调用方的 stdout 句柄，
+        # 调用方若用管道（如 `| Select-Object -Last n`）会因句柄不关闭而永久挂住
+        $outLog = Join-Path $base 'db.out'
         Start-Process -FilePath $server `
             -ArgumentList "--basedir=$dist", "--datadir=$data", "--port=$port", '--bind-address=127.0.0.1' `
-            -RedirectStandardError $log -WindowStyle Hidden | Out-Null
+            -RedirectStandardOutput $outLog -RedirectStandardError $log -WindowStyle Hidden | Out-Null
         for ($i = 0; $i -lt 120; $i++) {
             Start-Sleep -Milliseconds 250
             if (Test-DbPort) { break }

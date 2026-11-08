@@ -1295,6 +1295,24 @@ impl Dal {
             Err(e) => return Err(e),
         };
         for idx in &table.indexes {
+            // 表达式索引（JSON 函数/多值索引）：`columns` 为空，库里也读不回表达式
+            // （`information_schema.STATISTICS.COLUMN_NAME` 为 NULL），只能按**索引名**判存在
+            if idx.expression.is_some() {
+                let want_name = self.kind.index_name(table, idx);
+                if existing
+                    .iter()
+                    .any(|e| e.name.eq_ignore_ascii_case(&want_name))
+                {
+                    continue;
+                }
+                if let Some(sql) = self.kind.create_index_sql(table, idx) {
+                    self.exec_ddl(session, mode, report, &sql)?;
+                    report
+                        .added_indexes
+                        .push((table_name.to_string(), want_name));
+                }
+                continue;
+            }
             if idx.columns.is_empty() {
                 continue;
             }
@@ -1332,6 +1350,10 @@ impl Dal {
         // 清理多余索引：模型里没有该列组合，或同列已有唯一索引而残留普通索引（冗余）
         for e in &existing {
             if is_primary_index_name(&e.name) {
+                continue;
+            }
+            // 表达式索引（`COLUMN_NAME` 为 NULL）读不回表达式，无法判断是否多余 → 保守不删
+            if e.columns.is_empty() {
                 continue;
             }
             let in_model = table
@@ -1493,7 +1515,7 @@ impl Dal {
             // 只读档：不执行，收集“将执行”的 DDL 供人工处理（对齐 C# `DDL模式[ReadOnly]，请手工创建表`）
             report.pending_sql.push(sql.to_string());
         } else {
-            match session.execute(sql, &[]) {
+            match session.execute_ddl(sql) {
                 Ok(_) => {}
                 // **幂等**：多个服务同时启动时，先到者已经完成了同一动作，后到者会收到
                 // 「列/索引已存在」或「要删的对象已不存在」。目标状态已经达成，不能算失败——
@@ -1503,7 +1525,18 @@ impl Dal {
                         .notes
                         .push(format!("跳过（目标状态已达成）：{sql}（{e}）"));
                 }
-                Err(e) => return Err(e),
+                // 失败必须带上方言 SQL，否则只能靠猜（用户口径：日志要能定位到哪一条语句）
+                Err(e) if is_generated_column_order_error(&e) => {
+                    // MySQL 8.0.28 实测：本会话读过 `information_schema` 后再建函数索引/JSON 多值索引，
+                    // 会误报 `ERROR 3107 Generated column can refer only to generated columns defined
+                    // prior to it`；`COM_RESET_CONNECTION` 无效，**换一条物理连接**即成功（当前 session 仍在占用，池会新建）。
+                    let mut fresh = self.open_session()?;
+                    report
+                        .notes
+                        .push(format!("会话表定义缓存导致 3107，已换新连接重建：{sql}"));
+                    fresh.execute_ddl(sql)?;
+                }
+                Err(e) => return Err(Error::Db(format!("{e}；DDL：{sql}"))),
             }
         }
         Ok(())
@@ -1996,6 +2029,24 @@ impl Dal {
                             // 索引：缺失 / 多余（同列且同序视为一致；唯一性差异按"需升级"报告）
                             if crate::catalog::supports_index_catalog(self.kind) {
                                 for idx in &table.indexes {
+                                    // 表达式索引：库里读不到表达式（`COLUMN_NAME` 为 NULL），
+                                    // 只能按**索引名**幂等比对，否则每轮都会重复 `CREATE INDEX`
+                                    if idx.expression.is_some() {
+                                        let want_name = self.kind.index_name(table, idx);
+                                        if db
+                                            .indexes
+                                            .iter()
+                                            .any(|e| e.name.eq_ignore_ascii_case(&want_name))
+                                        {
+                                            continue;
+                                        }
+                                        diff.missing_indexes
+                                            .push((tname.to_string(), want_name));
+                                        if let Some(sql) = self.kind.create_index_sql(table, idx) {
+                                            diff.alter_sql.push(sql);
+                                        }
+                                        continue;
+                                    }
                                     if idx.columns.is_empty() {
                                         continue;
                                     }
@@ -2031,6 +2082,10 @@ impl Dal {
                                     }
                                 }
                                 for e in &db.indexes {
+                                    // 表达式索引读不回表达式 → 无法判断是否多余，保守不删
+                                    if e.columns.is_empty() {
+                                        continue;
+                                    }
                                     let in_model = table
                                         .indexes
                                         .iter()
@@ -2429,6 +2484,14 @@ fn is_idempotent_ddl_error(err: &Error) -> bool {
     ["ERROR 1060", "ERROR 1061", "ERROR 1091", "ERROR 1050"]
         .iter()
         .any(|code| msg.contains(code))
+}
+
+/// MySQL 建函数索引 / JSON 多值索引时的「隐藏生成列顺序」误报（`ERROR 3107`）。
+///
+/// 只在「本会话先读过 `information_schema`」时出现（2026-11-08 在 8.0.28 实测）；
+/// 换一条新物理连接即可成功，因此由 [`Dal::exec_ddl`] 重试。
+fn is_generated_column_order_error(err: &Error) -> bool {
+    matches!(err, Error::Db(msg) if msg.contains("ERROR 3107"))
 }
 
 /// 宽松比较列类型：只比较基础类型名（忽略长度/精度/大小写），并处理常见等价别名。

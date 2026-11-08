@@ -542,6 +542,16 @@ impl SqlSession for MysqlSession {
         Ok(self.conn.affected_rows())
     }
 
+    /// 执行 DDL：走**文本协议**（`query_drop`）。
+    ///
+    /// DDL 不需要参数绑定，文本来回更省一次 prepare；同时避开
+    /// 「同一会话读过 `information_schema` 后再建函数/多值索引会误报 `ERROR 3107`」的问题
+    /// （该类误报的绕过在 `Dal::exec_ddl` 里用新连接重试）。
+    fn execute_ddl(&mut self, sql: &str) -> Result<u64> {
+        self.conn.query_drop(sql).map_err(map_err)?;
+        Ok(self.conn.affected_rows())
+    }
+
     fn insert_and_get_identity_owned(
         &mut self,
         sql: &str,

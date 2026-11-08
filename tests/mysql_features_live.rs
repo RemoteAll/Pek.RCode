@@ -28,6 +28,10 @@ const MODEL: &str = r#"<EntityModel><Tables><Table Name="RCodeLiveDoc" TableName
   </Columns>
   <Indexes>
     <Index Columns="DeviceId" Unique="True" />
+    <!-- JSON 多值索引：让 `'a' MEMBER OF (Payload->'$.tags')` 可走索引 -->
+    <Index Name="ix_live_payload_tags" Expression="CAST(Payload->'$.tags' AS CHAR(20) ARRAY)" />
+    <!-- JSON 函数索引：按标量等值/排序 -->
+    <Index Name="ix_live_payload_count" Expression="CAST(Payload->'$.count' AS UNSIGNED)" />
   </Indexes>
 </Table></Tables></EntityModel>"#;
 
@@ -171,6 +175,155 @@ fn mysql_json_column_stores_native_type_and_roundtrips() {
         stats.first().and_then(|row| row.get(0)).and_then(DbValue::as_i64),
         Some(3),
         "JSON_EXTRACT 应能取到数字 3"
+    );
+
+    cleanup(&dal);
+}
+
+/// 驱动层探针：同一会话里反复建/删表达式索引是否正常（隔离 `sync_schema` 的其他动作）。
+#[test]
+fn mysql_driver_can_recreate_expression_index_in_one_session() {
+    let Some(_) = conn() else { return };
+    let dal = open();
+    let mut session = dal.open_session().unwrap();
+    let _ = session.execute("DROP TABLE IF EXISTS rcode_live_probe", &[]);
+    session
+        .execute(
+            "CREATE TABLE rcode_live_probe (Id int primary key, Payload json)",
+            &[],
+        )
+        .unwrap();
+    session
+        .execute(
+            "CREATE INDEX ix_probe_count ON rcode_live_probe ((CAST(Payload->'$.count' AS UNSIGNED)))",
+            &[],
+        )
+        .unwrap();
+    session
+        .execute(
+            "CREATE INDEX ix_probe_tags ON rcode_live_probe ((CAST(Payload->'$.tags' AS CHAR(20) ARRAY)))",
+            &[],
+        )
+        .unwrap();
+    session
+        .execute("DROP INDEX ix_probe_tags ON rcode_live_probe", &[])
+        .unwrap();
+    // 模拟 `sync_schema` 的前置动作：prepared 方式读 information_schema
+    let _ = session
+        .query(
+            "SELECT COLUMN_NAME FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'rcode_live_probe'",
+            &[],
+        )
+        .unwrap();
+    let _ = session
+        .query(
+            "SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'rcode_live_probe'",
+            &[],
+        )
+        .unwrap();
+    // 旧会话**保持占用**，开第二个会话（池会分配另一条物理连接）
+    let mut fresh = dal.open_session().unwrap();
+    fresh
+        .execute_ddl("CREATE INDEX ix_probe_tags ON rcode_live_probe ((CAST(Payload->'$.tags' AS CHAR(20) ARRAY)))")
+        .unwrap();
+    drop(fresh);
+    let _ = session.execute("DROP TABLE IF EXISTS rcode_live_probe", &[]);
+}
+
+/// 表达式索引（JSON 多值 / 函数索引）：能建、幂等、被优化器识别为候选索引。
+///
+/// 幂等是重点：库里读不回表达式（`information_schema.STATISTICS.COLUMN_NAME` 为 NULL），
+/// 只能按索引名判存在；否则每次启动都会重复 `CREATE INDEX`（虽然错误被吞，但日志一直报）。
+#[test]
+fn mysql_json_expression_indexes_are_created_and_idempotent() {
+    let Some(_) = conn() else { return };
+    let dal = open();
+    // 干净起点：上一次运行可能留下表（断言失败时不会走到 cleanup）
+    cleanup(&dal);
+    // 首次同步会连表带索引一起建（`create_table_sql` 里已含 CREATE INDEX）
+    let first = dal.sync_schema().unwrap();
+    assert!(
+        first.created_tables.iter().any(|t| t == "rcode_live_doc"),
+        "首次同步应新建表：{:?}",
+        first.created_tables
+    );
+
+    // 手动删掉一个表达式索引，模拟「模型新增索引」的场景：
+    // 表达式索引的 `columns` 为空，若不走“按名字比对”就会被当成无列索引跳过、永远补不回来
+    {
+        let mut session = dal.open_session().unwrap();
+        session
+            .execute("DROP INDEX ix_live_payload_tags ON rcode_live_doc", &[])
+            .unwrap();
+    }
+    let repaired = dal.sync_schema().unwrap();
+    assert!(
+        repaired
+            .added_indexes
+            .iter()
+            .any(|(_, n)| n == "ix_live_payload_tags"),
+        "缺失的表达式索引应被补建：{:?}",
+        repaired.added_indexes
+    );
+
+    // 二次同步必须幂等：表达式索引在库里读不回表达式（`COLUMN_NAME` 为 NULL），
+    // 只能按索引名判存在；撤掉“按名字比对”后这里会重新补建
+    let second = dal.sync_schema().unwrap();
+    assert!(
+        second.added_indexes.is_empty(),
+        "二次同步不应再补任何索引：{:?}",
+        second.added_indexes
+    );
+    assert!(
+        second.created_tables.is_empty(),
+        "二次同步不应再建表：{:?}",
+        second.created_tables
+    );
+
+    let mut session = dal.open_session().unwrap();
+    let db_name = session
+        .query("SELECT DATABASE()", &[])
+        .unwrap()
+        .first()
+        .map(|row| cell_text(row, 0))
+        .unwrap_or_default();
+    assert!(!db_name.is_empty(), "连接应有默认库");
+
+    let rows = session
+        .query(
+            "SELECT INDEX_NAME FROM information_schema.statistics \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'rcode_live_doc' \
+               AND EXPRESSION IS NOT NULL",
+            &[DbValue::Text(db_name.clone())],
+        )
+        .unwrap();
+    let mut names: Vec<String> = rows.rows.iter().map(|row| cell_text(row, 0)).collect();
+    names.sort();
+    assert!(
+        names.contains(&"ix_live_payload_tags".to_string()),
+        "应建出多值索引，实际：{names:?}"
+    );
+    assert!(
+        names.contains(&"ix_live_payload_count".to_string()),
+        "应建出函数索引，实际：{names:?}"
+    );
+
+    // 优化器应把多值索引当作候选（小表可能仍选全表扫描，所以只看 possible_keys）
+    let plan = session
+        .query(
+            "EXPLAIN SELECT Id FROM rcode_live_doc WHERE 'a' MEMBER OF (Payload->'$.tags')",
+            &[],
+        )
+        .unwrap();
+    let candidates = plan
+        .first()
+        .map(|row| cell_text(row, 5))
+        .unwrap_or_default();
+    assert!(
+        candidates.contains("ix_live_payload_tags"),
+        "优化器未识别多值索引（possible_keys={candidates}）"
     );
 
     cleanup(&dal);

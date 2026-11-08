@@ -369,6 +369,16 @@ pub trait SqlSession: Send {
         self.query(sql, &params)
     }
 
+    /// 执行 **DDL**（建表/改表/建索引/删索引等），返回受影响行数。
+    ///
+    /// 默认实现转调 [`SqlSession::execute`]（无参数）；需要区分协议层的驱动自行覆写：
+    /// MySQL 的 prepared 语句在同一会话里读过 `information_schema` 后，再执行
+    /// `CREATE INDEX … ((表达式))` 会误报 `ERROR 3107`（2026-11-08 在 8.0.28 上实测），
+    /// 因此它改走文本协议。
+    fn execute_ddl(&mut self, sql: &str) -> Result<u64> {
+        self.execute(sql, &[])
+    }
+
     /// 开启事务。
     fn begin(&mut self) -> Result<()>;
 

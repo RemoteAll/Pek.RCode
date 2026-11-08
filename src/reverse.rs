@@ -126,6 +126,9 @@ fn to_table_meta(info: catalog::TableInfo) -> TableMeta {
                 name: Some(idx.name),
                 columns: idx.columns,
                 unique: idx.unique,
+                // 反向工程读不回表达式（`information_schema.STATISTICS.COLUMN_NAME` 为 NULL
+                // 的函数索引会被整体跳过），所以这里恒为 `None`
+                expression: None,
             })
             .collect(),
         audit_columns: std::sync::OnceLock::new(),

@@ -828,24 +828,59 @@ impl DatabaseKind {
     /// <returns>索引名</returns>
     pub fn index_name(&self, table: &TableMeta, idx: &IndexMeta) -> String {
         idx.name.clone().unwrap_or_else(|| {
-            format!(
-                "ix_{}_{}",
-                table.effective_table_name(),
-                idx.columns.join("_")
-            )
+            // 表达式索引在模型解析时已强制要求 `Name`，这里只是兜底不 panic
+            if idx.columns.is_empty() {
+                format!("ix_{}", table.effective_table_name())
+            } else {
+                format!(
+                    "ix_{}_{}",
+                    table.effective_table_name(),
+                    idx.columns.join("_")
+                )
+            }
         })
     }
 
-    /// 生成索引创建语句（`None` 表示索引无列，可忽略）。
+    /// 生成索引创建语句（`None` 表示索引无列或不支持该形式，可忽略）。
     ///
     /// **MySQL 特殊处理**：`TEXT`/`BLOB` 系列列（模型里 `String` 无 `Length`
     /// 或超长、`Binary`）必须带前缀长度才能建索引（否则 `ERROR 1170 BLOB/TEXT column used
     /// in key specification without a key length`）。这里自动补 `(191)`：
     /// utf8mb4 下 191 字符 = 764 字节，兼容老版本 767 字节索引前缀上限。
+    ///
+    /// **表达式索引**（`IndexMeta::expression`）：JSON 列本身无法直接建索引（`ERROR 3152`），
+    /// 必须写成函数/多值索引。MySQL 要求表达式在列列表里再包一层括号（`ON t ((expr))`），
+    /// PostgreSQL / SQLite / DuckDB / Oracle 单层即可；SQL Server 只能用计算列，此处返回 `None`。
     /// <param name="table">表</param>
     /// <param name="idx">索引定义</param>
     /// <returns>CREATE INDEX 语句</returns>
     pub fn create_index_sql(&self, table: &TableMeta, idx: &IndexMeta) -> Option<String> {
+        if let Some(expr) = idx.expression.as_deref() {
+            let expr = expr.trim();
+            // 只能用计算列建模的库（SQL Server），以及列式/时序库：不生成表达式索引
+            if expr.is_empty()
+                || matches!(
+                    self,
+                    DatabaseKind::SqlServer | DatabaseKind::TDengine | DatabaseKind::ClickHouse
+                )
+            {
+                return None;
+            }
+            // 模型解析阶段已校验表达式索引必须有 Name
+            let name = self.index_name(table, idx);
+            let body = if *self == DatabaseKind::MySql {
+                format!("(({expr}))")
+            } else {
+                format!("({expr})")
+            };
+            return Some(format!(
+                "CREATE {}INDEX {} ON {} {}",
+                if idx.unique { "UNIQUE " } else { "" },
+                self.quote(&name),
+                self.quote(table.effective_table_name()),
+                body
+            ));
+        }
         if idx.columns.is_empty() {
             return None;
         }
@@ -2178,6 +2213,7 @@ mod tests {
             name: None,
             columns: vec!["Code".into()],
             unique: true,
+            expression: None,
         });
         let stmts = DatabaseKind::Sqlite.create_table_sql(&table);
         assert_eq!(stmts.len(), 2);
@@ -2200,11 +2236,13 @@ mod tests {
             name: None,
             columns: vec!["Code".into()],
             unique: true,
+            expression: None,
         });
         table.indexes.push(crate::model::IndexMeta {
             name: None,
             columns: vec!["Title".into()],
             unique: true,
+            expression: None,
         });
         let stmts = DatabaseKind::MySql.create_table_sql(&table);
         let joined = stmts.join("\n");
@@ -2216,6 +2254,60 @@ mod tests {
         // 其它方言不加前缀
         let sqlite = DatabaseKind::Sqlite.create_table_sql(&table).join("\n");
         assert!(sqlite.contains("(\"Title\")"), "{sqlite}");
+    }
+
+    /// 表达式索引：JSON 列不能直接建索引（`ERROR 3152`），必须走函数索引 / 多值索引。
+    ///
+    /// MySQL 要求表达式在列列表里**再包一层括号**（`ON t ((expr))`），
+    /// 其它支持表达式索引的库单层即可；SQL Server 只能用计算列。
+    #[test]
+    fn expression_index_sql_per_database() {
+        let mut table = sample_table();
+        table.indexes.push(crate::model::IndexMeta {
+            name: Some("ix_DH_Order_tags".into()),
+            columns: Vec::new(),
+            unique: false,
+            // 多值索引：让 `'x' MEMBER OF (Payload->'$.tags')` 可走索引
+            expression: Some("CAST(Payload->'$.tags' AS CHAR(20) ARRAY)".into()),
+        });
+        let idx = &table.indexes[0];
+
+        let sql = DatabaseKind::MySql
+            .create_index_sql(&table, idx)
+            .expect("MySQL 支持表达式索引");
+        assert_eq!(
+            sql,
+            "CREATE INDEX `ix_DH_Order_tags` ON `DH_Order` ((CAST(Payload->'$.tags' AS CHAR(20) ARRAY)))"
+        );
+
+        let pg = DatabaseKind::PostgreSql
+            .create_index_sql(&table, idx)
+            .expect("PostgreSQL 支持表达式索引");
+        assert!(
+            pg.contains("(CAST(Payload->'$.tags' AS CHAR(20) ARRAY))"),
+            "{pg}"
+        );
+        assert!(!pg.contains("(("), "PostgreSQL 不应双括号：{pg}");
+
+        let sqlite = DatabaseKind::Sqlite
+            .create_index_sql(&table, idx)
+            .expect("SQLite 支持表达式索引");
+        assert!(sqlite.starts_with("CREATE INDEX"), "{sqlite}");
+
+        // SQL Server 只能用计算列 + 索引计算列
+        assert!(
+            DatabaseKind::SqlServer.create_index_sql(&table, idx).is_none(),
+            "SQL Server 不生成表达式索引"
+        );
+
+        // 表达式为空的索引不生成任何语句
+        let blank = crate::model::IndexMeta {
+            name: Some("ix_blank".into()),
+            columns: Vec::new(),
+            unique: false,
+            expression: Some("   ".into()),
+        };
+        assert!(DatabaseKind::MySql.create_index_sql(&table, &blank).is_none());
     }
 
     /// MySQL：`TEXT`/`BLOB` 列不接受字面量默认值（ERROR 1101），要写成表达式默认。

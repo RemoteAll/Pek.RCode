@@ -477,14 +477,20 @@ fn read_mysql(session: &mut dyn SqlSession) -> Result<Vec<TableInfo>> {
         let index_name = text(row, 1);
         let unique = int(row, 2) == 0;
         let column = text(row, 4);
-        if index_name.eq_ignore_ascii_case("PRIMARY") || column.is_empty() {
+        if index_name.eq_ignore_ascii_case("PRIMARY") {
             continue;
         }
+        // 函数索引 / JSON 多值索引的 `COLUMN_NAME` 为 NULL（表达式在 `EXPRESSION` 列）：
+        // 仍保留条目（`columns` 为空），让 `sync_schema` 能按名字判存在，避免每轮重复建
         match table.indexes.iter_mut().find(|i| i.name == index_name) {
-            Some(existing) => existing.columns.push(column),
+            Some(existing) => {
+                if !column.is_empty() {
+                    existing.columns.push(column);
+                }
+            }
             None => table.indexes.push(IndexInfo {
                 name: index_name,
-                columns: vec![column],
+                columns: if column.is_empty() { Vec::new() } else { vec![column] },
                 unique,
             }),
         }
@@ -506,14 +512,19 @@ fn mysql_indexes(session: &mut dyn SqlSession, table: &str) -> Result<Vec<IndexI
     for row in &set.rows {
         let index_name = text(row, 0);
         let column = text(row, 3);
-        if index_name.eq_ignore_ascii_case("PRIMARY") || column.is_empty() {
+        if index_name.eq_ignore_ascii_case("PRIMARY") {
             continue;
         }
+        // 同 `read_mysql`：函数索引/多值索引的 `COLUMN_NAME` 为 NULL，保留空列表条目
         match indexes.iter_mut().find(|i| i.name == index_name) {
-            Some(existing) => existing.columns.push(column),
+            Some(existing) => {
+                if !column.is_empty() {
+                    existing.columns.push(column);
+                }
+            }
             None => indexes.push(IndexInfo {
                 name: index_name,
-                columns: vec![column],
+                columns: if column.is_empty() { Vec::new() } else { vec![column] },
                 unique: int(row, 1) == 0,
             }),
         }
