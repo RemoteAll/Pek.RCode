@@ -226,15 +226,81 @@ impl DatabaseFile {
 
     /// 解析指定连接名（SQLite 相对路径按 `base` 绝对化）。
     ///
-    /// 供读写分离等“按连接名取实际连接串”的场景使用。
+    /// 供读写分离等“按连接名取实际连接串”的场景使用；支持 C# 的 `MapTo=` 别名
+    /// （见 [`DatabaseFile::follow_map_to`]）。
     pub fn resolve_connection(&self, base: &Path, name: &str) -> Result<String, String> {
-        let name = name.trim();
-        let entry = self
-            .connections
-            .get(name)
-            .ok_or_else(|| format!("连接 {name} 不存在"))?;
-        resolve_connection(base, entry.connection_string())
+        let (_, raw) = self.follow_map_to(name)?;
+        resolve_connection(base, &raw)
     }
+
+    /// 跟随 C# 的 `MapTo=<连接名>` 别名，返回 `(最终连接名, 真实连接串)`。
+    ///
+    /// C# DH.NCode 的多库配置大量使用别名，例如线上：
+    /// ```toml
+    /// [Connections.Pek]
+    /// ConnectionString = "Server=...;provider=mysql"
+    /// [Connections.Membership]
+    /// ConnectionString = "MapTo=Pek"
+    /// [Connections.DH]
+    /// ConnectionString = "MapTo=Pek"
+    /// ```
+    /// 别名与目标指向**同一个库**，所以返回最终连接名供调用方共享同一个连接池。
+    /// 最多跟随 8 跳；目标不存在或出现循环时给出包含了链路的明确错误（不静默降级）。
+    pub fn follow_map_to(&self, name: &str) -> Result<(String, String), String> {
+        let start = name.trim();
+        let mut current = start.to_string();
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            if seen.iter().any(|s| s.eq_ignore_ascii_case(&current)) {
+                let mut chain: Vec<String> = seen.clone();
+                chain.push(current.clone());
+                return Err(format!("连接 {start} 的 MapTo 出现循环：{}", chain.join(" → ")));
+            }
+            if seen.len() >= 8 {
+                return Err(format!("连接 {start} 的 MapTo 跳转超过 8 层（疑似循环）：{}", seen.join(" → ")));
+            }
+            // 连接名查找**大小写不敏感**（对齐 .NET `ConnectionStrings` 语义；
+            // 线上 C# 配置里 MapTo=Pek 与连接名 Pek 的大小写不一定一致）
+            let (key, entry) = self.lookup(&current).ok_or_else(|| {
+                format!("连接 {current} 不存在（可用：{}）", self.names().join(", "))
+            })?;
+            let key = key.to_string();
+            let raw = entry.connection_string().trim();
+            match map_to_of(raw) {
+                Some(target) if !target.is_empty() => {
+                    seen.push(key);
+                    current = target;
+                }
+                Some(_) => return Err(format!("连接 {current} 的 MapTo 目标为空")),
+                None => return Ok((key, raw.to_string())),
+            }
+        }
+    }
+
+    /// 按名字查连接（先精确、再大小写不敏感），返回真实键名与条目。
+    fn lookup(&self, name: &str) -> Option<(&str, &ConnectionEntry)> {
+        if let Some((k, v)) = self.connections.get_key_value(name) {
+            return Some((k.as_str(), v));
+        }
+        self.connections
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(k, v)| (k.as_str(), v))
+    }
+}
+
+/// 从连接串里取 `MapTo=<连接名>`（大小写不敏感；C# DH.NCode 的多库别名写法）。
+/// 例：`MapTo=Pek`。
+fn map_to_of(conn: &str) -> Option<String> {
+    for seg in conn.split(';') {
+        let seg = seg.trim();
+        if let Some((k, v)) = seg.split_once('=')
+            && k.trim().eq_ignore_ascii_case("MapTo")
+        {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
 }
 
 /// 约定文件完整路径（`{base}/Config/Database.toml`）。
@@ -424,26 +490,22 @@ impl Databases {
             .unwrap_or_default()
     }
 
-    /// 连接串摘要（避免泄露口令）。
+    /// 连接串摘要（避免泄露口令；`MapTo=` 别名跟随到目标后取 Provider）。
     pub fn connection_label(&self, name: &str) -> String {
-        self.file
-            .connections
-            .get(name.trim())
-            .map(|e| connection_label(e.connection_string()))
-            .unwrap_or_else(|| "未知连接".to_string())
+        match self.file.follow_map_to(name) {
+            Ok((_, raw)) => connection_label(&raw),
+            Err(_) => "未知连接".to_string(),
+        }
     }
 
     /// 打开（或复用）指定连接的共享存储。
     ///
     /// 需要驱动包的连接：按 `[DriverStore]` 分发（未配置且无缓存/预置时给出明确错误）。
     pub fn store(&self, name: &str) -> Result<Arc<SharedStore>, String> {
-        let name = name.trim();
-        let entry =
-            self.file.connections.get(name).ok_or_else(|| {
-                format!("连接不存在：{name}（可用：{}）", self.names().join(", "))
-            })?;
-        let raw = resolve_connection(&self.base, entry.connection_string())?;
-        let (store, _) = store::get_or_open_scoped(&self.base, name, || {
+        // `MapTo=` 别名与目标指向同一个库 → 用**最终连接名**做缓存 key，共享同一个连接池
+        let (target, raw) = self.file.follow_map_to(name)?;
+        let raw = resolve_connection(&self.base, &raw)?;
+        let (store, _) = store::get_or_open_scoped(&self.base, &target, || {
             let conn = self.prepare_conn(&raw)?;
             let dal = match &self.model {
                 Some(model) => {
@@ -678,6 +740,58 @@ Note = "主库 \"引号\" 与\n换行"
             rendered.contains("[Connections.simple]"),
             "简写应写成表形态：{rendered}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn map_to_alias_resolves_to_target_and_detects_cycle() {
+        let dir = temp_dir("mapto");
+        write_file(
+            &dir,
+            r#"
+Default = "DH"
+[Connections.Pek]
+ConnectionString = "Server=db;Port=3306;Database=pek;provider=mysql"
+Note = "线上主库"
+[Connections.Membership]
+ConnectionString = "MapTo=Pek"
+[Connections.DH]
+ConnectionString = "mapto=pek"
+"#,
+        );
+        let file = DatabaseFile::load(&dir).unwrap().expect("应可解析");
+
+        // 别名跟随到真实连接串（大小写不敏感）
+        let (target, raw) = file.follow_map_to("DH").unwrap();
+        assert_eq!(target, "Pek");
+        assert!(raw.contains("Database=pek"), "{raw}");
+        assert_eq!(
+            file.resolve_connection(&dir, "Membership").unwrap(),
+            file.resolve_connection(&dir, "Pek").unwrap(),
+            "Membership 与 Pek 必须解析成同一个库"
+        );
+
+        // 循环必须明确报错，不能静默当成普通连接串
+        let mut cyclic = DatabaseFile::default();
+        cyclic.connections.insert(
+            "A".to_string(),
+            ConnectionEntry::Simple("MapTo=B".to_string()),
+        );
+        cyclic.connections.insert(
+            "B".to_string(),
+            ConnectionEntry::Simple("MapTo=A".to_string()),
+        );
+        let err = cyclic.follow_map_to("A").unwrap_err();
+        assert!(err.contains("循环"), "{err}");
+
+        // 目标不存在 → 报错里带可用连接名
+        let mut orphan = DatabaseFile::default();
+        orphan.connections.insert(
+            "X".to_string(),
+            ConnectionEntry::Simple("MapTo=Missing".to_string()),
+        );
+        let err = orphan.follow_map_to("X").unwrap_err();
+        assert!(err.contains("Missing"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
