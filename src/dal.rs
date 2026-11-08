@@ -1189,7 +1189,53 @@ impl Dal {
     /// 由驱动组件分发的**自有远端库**（本机 dbserver 驱动宿主）请用
     /// [`Dal::sync_schema_including_network`] 显式启用。
     pub fn sync_schema(&self) -> Result<SchemaReport> {
-        self.sync_schema_inner(false)
+        self.sync_schema_for(None, true, false)
+    }
+
+    /// 同 [`Dal::sync_schema`]，但**只处理属于指定连接的表**（多库模型的正确建库方式）。
+    ///
+    /// 表归属规则（对齐 C# `TableItem.ConnName` → `Meta.ConnName`）：
+    /// - 表上配了 `ConnName` → 只归该连接；
+    /// - 表上没配 → 归**模型级** `<Option><ConnName>`。
+    ///
+    /// `conn_name`：当前 `Dal` 对应的连接名（如 `Databases::store` 传入的那个）。
+    /// 传 `None` 时**不按连接过滤**（把所有表都建在当前连接上）—— 这是早期行为，仅为兼容保留；
+    /// 多库模型必须传连接名，否则会把别的库的表也建到本库。
+    ///
+    /// 注意：若调用方不确定「本连接是否就是模型级连接」（旧配置里连接名可能与模型不一致），
+    /// 用 [`Dal::sync_schema_for`] 显式指定 `include_model_level`，避免一张表都不建。
+    pub fn sync_schema_named(&self, conn_name: Option<&str>) -> Result<SchemaReport> {
+        self.sync_schema_for(conn_name, true, false)
+    }
+
+    /// 精确版结构同步：显式指定「是否在本连接建**没有表级 ConnName** 的表」。
+    ///
+    /// - `conn_name = None`：不按连接过滤（旧行为）。
+    /// - `conn_name = Some(c)`：表级 `ConnName` 必须等于 `c` 才建；
+    ///   表级为空的表仅在 `include_model_level = true` 时建。
+    /// - `include_network`：是否对 network 连接也执行（见 [`Dal::sync_schema_including_network`]）。
+    ///
+    /// `conn_name`：连接名。
+    /// `include_model_level`：是否处理「表级 `ConnName` 为空」的表（它们归属模型级 `ConnName`）。
+    /// `include_network`：是否处理 network 连接。
+    pub fn sync_schema_for(
+        &self,
+        conn_name: Option<&str>,
+        include_model_level: bool,
+        include_network: bool,
+    ) -> Result<SchemaReport> {
+        let _ = include_model_level;
+        self.sync_schema_inner(conn_name, include_model_level, include_network)
+    }
+
+    /// 同 [`Dal::sync_schema_including_network`]，但只处理属于指定连接的表。
+    ///
+    /// `conn_name`：当前 `Dal` 对应的连接名（`None` = 不按连接过滤）。
+    pub fn sync_schema_named_including_network(
+        &self,
+        conn_name: Option<&str>,
+    ) -> Result<SchemaReport> {
+        self.sync_schema_inner(conn_name, true, true)
     }
 
     /// 同 [`Dal::sync_schema`]，但**对 network 连接也执行**结构同步（建表 / 补列 / 补索引）。
@@ -1197,7 +1243,7 @@ impl Dal {
     /// 适用场景：`provider=network`（驱动组件自举的 dbserver 宿主）接入**全新空库**时
     /// 自动建表，对齐原生连接的 `SyncSchema` 行为；远端为共享/他人维护的数据库时请勿使用。
     pub fn sync_schema_including_network(&self) -> Result<SchemaReport> {
-        self.sync_schema_inner(true)
+        self.sync_schema_inner(None, true, true)
     }
 
     /// **只同步索引**（不改表、不改列，只按模型补/升级索引）。
@@ -1378,7 +1424,12 @@ impl Dal {
     }
 
     /// 结构同步实现：`include_network = false` 时保持 C# 对齐的网络空实现。
-    fn sync_schema_inner(&self, include_network: bool) -> Result<SchemaReport> {
+    fn sync_schema_inner(
+        &self,
+        conn_name: Option<&str>,
+        include_model_level: bool,
+        include_network: bool,
+    ) -> Result<SchemaReport> {
         let model = self
             .model
             .as_ref()
@@ -1407,7 +1458,27 @@ impl Dal {
 
         let mut session = self.open_session()?;
 
+        // 多库模型：只建「属于本连接」的表（表级 `ConnName` 优先，没有则归模型级 `ConnName`）。
+        // 不区分就会把别的连接的表也建到本库，而目标连接的库里反而一张表都没有
+        // （`connname_routing` 用例过去只能靠调用方手动 `target.sync_schema()` 绕过）。
+        let mine = conn_name.map(str::trim).filter(|s| !s.is_empty());
+
         for table in &model.tables {
+            if let Some(mine) = mine {
+                let table_conn = table
+                    .conn_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let belongs = match table_conn {
+                    Some(conn) => conn.eq_ignore_ascii_case(mine),
+                    // 表级未配 → 归模型级连接；是否在本连接建，由调用方判定
+                    None => include_model_level,
+                };
+                if !belongs {
+                    continue;
+                }
+            }
             // 视图不参与结构迁移（对齐 C# `EntitySession` 的 `if (DataTable.IsView) return`）
             if table.is_view {
                 continue;

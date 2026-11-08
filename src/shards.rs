@@ -865,7 +865,11 @@ fn open_auto_sqlite(name: &str, base_dal: &Dal) -> Result<Arc<Dal>> {
         "Data Source={};Provider=SQLite",
         dir.join(format!("{name}.db")).display()
     );
-    Ok(Arc::new(Dal::open_with_model(&conn, (*model).clone())?))
+    let dal = Dal::open_with_model(&conn, (*model).clone())?;
+    // 新库没有表：按**该连接**建表（只建表级 ConnName 指向它的那些表）。
+    // 不建的话，表级 ConnName 解析出来的库永远是空的，一查就报“表不存在”
+    dal.sync_schema_for(Some(name), false, false)?;
+    Ok(Arc::new(dal))
 }
 
 /// 解析**表级 `ConnName`** 对应的数据访问层（对应 C# `Meta.ConnName` / `TableItem.ConnName`）。

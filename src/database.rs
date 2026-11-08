@@ -135,6 +135,30 @@ pub struct DatabaseFile {
     pub connections: BTreeMap<String, ConnectionEntry>,
     /// 驱动组件源（可选）
     pub driver_store: Option<DriverStore>,
+    /// 外部数据域绑定（可选）：本项目自身数据之外的、属于主站（C#）的库
+    pub external: Option<ExternalLinks>,
+}
+
+/// 外部数据域绑定。
+///
+/// 口径（与 C# 一致）：**本项目自己产生的数据**（用量、上传、文章、面板账号等）放本项目库；
+/// **主站（C#）的数据**（如用户表 `DH_UserEx`——中转站只是读它来校验 Key）绑到主站自己的库，
+/// 不能混入本项目库。
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct ExternalLinks {
+    /// 用户/成员库连接名（`DH_UserEx` 所在库）；空 = 与本项目库相同
+    pub user_connection: String,
+}
+
+impl DatabaseFile {
+    /// 主站用户库连接名（未配置或为空时返回 `None` = 与本项目库相同）。
+    pub fn user_connection(&self) -> Option<&str> {
+        self.external
+            .as_ref()
+            .map(|e| e.user_connection.trim())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 impl DatabaseFile {
@@ -180,6 +204,17 @@ impl DatabaseFile {
             out.push_str(&format!("Url = \"{}\"\n", toml_escape(&store.url)));
             out.push_str(&format!("PubKey = \"{}\"\n", toml_escape(&store.pub_key)));
             out.push_str(&format!("CaFile = \"{}\"\n", toml_escape(&store.ca_file)));
+        }
+
+        // 外部数据域绑定（非空才写，避免默认文件多一段无用配置）
+        if let Some(ext) = &self.external
+            && !ext.user_connection.trim().is_empty()
+        {
+            out.push_str("[External]\n");
+            out.push_str(&format!(
+                "UserConnection = \"{}\"\n",
+                toml_escape(&ext.user_connection)
+            ));
         }
 
         out
@@ -511,13 +546,27 @@ impl Databases {
                 Some(model) => {
                     let dal = Dal::open_with_model(&conn, model.clone())
                         .map_err(|e| format!("打开数据库失败：{e}"))?;
-                    dal.sync_schema()
+                    // **按连接名建表**：多库模型下每个连接只建属于自己的表
+                    //（表级 `ConnName` 优先，没有则归模型级 `ConnName`）。
+                    // 「无表级 ConnName」的表只在本连接就是模型级连接（或模型级连接没配置、本连接代它）时建。
+                    let own_model_tables = match model.options.conn_name() {
+                        Some(model_conn) => {
+                            model_conn.trim().eq_ignore_ascii_case(&target)
+                                || !self
+                                    .file
+                                    .connections
+                                    .keys()
+                                    .any(|k| k.eq_ignore_ascii_case(model_conn.trim()))
+                        }
+                        None => true,
+                    };
+                    dal.sync_schema_for(Some(&target), own_model_tables, false)
                         .map_err(|e| format!("同步表结构失败：{e}"))?;
                     // 自有远端库：network 连接默认空实现（对齐 C#），显式启用时补做结构同步
                     if self.remote_schema_sync
                         && crate::network::is_network(&ConnectionString::parse(&conn))
                     {
-                        dal.sync_schema_including_network()
+                        dal.sync_schema_for(Some(&target), own_model_tables, true)
                             .map_err(|e| format!("同步远端表结构失败：{e}"))?;
                     }
                     dal

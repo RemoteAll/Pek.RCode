@@ -123,5 +123,52 @@ fn table_conn_name_routing_matrix() {
     );
 
     shards::clear_connections();
+
+    // —— 场景 C：按连接建表（多库模型的正确姿势）——
+    // 模型级 Main，RemoteTable 指向 IoTData：主库只能有 LocalTable，IoTData 库只建 RemoteTable
+    let multi = MODEL.replace(
+        "<EntityModel>",
+        "<EntityModel><Option><ConnName>Main</ConnName></Option>",
+    );
+    let model = EntityModel::parse(&multi).expect("模型解析");
+
+    let main_db = dir.join("c-main.db");
+    let main_dal = Dal::open_with_model(&conn(&main_db), model.clone()).expect("打开主库");
+    let report = main_dal
+        .sync_schema_for(Some("Main"), true, false)
+        .expect("按连接同步主库");
+    assert!(
+        report.created_tables.iter().any(|t| t == "LocalTable"),
+        "主库应建 LocalTable：{report:?}"
+    );
+    assert!(
+        !report.created_tables.iter().any(|t| t == "RemoteTable"),
+        "主库**不应**建 RemoteTable（它属于 IoTData 连接）：{report:?}"
+    );
+    // 主库里确实查不到 RemoteTable（表不存在 → 查询报错）
+    {
+        let mut session = main_dal.open_session().expect("会话");
+        let table = main_dal.table("RemoteTable").expect("取表");
+        assert!(
+            table.query(session.as_mut(), &Query::new().column("Id")).is_err(),
+            "主库不应存在 RemoteTable 表"
+        );
+    }
+
+    // 表级连接：解析即自动建库 + 按该连接建表（无需调用方手动 sync_schema）
+    let auto = main_dal
+        .table_conn_dal("RemoteTable")
+        .expect("解析连接")
+        .expect("应解析出 IoTData 连接");
+    let mut auto_session = auto.open_session().expect("会话");
+    let auto_table = auto.table("RemoteTable").expect("取表");
+    assert!(
+        auto_table
+            .query(auto_session.as_mut(), &Query::new().column("Id"))
+            .is_ok(),
+        "自动建的表级连接库里应有 RemoteTable 表（不需要调用方手动 sync_schema）"
+    );
+
+    shards::clear_connections();
     let _ = std::fs::remove_dir_all(&dir);
 }
