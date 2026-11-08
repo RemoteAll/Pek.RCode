@@ -30,7 +30,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use postgres::config::SslMode;
-use postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
+use postgres::types::{Format, FromSql, IsNull, ToSql, Type, to_sql_checked};
 use postgres::{Client, Config as PgConfig, NoTls};
 use rust_decimal::Decimal;
 
@@ -542,6 +542,28 @@ fn to_hex(bytes: &[u8]) -> String {
     text
 }
 
+/// 原样按 UTF-8 读取的文本包装。
+///
+/// `postgres` 的 `String` 实现只接受文本类类型，`json`/`jsonb`（以及数组、复合类型）不在白名单里，
+/// 遇则报 "cannot convert between the Rust type `alloc::string::String` and the Postgres type `jsonb`"。
+/// 本包装接受任意类型并按 UTF-8 解析原始字节，保留 JSON 原文（不经过 serde 重排序）。
+#[derive(Debug)]
+struct RawText(String);
+
+impl<'a> FromSql<'a> for RawText {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(RawText(String::from_utf8(raw.to_vec())?))
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        // 只用于“按文本回退”的列，类型白名单由调用方决定
+        true
+    }
+}
+
 /// PostgreSQL 值 → `DbValue`（按列类型分支）。
 fn pg_to_dbvalue(row: &postgres::Row, index: usize, ty: &Type) -> Result<DbValue> {
     use Type as T;
@@ -570,6 +592,8 @@ fn pg_to_dbvalue(row: &postgres::Row, index: usize, ty: &Type) -> Result<DbValue
         T::FLOAT8 => read!(f64, DbValue::Float),
         T::NUMERIC => read!(Decimal, DbValue::Decimal),
         T::TEXT | T::VARCHAR | T::BPCHAR | T::NAME | T::UNKNOWN => read!(String, DbValue::Text),
+        // json/jsonb 不在 `String` 的 FromSql 白名单内，按原文读取
+        T::JSON | T::JSONB => read!(RawText, |v| DbValue::Text(v.0)),
         T::BYTEA => read!(Vec<u8>, DbValue::Blob),
         T::TIMESTAMP => read!(NaiveDateTime, DbValue::DateTime),
         T::TIMESTAMPTZ => read!(DateTime<Utc>, |v| DbValue::DateTime(v.naive_utc())),

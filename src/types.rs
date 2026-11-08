@@ -30,11 +30,17 @@ pub enum DataType {
     DateTime,
     /// 二进制（C# `Byte[]`）
     Binary,
+    /// JSON 文本（MySQL `JSON` / PostgreSQL `jsonb` / DuckDB `JSON`）
+    ///
+    /// 建表时映射到各数据库的 JSON 类型；无原生 JSON 类型的库退化为文本大字段。
+    /// 读写值仍是 [`crate::value::DbValue::Text`]（JSON 原文），字段仍以 `String` 承载，
+    /// 因此**与 `String` 在值语义上完全等价**，区别只在于建表类型与反向工程识别。
+    Json,
 }
 
 impl DataType {
     /// 全部类型（用于遍历/自检）。
-    pub const ALL: [DataType; 11] = [
+    pub const ALL: [DataType; 12] = [
         DataType::Boolean,
         DataType::Byte,
         DataType::Int16,
@@ -46,6 +52,7 @@ impl DataType {
         DataType::String,
         DataType::DateTime,
         DataType::Binary,
+        DataType::Json,
     ];
 
     /// 标准名称（与 Model.xml 中的 `DataType` 属性一致）。
@@ -62,6 +69,7 @@ impl DataType {
             DataType::String => "String",
             DataType::DateTime => "DateTime",
             DataType::Binary => "Binary",
+            DataType::Json => "Json",
         }
     }
 
@@ -79,8 +87,9 @@ impl DataType {
             "string" | "text" => Ok(DataType::String),
             "datetime" | "date" | "timestamp" => Ok(DataType::DateTime),
             "binary" | "byte[]" | "blob" => Ok(DataType::Binary),
+            "json" | "jsonb" => Ok(DataType::Json),
             other => Err(Error::Model(format!(
-                "未知的数据类型 \"{other}\"（支持：Boolean/Byte/Int16/Int32/Int64/Single/Double/Decimal/String/DateTime/Binary）"
+                "未知的数据类型 \"{other}\"（支持：Boolean/Byte/Int16/Int32/Int64/Single/Double/Decimal/String/DateTime/Binary/Json）"
             ))),
         }
     }
@@ -116,6 +125,8 @@ impl DataType {
             DataType::String => "String",
             DataType::DateTime => "chrono::NaiveDateTime",
             DataType::Binary => "Vec<u8>",
+            // JSON 原文即字符串，实体字段类型与 `String` 一致
+            DataType::Json => "String",
         }
     }
 }
@@ -137,7 +148,17 @@ mod tests {
         assert_eq!(DataType::from_name("Long").unwrap(), DataType::Int64);
         assert_eq!(DataType::from_name("text").unwrap(), DataType::String);
         assert_eq!(DataType::from_name("byte[]").unwrap(), DataType::Binary);
+        assert_eq!(DataType::from_name("json").unwrap(), DataType::Json);
+        assert_eq!(DataType::from_name("JSONB").unwrap(), DataType::Json);
         assert!(DataType::from_name("money2").is_err());
+    }
+
+    #[test]
+    fn json_behaves_like_string_for_values() {
+        // JSON 与 String 值语义一致（实体字段同为 `String`），便于 C# 侧按 String 消费
+        assert_eq!(DataType::Json.rust_type(), DataType::String.rust_type());
+        assert_eq!(DataType::Json.name(), "Json");
+        assert!(!DataType::Json.is_numeric());
     }
 
     #[test]

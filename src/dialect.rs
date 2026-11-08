@@ -519,6 +519,9 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => "datetime".into(),
                 DataType::Binary => "binary".into(),
+                // SQLite 无 JSON 类型；声明成 `json` 会得到 NUMERIC 亲和度而把 JSON 数字文字转成数字，
+                // 故一律存 TEXT（JSON1/JSONB 函数对 TEXT 同样生效）
+                DataType::Json => "text".into(),
             },
             DatabaseKind::MySql => match t {
                 // 与 DH.NCode 对齐：MySQL 布尔用 TINYINT（读取时 0/1 → bool）
@@ -542,6 +545,8 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => datetime_spec("datetime", col.scale),
                 DataType::Binary => "longblob".into(),
+                // 5.7.8+ 原生 JSON：紧凑二进制存储 + 服务端合法性校验
+                DataType::Json => "JSON".into(),
             },
             DatabaseKind::SqlServer => match t {
                 DataType::Boolean => "bit".into(),
@@ -561,6 +566,8 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => datetime_spec_mssql(col.scale),
                 DataType::Binary => "varbinary(max)".into(),
+                // SQL Server 2016+ 以 nvarchar(max) + ISJSON 承载 JSON（2025 才有原生 json 类型）
+                DataType::Json => "nvarchar(max)".into(),
             },
             // PostgreSQL 与国产 PG 系（金仓/瀚高/海量）类型映射一致
             DatabaseKind::PostgreSql
@@ -583,6 +590,8 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => datetime_spec("timestamp", col.scale),
                 DataType::Binary => "bytea".into(),
+                // jsonb：二进制存储 + 去重键 + 可索引 / 可用操作符查询
+                DataType::Json => "jsonb".into(),
             },
             DatabaseKind::Oracle => match t {
                 DataType::Boolean => "number(1)".into(),
@@ -602,6 +611,8 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => "timestamp".into(),
                 DataType::Binary => "blob".into(),
+                // 在 Oracle 21c 之前无原生 JSON 类型；CLOB 兼容面最广
+                DataType::Json => "clob".into(),
             },
             DatabaseKind::DuckDb => match t {
                 DataType::Boolean => "BOOLEAN".into(),
@@ -620,6 +631,7 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => "TIMESTAMP".into(),
                 DataType::Binary => "BLOB".into(),
+                DataType::Json => "JSON".into(),
             },
             DatabaseKind::Firebird => match t {
                 // 与 DH.NCode 对齐：Firebird 无布尔类型，用 SMALLINT 承载
@@ -639,6 +651,7 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => "TIMESTAMP".into(),
                 DataType::Binary => "BLOB".into(),
+                DataType::Json => "BLOB SUB_TYPE TEXT".into(),
             },
             DatabaseKind::ClickHouse => match t {
                 DataType::Boolean | DataType::Byte => "UInt8".into(),
@@ -649,7 +662,7 @@ impl DatabaseKind {
                 DataType::Double => "Float64".into(),
                 DataType::Decimal => format!("Decimal({},{})", col.precision, col.scale),
                 // ClickHouse 字符串无长度参数
-                DataType::String | DataType::Binary => "String".into(),
+                DataType::String | DataType::Binary | DataType::Json => "String".into(),
                 DataType::DateTime => "DateTime64(6)".into(),
             },
             DatabaseKind::TDengine => match t {
@@ -672,6 +685,7 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => "TIMESTAMP".into(),
                 DataType::Binary => "BLOB".into(),
+                DataType::Json => "TEXT".into(),
             },
             DatabaseKind::InfluxDb => match t {
                 DataType::Boolean => "BOOLEAN".into(),
@@ -682,6 +696,7 @@ impl DatabaseKind {
                 DataType::String => "STRING".into(),
                 DataType::DateTime => "TIMESTAMP".into(),
                 DataType::Binary => "BINARY".into(),
+                DataType::Json => "STRING".into(),
             },
             DatabaseKind::Hana => match t {
                 DataType::Boolean => "BOOLEAN".into(),
@@ -707,6 +722,7 @@ impl DatabaseKind {
                         "BLOB".into()
                     }
                 }
+                DataType::Json => "NCLOB".into(),
             },
             // 文档型：返回 BSON 类型名（供模型导出/诊断参考）
             DatabaseKind::MongoDb => match t {
@@ -718,6 +734,7 @@ impl DatabaseKind {
                 DataType::String => "string".into(),
                 DataType::DateTime => "date".into(),
                 DataType::Binary => "binData".into(),
+                DataType::Json => "object".into(),
             },
             // 与 DH.NCode 对齐：DB2 采用 Oracle 兼容模式（NUMBER/BINARY_FLOAT/To_Date）
             DatabaseKind::Db2 => match t {
@@ -738,6 +755,7 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => "TIMESTAMP".into(),
                 DataType::Binary => "BLOB".into(),
+                DataType::Json => "CLOB".into(),
             },
             // 与 DH.NCode 对齐：达梦类型（BIT/TINYINT/DEC/DATETIME/BLOB）
             DatabaseKind::DaMeng => match t {
@@ -758,6 +776,7 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => "DATETIME".into(),
                 DataType::Binary => "BLOB".into(),
+                DataType::Json => "CLOB".into(),
             },
             // 与 DH.NCode 对齐：IRIS 类型表（布尔用 TINYINT 承载）
             DatabaseKind::Iris => match t {
@@ -778,6 +797,7 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => "DATETIME".into(),
                 DataType::Binary => "BLOB".into(),
+                DataType::Json => "LONGVARCHAR".into(),
             },
             DatabaseKind::Access => match t {
                 DataType::Boolean => "BIT".into(),
@@ -797,6 +817,7 @@ impl DatabaseKind {
                 }
                 DataType::DateTime => "DATETIME".into(),
                 DataType::Binary => "BINARY".into(),
+                DataType::Json => "MEMO".into(),
             },
         }
     }
@@ -1494,6 +1515,7 @@ pub const MYSQL_INDEX_PREFIX_CHARS: i32 = 191;
 ///
 /// 判定与 [`DatabaseKind::field_type`] 的 MySQL 分支保持一致：
 /// `String` 且 `Length` 为 0（不限）或超 `16383` → `longtext`；`Binary` → `longblob`。
+/// `Json` 不加前缀长度（`JSON(191)` 是非法语法；JSON 列本身只能通过生成列建索引）。
 ///
 /// # 参数
 /// - `col`：列定义。
@@ -1504,6 +1526,7 @@ fn mysql_needs_index_prefix(col: &ColumnMeta) -> bool {
     match col.data_type {
         DataType::String => col.length <= 0 || col.length > 16383,
         DataType::Binary => true,
+        DataType::Json => false,
         _ => false,
     }
 }
@@ -1727,6 +1750,20 @@ mod tests {
         assert!(
             SqlFeatures::from_server(DatabaseKind::MySql, &modern).upsert_row_alias,
             "8.0.19 起应使用行别名"
+        );
+
+        // MySQL 9.x：继续支持行别名（9.0 只移除了 mysql_native_password，未移除 upsert 语法）。
+        // 9.7.4+ 的 `VERSION()` 仍返回三段兼容版本（四段只在 VERSION_WITH_UPDATE() 里），解析不受影响。
+        let nine = ServerInfo::parse("9.0.1");
+        assert_eq!((nine.major, nine.minor, nine.patch), (9, 0, 1));
+        assert!(
+            SqlFeatures::from_server(DatabaseKind::MySql, &nine).upsert_row_alias,
+            "MySQL 9.x 应继续使用行别名"
+        );
+        let newer = ServerInfo::parse("9.7.4");
+        assert!(
+            SqlFeatures::from_server(DatabaseKind::MySql, &newer).upsert_row_alias,
+            "9.7.x 同样支持行别名"
         );
 
         // MariaDB 不支持别名语法，即使版本号看着够新

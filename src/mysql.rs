@@ -132,6 +132,7 @@ impl MysqlSession {
                         &ValueMeta {
                             is_bit: false,
                             is_binary: false,
+                            is_json: false,
                         },
                     ),
                 });
@@ -454,14 +455,19 @@ struct ValueMeta {
     is_bit: bool,
     /// 是否二进制列（按 Blob 处理而非文本）
     is_binary: bool,
+    /// 是否 JSON 列（字符集是 binary，会带 `BINARY_FLAG`，但内容应还原为文本）
+    is_json: bool,
 }
 
 impl ValueMeta {
     /// 从驱动列描述构造。
     fn of(column: &Column) -> Self {
+        let is_json = column.column_type() == ColumnType::MYSQL_TYPE_JSON;
         Self {
             is_bit: column.column_type() == ColumnType::MYSQL_TYPE_BIT,
-            is_binary: column.flags().contains(ColumnFlags::BINARY_FLAG),
+            // JSON 列字符集为 binary，带有 BINARY_FLAG；优先级低于 is_json
+            is_binary: !is_json && column.flags().contains(ColumnFlags::BINARY_FLAG),
+            is_json,
         }
     }
 }
@@ -482,13 +488,15 @@ fn mysql_to_dbvalue(value: Value, meta: &ValueMeta) -> DbValue {
                     acc = (acc << 8) | u64::from(*b);
                 }
                 DbValue::Int(acc as i64)
-            } else if meta.is_binary {
-                DbValue::Blob(bytes)
-            } else {
+            } else if meta.is_json || !meta.is_binary {
+                // 文本列 + JSON 列：JSON 列的字符集是 binary（带 `BINARY_FLAG`），
+                // 但内容是 JSON 原文，必须还原为文本（`DbValue::Text`）而非 Blob
                 match String::from_utf8(bytes) {
                     Ok(text) => DbValue::Text(text),
                     Err(e) => DbValue::Blob(e.into_bytes()),
                 }
+            } else {
+                DbValue::Blob(bytes)
             }
         }
         Value::Date(y, mo, d, h, mi, s, us) => {
@@ -754,14 +762,23 @@ mod tests {
         let text_meta = ValueMeta {
             is_bit: false,
             is_binary: false,
+            is_json: false,
         };
         let blob_meta = ValueMeta {
             is_bit: false,
             is_binary: true,
+            is_json: false,
         };
         let bit_meta = ValueMeta {
             is_bit: true,
             is_binary: true,
+            is_json: false,
+        };
+        // JSON 列的字符集是 binary（带 BINARY_FLAG），但仍应还原为文本而非 Blob
+        let json_meta = ValueMeta {
+            is_bit: false,
+            is_binary: true,
+            is_json: true,
         };
 
         assert!(mysql_to_dbvalue(Value::NULL, &text_meta).is_null());
@@ -782,6 +799,11 @@ mod tests {
             mysql_to_dbvalue(Value::Bytes(b"hello".to_vec()), &blob_meta),
             DbValue::Blob(_)
         ));
+        // JSON 列 → 文本（即便驱动带了 BINARY_FLAG）
+        assert_eq!(
+            mysql_to_dbvalue(Value::Bytes(br#"{"a":1}"#.to_vec()), &json_meta).as_str(),
+            Some(r#"{"a":1}"#)
+        );
         // BIT(1)：单字节 0x01 → 1
         assert_eq!(
             mysql_to_dbvalue(Value::Bytes(vec![1]), &bit_meta).as_i64(),

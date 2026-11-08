@@ -299,7 +299,7 @@ pub fn generate(table: &TableMeta) -> String {
             }
             let ty = entity_field_type(col);
             let param = safe_field_name(&to_snake_case(&col.name));
-            let expr = if matches!(col.data_type, DataType::String) {
+            let expr = if matches!(col.data_type, DataType::String | DataType::Json) {
                 format!("pek_rcode::DbValue::Text({param})")
             } else {
                 format!("pek_rcode::DbValue::from({param})")
@@ -359,7 +359,8 @@ pub fn generate(table: &TableMeta) -> String {
         ];
         let mut checks = Vec::new();
         for col in &table.columns {
-            if col.nullable || !matches!(col.data_type, DataType::String) {
+            // JSON 列与字符串列同为 `String` 字段，空串同样视为缺失
+            if col.nullable || !matches!(col.data_type, DataType::String | DataType::Json) {
                 continue;
             }
             if col
@@ -497,7 +498,7 @@ fn known_enum(enum_type: &str) -> Option<(&'static str, &'static str)> {
 
 /// 字段是否为字符串/二进制（非 Copy，输出时需 clone）。
 fn needs_clone(t: DataType) -> bool {
-    matches!(t, DataType::String | DataType::Binary)
+    matches!(t, DataType::String | DataType::Binary | DataType::Json)
 }
 
 /// `new()` 中每个字段的默认值表达式。
@@ -513,7 +514,7 @@ fn default_expr(col: &ColumnMeta) -> String {
         DataType::Byte | DataType::Int16 | DataType::Int32 | DataType::Int64 => "0".into(),
         DataType::Single | DataType::Double => "0.0".into(),
         DataType::Decimal => "Default::default()".into(),
-        DataType::String => "String::new()".into(),
+        DataType::String | DataType::Json => "String::new()".into(),
         DataType::DateTime => "chrono::DateTime::UNIX_EPOCH.naive_utc()".into(),
         DataType::Binary => "Vec::new()".into(),
     }
@@ -554,7 +555,7 @@ fn from_row_expr(col: &ColumnMeta, name: &str, owned: bool) -> String {
     }
     if col.nullable {
         return match col.data_type {
-            DataType::String => format!(
+            DataType::String | DataType::Json => format!(
                 "row.{accessor}(\"{name}\").and_then(|v| (!v.is_null()).then(|| v.{text_of}()))"
             ),
             DataType::Binary => {
@@ -568,7 +569,7 @@ fn from_row_expr(col: &ColumnMeta, name: &str, owned: bool) -> String {
     }
 
     match col.data_type {
-        DataType::String => {
+        DataType::String | DataType::Json => {
             format!("row.{accessor}(\"{name}\").map(DbValue::{text_of}).unwrap_or_default()")
         }
         DataType::Binary => {
@@ -597,7 +598,9 @@ fn value_converter(t: DataType) -> &'static str {
         DataType::Double => "DbValue::as_f64",
         DataType::Decimal => "DbValue::as_decimal",
         DataType::DateTime => "DbValue::as_datetime",
-        DataType::String | DataType::Binary => unreachable!("字符串/二进制由调用方特殊处理"),
+        DataType::String | DataType::Binary | DataType::Json => {
+            unreachable!("字符串/JSON/二进制由调用方特殊处理")
+        }
     }
 }
 
@@ -627,7 +630,7 @@ fn set_field_expr(col: &ColumnMeta) -> String {
     }
     if col.nullable {
         return match col.data_type {
-            DataType::String => "(!value.is_null()).then(|| value.to_text())".into(),
+            DataType::String | DataType::Json => "(!value.is_null()).then(|| value.to_text())".into(),
             DataType::Binary => "value.as_blob().map(<[u8]>::to_vec)".into(),
             other => format!(
                 "value.{}()",
@@ -636,7 +639,7 @@ fn set_field_expr(col: &ColumnMeta) -> String {
         };
     }
     match col.data_type {
-        DataType::String => "value.to_text()".into(),
+        DataType::String | DataType::Json => "value.to_text()".into(),
         DataType::Binary => "value.as_blob().map(<[u8]>::to_vec).unwrap_or_default()".into(),
         DataType::DateTime => {
             "value.as_datetime().unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH.naive_utc())".into()

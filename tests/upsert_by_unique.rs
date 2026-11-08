@@ -156,7 +156,7 @@ fn upsert_batch_by_unique_validates_inputs() {
                 &[],
                 &["DeviceId"],
                 &[],
-                &[one.clone()],
+                std::slice::from_ref(&one),
                 None
             )
             .is_err()
@@ -182,7 +182,7 @@ fn upsert_batch_by_unique_validates_inputs() {
                 &["DeviceId", "Memory"],
                 &["DeviceId"],
                 &[],
-                &[one.clone()],
+                std::slice::from_ref(&one),
                 None,
             )
             .is_err()

@@ -558,7 +558,8 @@ fn map_mysql_type(
         "varchar" | "char" | "nvarchar" | "nchar" => {
             (DataType::String, args.first().copied().unwrap_or(0), 0, 0)
         }
-        "text" | "tinytext" | "mediumtext" | "longtext" | "json" | "set" => {
+        "json" => (DataType::Json, 0, 0, 0),
+        "text" | "tinytext" | "mediumtext" | "longtext" | "set" => {
             (DataType::String, 0, 0, 0)
         }
         "enum" => {
@@ -739,7 +740,8 @@ fn map_postgres_type(
         "character varying" | "varchar" | "character" | "char" | "bpchar" | "name" => {
             (DataType::String, max_len.max(0), 0, 0)
         }
-        "text" | "citext" | "json" | "jsonb" | "uuid" | "xml" | "inet" | "cidr" | "macaddr"
+        "json" | "jsonb" => (DataType::Json, 0, 0, 0),
+        "text" | "citext" | "uuid" | "xml" | "inet" | "cidr" | "macaddr"
         | "interval" | "tsvector" | "tsquery" => (DataType::String, 0, 0, 0),
         "timestamp without time zone"
         | "timestamp"
@@ -907,6 +909,8 @@ fn map_mssql_type(type_name: &str, max_length: i32) -> (DataType, i32) {
         "decimal" | "numeric" | "money" | "smallmoney" => (DataType::Decimal, 0),
         "nvarchar" | "nchar" | "varchar" | "char" => (DataType::String, len.max(0)),
         "ntext" | "text" | "xml" | "sql_variant" | "uniqueidentifier" => (DataType::String, 0),
+        // SQL Server 2025 新增原生 json 类型；2016+ 仍以 nvarchar(max) 承载
+        "json" => (DataType::Json, 0),
         "datetime" | "smalldatetime" | "datetime2" | "date" | "time" | "datetimeoffset" => {
             (DataType::DateTime, 0)
         }
@@ -1132,6 +1136,8 @@ fn map_oracle_type(
             (DataType::String, len, 0, 0)
         }
         "clob" | "nclob" | "long" | "rowid" | "xmltype" => (DataType::String, 0, 0, 0),
+        // Oracle 21c+ 原生 JSON 类型（底层 OSON，兼容读写仍按文本）
+        "json" => (DataType::Json, 0, 0, 0),
         "date" | "timestamp" | "timestamp with time zone" | "timestamp with local time zone" => {
             (DataType::DateTime, 0, 0, 0)
         }
@@ -1273,7 +1279,8 @@ fn map_duckdb_type(raw_type: &str) -> (DataType, i32, i32, i32) {
         "varchar" | "char" | "bpchar" | "string" => {
             (DataType::String, args.first().copied().unwrap_or(0), 0, 0)
         }
-        "text" | "uuid" | "json" | "interval" | "time" => (DataType::String, 0, 0, 0),
+        "json" => (DataType::Json, 0, 0, 0),
+        "text" | "uuid" | "interval" | "time" => (DataType::String, 0, 0, 0),
         "timestamp"
         | "timestamp_s"
         | "timestamp_ms"
@@ -2018,7 +2025,8 @@ fn map_clickhouse_type(raw_type: &str) -> (DataType, i32, i32, i32, bool) {
             args.get(1).copied().unwrap_or(4),
         ),
         "string" | "fixedstring" => (DataType::String, args.first().copied().unwrap_or(0), 0, 0),
-        "enum8" | "enum16" | "uuid" | "ipv4" | "ipv6" | "json" => (DataType::String, 0, 0, 0),
+        "json" => (DataType::Json, 0, 0, 0),
+        "enum8" | "enum16" | "uuid" | "ipv4" | "ipv6" => (DataType::String, 0, 0, 0),
         "date" | "date32" | "datetime" | "datetime32" | "datetime64" => {
             (DataType::DateTime, 0, 0, 0)
         }
@@ -2109,7 +2117,8 @@ fn map_tdengine_type(type_name: &str, length: i32) -> (DataType, i32, i32, i32) 
             };
             (DataType::String, len, 0, 0)
         }
-        "json" | "geometry" => (DataType::String, 0, 0, 0),
+        "json" => (DataType::Json, 0, 0, 0),
+        "geometry" => (DataType::String, 0, 0, 0),
         "timestamp" => (DataType::DateTime, 0, 0, 0),
         _ => (DataType::String, 0, 0, 0),
     }
@@ -2277,6 +2286,8 @@ mod tests {
             DataType::String
         );
         assert_eq!(map_mysql_type("bit(1)", 0, 0, false).0, DataType::Boolean);
+        // 原生 JSON 列识别为 Json（而非退化为 String），否则 sync_schema 会把 longtext 当目标类型
+        assert_eq!(map_mysql_type("json", 0, 0, false).0, DataType::Json);
     }
 
     #[test]
@@ -2308,6 +2319,8 @@ mod tests {
             map_postgres_type("text", 0, 0, 0),
             (DataType::String, 0, 0, 0)
         );
+        assert_eq!(map_postgres_type("json", 0, 0, 0).0, DataType::Json);
+        assert_eq!(map_postgres_type("jsonb", 0, 0, 0).0, DataType::Json);
     }
 
     #[test]
@@ -2320,6 +2333,8 @@ mod tests {
         assert_eq!(map_mssql_type("decimal", 9), (DataType::Decimal, 0));
         assert_eq!(map_mssql_type("datetime", 8), (DataType::DateTime, 0));
         assert_eq!(map_mssql_type("varbinary", -1), (DataType::Binary, 0));
+        // SQL Server 2016+ 无原生 json 类型，反向时 nvarchar(max) 仍为 String；2025 的 json 认作 Json
+        assert_eq!(map_mssql_type("json", -1), (DataType::Json, 0));
     }
 
     #[test]
@@ -2350,6 +2365,8 @@ mod tests {
             map_oracle_type("BINARY_DOUBLE", 8, 0, 0, 0).0,
             DataType::Double
         );
+        // Oracle 21c+ 原生 JSON 类型
+        assert_eq!(map_oracle_type("JSON", 0, 0, 0, 0).0, DataType::Json);
     }
 
     #[test]
@@ -2365,6 +2382,7 @@ mod tests {
         assert_eq!(map_duckdb_type("TIMESTAMP").0, DataType::DateTime);
         assert_eq!(map_duckdb_type("BLOB").0, DataType::Binary);
         assert_eq!(map_duckdb_type("HUGEINT").0, DataType::Decimal);
+        assert_eq!(map_duckdb_type("JSON").0, DataType::Json);
     }
 
     /// SQLite：目录读取 roundtrip（含非主键索引与唯一索引）。

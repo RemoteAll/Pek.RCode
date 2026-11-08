@@ -408,6 +408,7 @@ impl ColumnMeta {
     ///
     /// - `varchar(n)`：`4n + 2`（utf8mb4 + 长度前缀）
     /// - `Text`（无长度 String）：20（行内只存指针）
+    /// - `Json`：20（MySQL 的 JSON 列行内只存指针，实际内容在溢出页）
     /// - `Binary`：有长度按长度、无长度按 20
     /// - 其它固定宽度类型：按 8 字节粗略计（datetime/decimal 实际更小，留余量）
     pub fn mysql_row_bytes(&self) -> usize {
@@ -419,6 +420,7 @@ impl ColumnMeta {
                     20
                 }
             }
+            DataType::Json => 20,
             DataType::Binary => {
                 if self.length > 0 {
                     self.length as usize
