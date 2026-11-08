@@ -383,7 +383,13 @@ pub fn resolve_connection(base: &Path, conn: &str) -> Result<String, String> {
         if let Some((k, v)) = seg.split_once('=')
             && k.trim().eq_ignore_ascii_case("data source")
         {
-            let p = Path::new(v.trim());
+            // **路径分隔符归一（跨平台必须）**：配置里常写 Windows 风格 `Data\DH.db`，
+            // 而 Linux 上反斜杠**不是**路径分隔符 —— `Path::new("Data\\DH.db")` 是「一个文件名」，
+            // 于是 `base.join(...)` 会在**部署根**生成一个名字里带反斜杠的库（`Data\DH.db`），
+            // `Data/` 目录里反而没有（线上实测踩到）。统一按 `/` 解析，
+            // Windows / Linux 都得到正确的目录层级。
+            let normalized = v.trim().replace('\\', "/");
+            let p = Path::new(&normalized);
             let abs = if p.is_absolute() {
                 p.to_path_buf()
             } else {
@@ -413,7 +419,9 @@ pub fn sqlite_file_of(base: &Path, conn: &str) -> Option<PathBuf> {
         return None;
     }
     let ds = cs.data_source()?;
-    let path = Path::new(ds);
+    // 与 `resolve_connection` 同口径：反斜杠按 `/` 解析（Linux 上反斜杠不是分隔符）
+    let normalized = ds.replace('\\', "/");
+    let path = Path::new(&normalized);
     Some(if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -924,9 +932,13 @@ ConnectionString = "Data Source=Data/b.db;Provider=SQLite"
         assert!(out.contains(&dir.display().to_string()), "{out}");
         assert!(out.contains("ShowSql=false"), "其余段保留：{out}");
         assert!(dir.join("Data").is_dir(), "父目录自动创建");
-        // 已是绝对路径：幂等
+        // 已是绝对路径：幂等（分隔符形式会被归一到 `/`，语义等价）
         let abs = resolve_connection(&dir, &out).unwrap();
-        assert_eq!(abs, out);
+        assert_eq!(
+            abs.replace('\\', "/"),
+            out.replace('\\', "/"),
+            "已是绝对路径时应幂等"
+        );
         // 非 SQLite 原样；空串报错
         assert_eq!(
             resolve_connection(&dir, "Server=x;Provider=MySql").unwrap(),
@@ -940,6 +952,23 @@ ConnectionString = "Data Source=Data/b.db;Provider=SQLite"
         let p = sqlite_file_of(&dir, "Data Source=Data/x.db;Provider=SQLite").unwrap();
         assert_eq!(p, dir.join("Data").join("x.db"));
         assert!(sqlite_file_of(&dir, "Server=x;Provider=MySql").is_none());
+
+        // **Windows 风格分隔符必须跨平台正确**：Linux 上反斜杠不是分隔符，
+        // 不归一会生成「文件名带反斜杠」的库（`Data\DH.db` 落在部署根，Data/ 里反而没有）。
+        // 入参是 TOML **解析后**的值，即单个反斜杠。
+        let expected = dir.join("Data").join("DH.db");
+        let win = resolve_connection(&dir, "Data Source=Data\\DH.db;Provider=SQLite").unwrap();
+        assert!(
+            win.replace('\\', "/").contains(&expected.display().to_string().replace('\\', "/")),
+            "反斜杠必须按目录分隔解析：{win}"
+        );
+        assert_eq!(
+            sqlite_file_of(&dir, "Data Source=Data\\DH.db;Provider=SQLite").unwrap(),
+            expected,
+            "sqlite_file_of 也要按目录解析"
+        );
+        assert!(dir.join("Data").is_dir(), "应建出 Data 目录");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
