@@ -338,10 +338,18 @@ fn sqlite_indexes(session: &mut dyn SqlSession, table: &str) -> Result<Vec<Index
             "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
             &[DbValue::Text(name.clone())],
         )?;
-        let columns: Vec<String> = cols.rows.iter().map(|r| text(r, 0)).collect();
-        if columns.is_empty() {
-            continue;
-        }
+        // 函数索引（`CREATE INDEX … ON t (lower(x))`）的 `name` 是 NULL，`text()` 会转成空串；
+        // **必须过滤掉**，否则 `columns` 变成 `[""]`（非空！）→ 被判成“多余索引”而误删
+        // 函数索引（`CREATE INDEX … ON t (lower(x))`）的 `name` 是 NULL，`text()` 会转成空串；
+        // **必须过滤掉**，否则 `columns` 变成 `[""]`（非空！）→ 被判成“多余索引”而误删
+        let columns: Vec<String> = cols
+            .rows
+            .iter()
+            .map(|r| text(r, 0))
+            .filter(|c| !c.is_empty())
+            .collect();
+        // 与 MySQL / PostgreSQL 分支保持一致：保留空列条目（`columns` 为空），
+        // 供 `sync_schema` 按名字幂等比对、且「多余索引」清理会保守跳过
         indexes.push(IndexInfo {
             name,
             columns,
@@ -616,7 +624,7 @@ fn read_postgres(session: &mut dyn SqlSession) -> Result<Vec<TableInfo>> {
          JOIN pg_class i ON i.oid = ix.indexrelid \
          JOIN pg_class t ON t.oid = ix.indrelid \
          JOIN pg_namespace n ON n.oid = t.relnamespace \
-         JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey) \
+         LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey) \
          WHERE n.nspname = current_schema() \
          ORDER BY t.relname, i.relname, array_position(ix.indkey, a.attnum)",
         &[],
@@ -683,14 +691,17 @@ fn read_postgres(session: &mut dyn SqlSession) -> Result<Vec<TableInfo>> {
             }
             continue;
         }
-        if column.is_empty() {
-            continue;
-        }
+        // 表达式索引（`indkey` 里的 0 不对应真实列，`LEFT JOIN` 后 `attname` 为 NULL）：
+        // 保留空列条目，供 `sync_schema` 按名字幂等比对（与 MySQL/SQLite 同口径）
         match table.indexes.iter_mut().find(|i| i.name == index_name) {
-            Some(existing) => existing.columns.push(column),
+            Some(existing) => {
+                if !column.is_empty() {
+                    existing.columns.push(column);
+                }
+            }
             None => table.indexes.push(IndexInfo {
                 name: index_name,
-                columns: vec![column],
+                columns: if column.is_empty() { Vec::new() } else { vec![column] },
                 unique,
             }),
         }
@@ -707,7 +718,7 @@ fn postgres_indexes(session: &mut dyn SqlSession, table: &str) -> Result<Vec<Ind
          JOIN pg_class i ON i.oid = ix.indexrelid \
          JOIN pg_class t ON t.oid = ix.indrelid \
          JOIN pg_namespace n ON n.oid = t.relnamespace \
-         JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey) \
+         LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey) \
          WHERE n.nspname = current_schema() AND t.relname = ? AND ix.indisprimary = false \
          ORDER BY i.relname, array_position(ix.indkey, a.attnum)",
         &[DbValue::Text(table.to_string())],
@@ -716,14 +727,16 @@ fn postgres_indexes(session: &mut dyn SqlSession, table: &str) -> Result<Vec<Ind
     for row in &set.rows {
         let index_name = text(row, 0);
         let column = text(row, 2);
-        if column.is_empty() {
-            continue;
-        }
+        // 同 `read_postgres`：表达式索引列名为空，保留条目供按名幂等
         match indexes.iter_mut().find(|i| i.name == index_name) {
-            Some(existing) => existing.columns.push(column),
+            Some(existing) => {
+                if !column.is_empty() {
+                    existing.columns.push(column);
+                }
+            }
             None => indexes.push(IndexInfo {
                 name: index_name,
-                columns: vec![column],
+                columns: if column.is_empty() { Vec::new() } else { vec![column] },
                 unique: truthy(row, 1),
             }),
         }

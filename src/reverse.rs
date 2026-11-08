@@ -122,12 +122,15 @@ fn to_table_meta(info: catalog::TableInfo) -> TableMeta {
         indexes: info
             .indexes
             .into_iter()
+            // 表达式索引（MySQL 函数/多值索引、SQLite 函数索引）的列名读回来是 NULL，
+            // 只剩一个索引名；模型里无法表达「只有名字没有列/表达式」的索引，
+            // 若原样产出会写成 `<Index Name="x" Columns="" />` 这种垃圾定义 → 反向时不产出
+            .filter(|idx| !idx.columns.is_empty())
             .map(|idx| IndexMeta {
                 name: Some(idx.name),
                 columns: idx.columns,
                 unique: idx.unique,
-                // 反向工程读不回表达式（`information_schema.STATISTICS.COLUMN_NAME` 为 NULL
-                // 的函数索引会被整体跳过），所以这里恒为 `None`
+                // 反向工程不产出表达式索引（见上），故恒为 None
                 expression: None,
             })
             .collect(),

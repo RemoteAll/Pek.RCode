@@ -1536,7 +1536,12 @@ impl Dal {
                         .push(format!("会话表定义缓存导致 3107，已换新连接重建：{sql}"));
                     fresh.execute_ddl(sql)?;
                 }
-                Err(e) => return Err(Error::Db(format!("{e}；DDL：{sql}"))),
+                Err(e) => {
+                    // 截断而非省略：建表语句可能上百列，整条倾倒会让日志不可读
+                    let shown: String = sql.chars().take(300).collect();
+                    let dots = if shown.len() < sql.len() { "…" } else { "" };
+                    return Err(Error::Db(format!("{e}；DDL：{shown}{dots}")));
+                }
             }
         }
         Ok(())
@@ -2481,9 +2486,36 @@ fn is_idempotent_ddl_error(err: &Error) -> bool {
     let Error::Db(msg) = err else {
         return false;
     };
-    ["ERROR 1060", "ERROR 1061", "ERROR 1091", "ERROR 1050"]
-        .iter()
-        .any(|code| msg.contains(code))
+    // 各驱动的错误文本形态不同（见 `catalog`/各 `*_to_dbvalue` 的 `map_err`），这里按方言前缀匹配：
+    // - MySQL：`ERROR 1060/1061/1091/1050`；
+    // - SQLite（rusqlite 原文）：`duplicate column name` / `index … already exists` / `table … already exists`；
+    // - PostgreSQL：`SQLSTATE 42701`（duplicate_column）/ `42P07`（duplicate_table|relation）/ `42710`（duplicate_object）；
+    // - Oracle：`ORA-01430`（column already exists）/ `ORA-00955`（name is already used）；
+    // - SQL Server：`There is already an object named` / `Column names in each table must be unique`；
+    // - DuckDB：`already exists`（其 `Catalog Error` 文本）。
+    const MARKERS: [&str; 14] = [
+        // MySQL
+        "error 1060",
+        "error 1061",
+        "error 1091",
+        "error 1050",
+        "duplicate key name",
+        "duplicate column name",
+        // SQLite / DuckDB（rusqlite / duckdb 原文里都是 `... already exists`）
+        "already exists",
+        // PostgreSQL
+        "sqlstate 42701",
+        "sqlstate 42p07",
+        "sqlstate 42710",
+        // Oracle
+        "ora-01430",
+        "ora-00955",
+        // SQL Server
+        "there is already an object named",
+        "column names in each table must be unique",
+    ];
+    let lower = msg.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// MySQL 建函数索引 / JSON 多值索引时的「隐藏生成列顺序」误报（`ERROR 3107`）。

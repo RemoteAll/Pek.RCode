@@ -161,3 +161,133 @@ fn json_column_uses_string_storage_type() {
     assert_eq!(col.data_type.rust_type(), "String");
     assert_eq!(col.data_type.name(), "Json");
 }
+
+/// 表达式索引（SQLite 也支持）必须能建、且二次同步幂等。
+///
+/// 幂等依赖「按索引名判存在」：SQLite 的 `pragma_index_info` 对函数索引返回 NULL 列名，
+/// 若 `catalog` 把这类索引整体丢掉，每轮都会重复 `CREATE INDEX`，
+/// 而 SQLite 的 `index … already exists` 不在 MySQL 的错误码白名单里 → 会直接报错中断。
+const EXPR_MODEL: &str = r#"<EntityModel><Tables><Table Name="ExprDoc" TableName="ExprDoc">
+  <Columns>
+    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+    <Column Name="Payload" DataType="Json" Nullable="True" />
+    <Column Name="Note" DataType="String" Length="50" Nullable="True" />
+  </Columns>
+  <Indexes>
+    <Index Name="ix_expr_lower" Expression="lower(Note)" />
+    <Index Name="ix_expr_count" Expression="Payload->'$.count'" />
+  </Indexes>
+</Table></Tables></EntityModel>"#;
+
+fn setup_expr(name: &str) -> (PathBuf, Dal) {
+    let stamp = chrono::Local::now()
+        .format("%H%M%S%.9f")
+        .to_string()
+        .replace('.', "");
+    let dir = std::env::temp_dir().join(format!(
+        "rcode-jsonexpr-{}-{}-{name}",
+        std::process::id(),
+        stamp
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = format!("Data Source={};Provider=SQLite", dir.join("t.db").display());
+    let dal = Dal::open_with_model(&conn, EntityModel::parse(EXPR_MODEL).unwrap()).unwrap();
+    (dir, dal)
+}
+
+#[test]
+fn expression_index_sync_is_idempotent_on_sqlite() {
+    let (dir, dal) = setup_expr("sync");
+    let first = dal.sync_schema().unwrap();
+    assert!(
+        first.created_tables.iter().any(|t| t == "ExprDoc"),
+        "{:?}",
+        first.created_tables
+    );
+
+    // 二次同步：不能重复补建，也**不能把表达式索引当成多余索引删掉**
+    // （`pragma_index_info` 对函数索引返回 NULL 列名，若不过滤成空串会变成 `[""]`，
+    //  非空 → 被判成多余索引，第二次同步直接 Drop）
+    let second = dal.sync_schema().unwrap();
+    assert!(
+        second.added_indexes.is_empty(),
+        "二次同步不应补索引：{:?}",
+        second.added_indexes
+    );
+    assert!(
+        second.dropped_indexes.is_empty(),
+        "二次同步不应删索引：{:?}",
+        second.dropped_indexes
+    );
+
+    let mut session = dal.open_session().unwrap();
+    let rows = session
+        .query(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'ExprDoc' AND name LIKE 'ix_expr%' ORDER BY name",
+            &[],
+        )
+        .unwrap();
+    let names: Vec<String> = rows
+        .rows
+        .iter()
+        .filter_map(|row| row.get(0).and_then(DbValue::as_str).map(str::to_string))
+        .collect();
+    assert_eq!(names, vec!["ix_expr_count", "ix_expr_lower"]);
+
+    // 索引真的在 SQLite 里生效（函数索引可被查询计划选中）
+    let plan = session
+        .query("EXPLAIN QUERY PLAN SELECT * FROM ExprDoc WHERE lower(Note) = 'x'", &[])
+        .unwrap();
+    let detail: String = plan
+        .rows
+        .iter()
+        .filter_map(|row| row.get(3).and_then(DbValue::as_str))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        detail.to_ascii_lowercase().contains("ix_expr_lower"),
+        "查询计划应使用函数索引：{detail}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 反向工程不产出「只有名字没有列/表达式」的索引定义（否则写出 `<Index Name="x" Columns="" />` 垃圾）。
+#[test]
+fn reverse_skips_index_without_columns() {
+    let (dir, _dal) = setup_expr("reverse");
+    let conn = format!("Data Source={};Provider=SQLite", dir.join("t.db").display());
+    let dal = Dal::open(&conn).unwrap();
+    let mut session = dal.open_session().unwrap();
+    session
+        .execute(
+            "CREATE TABLE \"RevDoc\" (\"Id\" INTEGER PRIMARY KEY, \"Note\" text)",
+            &[],
+        )
+        .unwrap();
+    session
+        .execute("CREATE INDEX ix_rev_lower ON \"RevDoc\" (lower(\"Note\"))", &[])
+        .unwrap();
+    session
+        .execute("CREATE INDEX ix_rev_note ON \"RevDoc\" (\"Note\")", &[])
+        .unwrap();
+    drop(session);
+
+    let model = dal.read_model().unwrap();
+    let table = model
+        .tables
+        .iter()
+        .find(|t| t.effective_table_name() == "RevDoc")
+        .expect("应反向出 RevDoc");
+    assert!(
+        table.indexes.iter().all(|i| !i.columns.is_empty()),
+        "反向不应产出空列索引：{:?}",
+        table.indexes
+    );
+    // 普通列索引保留，函数索引被过滤
+    assert_eq!(table.indexes.len(), 1, "{:?}", table.indexes);
+    assert_eq!(table.indexes[0].columns, vec!["Note".to_string()]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
