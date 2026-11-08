@@ -16,6 +16,7 @@ const MODEL: &str = r#"<EntityModel><Tables><Table Name="DeviceOnline" TableName
     <Column Name="Delay" DataType="Int32" />
     <Column Name="Pings" DataType="Int32" />
     <Column Name="AccessMode" DataType="String" Length="20" />
+    <Column Name="CreateTime" DataType="DateTime" Nullable="True" />
   </Columns>
   <Indexes>
     <Index Columns="DeviceId" Unique="True" />
@@ -193,5 +194,90 @@ fn upsert_batch_by_unique_validates_inputs() {
             .is_err()
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 创建审计列（`CreateTime`）只在首次插入时写：冲突时不得被覆盖，也不需调用方额外传参。
+#[test]
+fn upsert_batch_by_unique_keeps_create_time() {
+    let (dir, dal) = setup("only");
+    let table = dal.table("DeviceOnline").unwrap();
+    let mut session = dal.open_session().unwrap();
+
+    let columns = ["DeviceId", "Memory", "Delay", "Pings", "AccessMode", "CreateTime"];
+    let first_time = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let first = vec![vec![
+        DbValue::Int(20),
+        DbValue::Int(100),
+        DbValue::Int(1),
+        DbValue::Int(1),
+        DbValue::Text("Mqtt".into()),
+        DbValue::DateTime(first_time),
+    ]];
+    table
+        .upsert_batch_by_unique(
+            session.as_mut(),
+            &columns,
+            &["DeviceId"],
+            &["Pings"],
+            &first,
+            None,
+        )
+        .unwrap();
+
+    // 第二批：CreateTime 给一个新值——但创建列属于「只写一次」，库里必须保持首次时间
+    let later = first_time + chrono::Duration::hours(5);
+    let second = vec![vec![
+        DbValue::Int(20),
+        DbValue::Int(200),
+        DbValue::Int(2),
+        DbValue::Int(3),
+        DbValue::Text("Mqtt".into()),
+        DbValue::DateTime(later),
+    ]];
+    table
+        .upsert_batch_by_unique(
+            session.as_mut(),
+            &columns,
+            &["DeviceId"],
+            &["Pings"],
+            &second,
+            None,
+        )
+        .unwrap();
+
+    let rows = table
+        .query(
+            session.as_mut(),
+            &Query::new().filter(Where::new().eq("DeviceId", 20)),
+        )
+        .unwrap();
+    let row = rows.rows.first().expect("应有一行");
+    assert_eq!(
+        row.get_by_name("CreateTime")
+            .and_then(|value| value.as_datetime()),
+        Some(first_time),
+        "CreateTime 属于创建列，不应被冲突更新覆盖"
+    );
+    assert_eq!(
+        row.get_by_name("Memory").and_then(|value| value.as_i64()),
+        Some(200),
+        "Memory 是普通列，应更新"
+    );
+    assert_eq!(
+        row.get_by_name("Pings").and_then(|value| value.as_i32()),
+        Some(4),
+        "Pings 是累加列，应在旧值上累加"
+    );
+    assert_eq!(
+        row.get_by_name("Delay").and_then(|value| value.as_i32()),
+        Some(2),
+        "Delay 是普通列，应更新为新值"
+    );
+
+    drop(session);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -18,6 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once};
 use crate::DatabaseKind;
 use crate::dal::Dal;
 use crate::session::SqlSession;
+use crate::transaction::EntityTransaction;
 
 /// 共享存储：一个数据目录一个数据访问层 + 一把串行锁。
 pub struct SharedStore {
@@ -84,6 +85,43 @@ impl SharedStore {
             .open_session()
             .map_err(|e| format!("数据会话创建失败：{e}"))?;
         f(&self.dal, session.as_mut()).map_err(|e| e.to_string())
+    }
+
+    /// **写会话（自动事务）**：把一批写操作包成一个事务执行。
+    ///
+    /// 与 [`SharedStore::with_session`] / [`SharedStore::with_session_concurrent`] 的区别：
+    /// - **自动事务**：回调成功才提交，返回 `Err` 或 panic 时自动回滚（`EntityTransaction` 的 RAII）；
+    /// - **按驱动选会话**：SQLite / DuckDB 走串行会话（进程内单写者）；
+    ///   MySQL / PostgreSQL 等网络库走并发会话（服务端保证并发安全，进程内再串行只会压成单线程）。
+    ///
+    /// 为什么需要它：MySQL 默认 `autocommit=1`，**一条语句一次提交**（= 一次 redo flush）。
+    /// 批量写不显式开事务时，N 条语句就是 N 次提交；包成事务后整批只提交一次。
+    /// SQLite 同理（`BEGIN ... COMMIT` 比逐条隐式事务少 N 次提交）。
+    ///
+    /// # 参数
+    /// - `f`：会话回调（返回值即本函数返回值）。
+    ///
+    /// # 返回值
+    /// 回调结果；开启/提交事务或回调失败时返回错误（未提交时自动回滚）。
+    pub fn with_write_session<F, R>(&self, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&Dal, &mut dyn SqlSession) -> crate::Result<R>,
+    {
+        let run = |dal: &Dal, session: &mut dyn SqlSession| -> crate::Result<R> {
+            let mut tx = EntityTransaction::new(session)?;
+            let out = f(dal, tx.session())?;
+            tx.commit()?;
+            Ok(out)
+        };
+
+        if matches!(
+            self.dal.kind(),
+            DatabaseKind::Sqlite | DatabaseKind::DuckDb
+        ) {
+            self.with_session(run)
+        } else {
+            self.with_session_concurrent(run)
+        }
     }
 
     /// **只读**会话：与写路径互斥锁无关（SQLite/WAL 允许 1 写 N 读）。
@@ -277,6 +315,12 @@ where
     }
     INTERCEPTORS.call_once(crate::interceptor::enable_defaults);
     let dal = open()?;
+    // **启动时探测一次服务端版本并缓存**（一次 `SELECT VERSION()`；后续所有 SQL 生成读缓存）。
+    // 版本决定可用语法（如 MySQL 8.0.19+ 的 Upsert 行别名、MariaDB 不支持别名）。
+    // 探测失败不阻塞启动：SQL 生成退化为最保守写法，并留下一行可定位的原因。
+    if let Err(err) = dal.detect_server() {
+        println!("[pek-rcode] 服务端版本探测失败，按最保守语法生成 SQL：{err}");
+    }
     let store = Arc::new(SharedStore {
         base: key.0.clone(),
         reads: read_pool_for(&dal),

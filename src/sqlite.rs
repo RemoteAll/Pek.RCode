@@ -354,7 +354,13 @@ impl SqlSession for SqliteSession {
     }
 
     fn begin(&mut self) -> Result<()> {
-        self.conn.execute_batch("BEGIN")?;
+        // **BEGIN IMMEDIATE**（而不是默认的 deferred）：
+        // - deferred 事务在「先读后写」时才尝试升级写锁，若此时另一个写者持有锁，
+        //   SQLite 直接返回 `SQLITE_BUSY` 且 busy_timeout 对「锁升级失败」不生效，
+        //   典型表现是批量写偶发 `database is locked`；
+        // - IMMEDIATE 在 BEGIN 时就拿 RESERVED 锁，冲突走 busy_timeout 正常排队；
+        // - WAL 模式下写不阻塞读（只读池照常工作）。
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
         Ok(())
     }
 

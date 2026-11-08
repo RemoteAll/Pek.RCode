@@ -3,7 +3,7 @@
 //! 对应 DH.NCode 的 `InsertBuilder` / `SelectBuilder`：语句完全由参数绑定生成，
 //! 列名一律经方言引用，杜绝拼接注入。
 
-use crate::dialect::{DatabaseKind, oracle_identity_sequence};
+use crate::dialect::{DatabaseKind, SqlFeatures, oracle_identity_sequence};
 use crate::error::{Error, Result};
 use crate::model::TableMeta;
 use crate::query::{OrderBy, Query, Where};
@@ -203,7 +203,9 @@ pub enum BatchWriteMode {
 /// 生成 `INSERT ... VALUES (..), (..), ...` 及方言去重后缀；列集由调用方统一，占位符按行展开，
 /// 参数由调用方按行、列顺序拍平传入（与 [`insert_sql_named`] 的单行占位符规则一致）。
 ///
-/// - `Upsert` 的冲突目标取**表主键**（无主键报错）；更新列 = 插入列中排除主键与自增列
+/// - `Upsert` 的冲突目标取**表主键**（无主键报错）；更新列 = 插入列中排除主键、自增列与
+///   **创建审计列**（`CreateTime` / `CreateUser` / `CreateUserID`：创建列只写一次，
+///   与 `TimeInterceptor` 的更新语义一致）
 ///   （对齐 C# `On Conflict Do Update` 的字段过滤；无更新列时 SQLite 系 `Do Nothing`、MySQL no-op）；
 /// - 方言不支持对应模式时返回 [`Error::Unsupported`]（由调用方回退或报错）。
 pub fn multi_write_sql_named(
@@ -213,6 +215,30 @@ pub fn multi_write_sql_named(
     columns: &[&str],
     rows: usize,
     mode: BatchWriteMode,
+) -> Result<String> {
+    multi_write_sql_named_with(
+        kind,
+        table,
+        table_name,
+        columns,
+        rows,
+        mode,
+        &SqlFeatures::default(),
+    )
+}
+
+/// 同 [`multi_write_sql_named`]，并带上**服务端版本特性**（如 MySQL 8.0.19+ 的 Upsert 行别名）。
+///
+/// 版本由 [`crate::dal::Dal::detect_server`] 在启动时探测并缓存（见 [`crate::dialect::ServerInfo`]）；
+/// 未探测时用 [`SqlFeatures::default`]（全关 = 最兼容写法）。
+pub fn multi_write_sql_named_with(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    columns: &[&str],
+    rows: usize,
+    mode: BatchWriteMode,
+    features: &SqlFeatures,
 ) -> Result<String> {
     multi_write_impl(
         kind,
@@ -224,6 +250,7 @@ pub fn multi_write_sql_named(
         None,
         None,
         &[],
+        features,
     )
 }
 
@@ -235,6 +262,7 @@ pub fn multi_write_sql_named(
 /// - 用途：心跳/状态表的「一台设备一行」批量 upsert（外部唯一键不是自增主键）。
 ///
 /// `update_only` 同 [`multi_write_sql_upsert_named`]；传 `None` = 更新除主键/自增列外的全部插入列。
+#[allow(clippy::too_many_arguments)]
 pub fn multi_write_sql_upsert_by_named(
     kind: DatabaseKind,
     table: &TableMeta,
@@ -244,6 +272,32 @@ pub fn multi_write_sql_upsert_by_named(
     increment_columns: &[&str],
     rows: usize,
     update_only: Option<&[&str]>,
+) -> Result<String> {
+    multi_write_sql_upsert_by_named_with(
+        kind,
+        table,
+        table_name,
+        columns,
+        conflict_columns,
+        increment_columns,
+        rows,
+        update_only,
+        &SqlFeatures::default(),
+    )
+}
+
+/// 同 [`multi_write_sql_upsert_by_named`]，并带上**服务端版本特性**。
+#[allow(clippy::too_many_arguments)]
+pub fn multi_write_sql_upsert_by_named_with(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    columns: &[&str],
+    conflict_columns: &[&str],
+    increment_columns: &[&str],
+    rows: usize,
+    update_only: Option<&[&str]>,
+    features: &SqlFeatures,
 ) -> Result<String> {
     if conflict_columns.is_empty() {
         return Err(Error::Model(format!(
@@ -261,6 +315,7 @@ pub fn multi_write_sql_upsert_by_named(
         update_only,
         Some(conflict_columns),
         increment_columns,
+        features,
     )
 }
 
@@ -280,6 +335,27 @@ pub fn multi_write_sql_upsert_named(
     rows: usize,
     update_only: Option<&[&str]>,
 ) -> Result<String> {
+    multi_write_sql_upsert_named_with(
+        kind,
+        table,
+        table_name,
+        columns,
+        rows,
+        update_only,
+        &SqlFeatures::default(),
+    )
+}
+
+/// 同 [`multi_write_sql_upsert_named`]，并带上**服务端版本特性**。
+pub fn multi_write_sql_upsert_named_with(
+    kind: DatabaseKind,
+    table: &TableMeta,
+    table_name: &str,
+    columns: &[&str],
+    rows: usize,
+    update_only: Option<&[&str]>,
+    features: &SqlFeatures,
+) -> Result<String> {
     multi_write_impl(
         kind,
         table,
@@ -290,9 +366,22 @@ pub fn multi_write_sql_upsert_named(
         update_only,
         None,
         &[],
+        features,
     )
 }
 
+/// 只在首次插入时写入的创建审计列（Upsert 冲突时**不得覆盖**）。
+///
+/// 与 `TimeInterceptor` 的更新语义一致：插入补 `CreateTime` / `CreateUser*`，
+/// 更新只刷新 `Update*`。Upsert 的「冲突即更新」分支属于更新语义，
+/// 因此创建列不能进 `SET`——否则 `CreateTime` 会变成「最后一次写入时间」。
+fn is_create_audit_column(field: &str) -> bool {
+    field.eq_ignore_ascii_case("CreateTime")
+        || field.eq_ignore_ascii_case("CreateUser")
+        || field.eq_ignore_ascii_case("CreateUserID")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn multi_write_impl(
     kind: DatabaseKind,
     table: &TableMeta,
@@ -303,6 +392,7 @@ fn multi_write_impl(
     update_only: Option<&[&str]>,
     conflict_columns: Option<&[&str]>,
     increment_columns: &[&str],
+    features: &SqlFeatures,
 ) -> Result<String> {
     if columns.is_empty() {
         return Err(Error::Model(format!(
@@ -326,17 +416,17 @@ fn multi_write_impl(
         resolved.push(column_name(table, field)?);
     }
 
-    let (head, tail): (&str, String) = match mode {
-        BatchWriteMode::Insert => ("INSERT INTO", String::new()),
+    let (head, tail, values_suffix): (&str, String, &str) = match mode {
+        BatchWriteMode::Insert => ("INSERT INTO", String::new(), ""),
         BatchWriteMode::InsertIgnore => match kind {
-            DatabaseKind::Sqlite | DatabaseKind::DuckDb => ("INSERT OR IGNORE INTO", String::new()),
-            DatabaseKind::MySql => ("INSERT IGNORE INTO", String::new()),
+            DatabaseKind::Sqlite | DatabaseKind::DuckDb => {
+                ("INSERT OR IGNORE INTO", String::new(), "")
+            }
+            DatabaseKind::MySql => ("INSERT IGNORE INTO", String::new(), ""),
             DatabaseKind::PostgreSql
             | DatabaseKind::KingBase
             | DatabaseKind::HighGo
-            | DatabaseKind::VastBase => {
-                ("INSERT INTO", " ON CONFLICT DO NOTHING".into())
-            }
+            | DatabaseKind::VastBase => ("INSERT INTO", " ON CONFLICT DO NOTHING".into(), ""),
             _ => {
                 return Err(Error::Unsupported(format!(
                     "{kind:?} 不支持多行 InsertIgnore 批量写入"
@@ -345,9 +435,9 @@ fn multi_write_impl(
         },
         BatchWriteMode::Replace => match kind {
             DatabaseKind::Sqlite | DatabaseKind::DuckDb => {
-                ("INSERT OR REPLACE INTO", String::new())
+                ("INSERT OR REPLACE INTO", String::new(), "")
             }
-            DatabaseKind::MySql => ("REPLACE INTO", String::new()),
+            DatabaseKind::MySql => ("REPLACE INTO", String::new(), ""),
             _ => {
                 return Err(Error::Unsupported(format!(
                     "{kind:?} 不支持多行 Replace 批量写入"
@@ -372,6 +462,7 @@ fn multi_write_impl(
                         && !table
                             .identity()
                             .is_some_and(|id| id.name.eq_ignore_ascii_case(field))
+                        && !is_create_audit_column(field)
                         && update_only.is_none_or(|only| {
                             only.iter().any(|col| col.eq_ignore_ascii_case(field))
                         })
@@ -420,9 +511,20 @@ fn multi_write_impl(
                             sets.join(", ")
                         )
                     };
-                    ("INSERT INTO", tail)
+                    ("INSERT INTO", tail, "")
                 }
                 DatabaseKind::MySql => {
+                    // 值引用按版本分流：MySQL 8.0.19+ 用行别名（`VALUES()` 自 8.0.20 起废弃），
+                    // MariaDB 与旧版仍用 `VALUES()`——别名语法不被 MariaDB 支持。
+                    let alias = features.upsert_row_alias && !update_fields.is_empty();
+                    let column_value = |col: &str| -> String {
+                        if alias {
+                            format!("_new.{col}")
+                        } else {
+                            format!("VALUES({col})")
+                        }
+                    };
+
                     let tail = if update_fields.is_empty() {
                         // 无更新列：no-op 保持"存在即忽略"语义（MySQL 惯用写法）
                         let pk = kind.quote(table.effective_column_name(pks[0]));
@@ -432,19 +534,20 @@ fn multi_write_impl(
                             .iter()
                             .map(|field| {
                                 let col = kind.quote(column_name(table, field)?);
+                                let value = column_value(&col);
                                 if increment_columns
                                     .iter()
                                     .any(|c| c.eq_ignore_ascii_case(field))
                                 {
-                                    Ok(format!("{col}={col}+VALUES({col})"))
+                                    Ok(format!("{col}={col}+{value}"))
                                 } else {
-                                    Ok(format!("{col}=VALUES({col})"))
+                                    Ok(format!("{col}={value}"))
                                 }
                             })
                             .collect::<Result<_>>()?;
                         format!(" ON DUPLICATE KEY UPDATE {}", sets.join(", "))
                     };
-                    ("INSERT INTO", tail)
+                    ("INSERT INTO", tail, if alias { " AS _new" } else { "" })
                 }
                 _ => {
                     return Err(Error::Unsupported(format!(
@@ -467,7 +570,10 @@ fn multi_write_impl(
         _ => 1,
     };
     let mut sql = String::with_capacity(
-        32 + resolved.len() * 16 + rows * (resolved.len() * (slot + 2) + 4) + tail.len(),
+        32 + resolved.len() * 16
+            + rows * (resolved.len() * (slot + 2) + 4)
+            + values_suffix.len()
+            + tail.len(),
     );
     sql.push_str(head);
     sql.push(' ');
@@ -495,6 +601,7 @@ fn multi_write_impl(
         }
         sql.push(')');
     }
+    sql.push_str(values_suffix);
     sql.push_str(&tail);
     Ok(sql)
 }
@@ -1432,6 +1539,29 @@ mod tests {
                 "ON DUPLICATE KEY UPDATE `Code`=VALUES(`Code`), `Amount`=VALUES(`Amount`)"
             ),
             "{sql}"
+        );
+
+        // MySQL 8.0.19+（探测到版本）：改用行别名，避免已废弃的 VALUES()
+        let features = SqlFeatures {
+            upsert_row_alias: true,
+        };
+        let sql = multi_write_sql_named_with(
+            DatabaseKind::MySql,
+            &t,
+            "DH_Order",
+            &cols,
+            2,
+            BatchWriteMode::Upsert,
+            &features,
+        )
+        .unwrap();
+        assert!(
+            sql.contains("ON DUPLICATE KEY UPDATE `Code`=_new.`Code`, `Amount`=_new.`Amount`"),
+            "别名语法应引用 _new 行：{sql}"
+        );
+        assert!(
+            sql.contains(") AS _new ON DUPLICATE KEY UPDATE"),
+            "别名应写在 VALUES 列表之后：{sql}"
         );
 
         // 仅主键列（无更新列）：SQLite 系 Do Nothing、MySQL no-op

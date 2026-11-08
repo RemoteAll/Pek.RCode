@@ -358,7 +358,10 @@ order.delete(&dal, session.as_mut())?;
 | `update` / `update_batch` / `update_sharded` / `update_batch_sharded` | **只写脏列**；无脏返回 0 |
 | `update_columns(dal, session, &["Amount"])` | **只写指定列**（显式列集；成功后只清这些列的脏） |
 | `enqueue_save` + `EntityQueue::flush`（`SaveAsync` 等价） | 行已存在 → **只写脏列**；行不存在 → 插入全列；无脏不入队 |
-| `upsert_batch` / `upsert_batch_sharded` | SQL 级整行覆盖（`ON CONFLICT DO UPDATE` 全列）；需要最小写入请用 `save_batch*` |
+| `upsert_batch` / `upsert_batch_sharded` | SQL 级整行覆盖（`ON CONFLICT DO UPDATE` 全列**除创建审计列**：`CreateTime`/`CreateUser`/`CreateUserID` 只写一次）；需要最小写入请用 `save_batch*` |
+| `TableRef::upsert_batch_by_unique` | 按**业务唯一键**一条语句多行 Upsert；`increment_columns` 指定的列冲突时**累加**（`列=列+excluded.列`），适合计数/统计表 |
+| `SharedStore::with_write_session` | 一批写操作自动包事务（回调成功才提交，失败自动回滚）；SQLite/DuckDB 走串行、MySQL/PG 走并发会话 |
+| `Dal::detect_server` / `server_info` / `sql_features` | **打开连接时探测一次服务端版本并缓存**（`SELECT VERSION()`）；SQL 生成据此分流：MySQL 8.0.19+ 用 Upsert 行别名（`VALUES()` 自 8.0.20 废弃）、MariaDB 继续 `VALUES()` |
 
 > **防呆约定**：启用脏追踪的实体（生成实体，或手写实现 `dirty_state()`）必须通过会登记脏数据的 setter 修改字段；
 > 直接改 `pub` 字段不会标脏，`update` 会认为"没有变化"而返回 0。生成实体字段私有，编译期即可杜绝该误用。

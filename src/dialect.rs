@@ -991,6 +991,7 @@ impl DatabaseKind {
     ///
     /// 只有 MySQL 需要重复默认值（其它方言改列本就保留默认值），其余方言直接返回
     /// [`DatabaseKind::alter_column_sql_keep`] 的结果。
+    #[allow(clippy::too_many_arguments)]
     pub fn alter_column_sql_keep_full(
         &self,
         table: &TableMeta,
@@ -1590,11 +1591,158 @@ fn render_default(kind: &DatabaseKind, default: &str, col: &ColumnMeta) -> Strin
     literal
 }
 
+/// 服务端版本信息（**启动时探测一次，进程内缓存复用**）。
+///
+/// 用途：同一数据库的 SQL 语法在不同版本上不同（如 MySQL 8.0.19+ 的 Upsert 行别名、
+/// `VALUES()` 自 8.0.20 起废弃、MariaDB 不支持别名语法），而 `DatabaseKind` 只区分"哪种库"。
+/// 版本探测只在打开连接时做一次（一次 `SELECT VERSION()`），后续所有 SQL 生成直接读缓存。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerInfo {
+    /// `SELECT VERSION()` 的原始返回
+    pub raw: String,
+    /// 是否 MariaDB（版本串含 `MariaDB`）
+    pub is_mariadb: bool,
+    /// 主版本
+    pub major: u32,
+    /// 次版本
+    pub minor: u32,
+    /// 修订号
+    pub patch: u32,
+}
+
+impl ServerInfo {
+    /// 解析版本串（只取开头的 `主.次.修订`）。
+    ///
+    /// 实测形态都能解析：`8.0.32-0ubuntu0.22.04.2`、`5.7.44-log`、
+    /// `10.11.6-MariaDB-1:10.11.6+maria~ubu2204`、`16.4 (Debian 16.4-1.pgdg120+1)`。
+    ///
+    /// # 参数
+    /// - `raw`：`SELECT VERSION()` 的返回。
+    ///
+    /// # 返回值
+    /// 版本信息（解析不出的段补 0）。
+    pub fn parse(raw: &str) -> Self {
+        let text = raw.trim();
+        let is_mariadb = text.to_ascii_lowercase().contains("mariadb");
+
+        // 取第一个「数字与点」组成的片段（跳过库名前缀，如 `MariaDB-10.11.6`）
+        let first = text
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .find(|part| !part.is_empty())
+            .unwrap_or("");
+        let mut parts = first.split('.');
+        let major = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let minor = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let patch = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+
+        Self {
+            raw: text.to_string(),
+            is_mariadb,
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    /// 版本是否 >= 给定的 `主.次.修订`。
+    ///
+    /// # 参数
+    /// - `major`：主版本。
+    /// - `minor`：次版本。
+    /// - `patch`：修订号。
+    ///
+    /// # 返回值
+    /// 达到或超过返回 `true`。
+    pub fn at_least(&self, major: u32, minor: u32, patch: u32) -> bool {
+        (self.major, self.minor, self.patch) >= (major, minor, patch)
+    }
+
+    /// 展示文本（日志/面板用）：`MySQL 8.0.32` / `MariaDB 10.11.6`。
+    ///
+    /// # 返回值
+    /// 一行摘要。
+    pub fn label(&self) -> String {
+        let brand = if self.is_mariadb { "MariaDB" } else { "Server" };
+        format!("{brand} {}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// 由服务端版本推出的 SQL 语法开关（**保守默认 = 全关**，即生成最兼容的写法）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SqlFeatures {
+    /// MySQL `8.0.19+` 的 `INSERT ... VALUES (...) AS new ON DUPLICATE KEY UPDATE 列 = new.列`。
+    ///
+    /// - `VALUES(列)` 自 MySQL `8.0.20` 起被标记废弃（仍可用，但有 deprecation 警告，未来版本可能移除）；
+    /// - **MariaDB 不支持**该别名语法（继续用 `VALUES()`）；
+    /// - 版本未知/探测失败时保持 `false`（`VALUES()` 在所有 MySQL 5.x/8.x 上都可用）。
+    pub upsert_row_alias: bool,
+}
+
+impl SqlFeatures {
+    /// 按数据库类型与探测到的版本推导。
+    ///
+    /// # 参数
+    /// - `kind`：数据库类型。
+    /// - `info`：服务端版本（启动时探测）。
+    ///
+    /// # 返回值
+    /// 特性开关（未知版本一律保守）。
+    pub fn from_server(kind: DatabaseKind, info: &ServerInfo) -> Self {
+        Self {
+            upsert_row_alias: kind == DatabaseKind::MySql
+                && !info.is_mariadb
+                && info.at_least(8, 0, 19),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{EntityModel, TableMeta};
 
+    #[test]
+    fn server_info_parses_common_version_strings() {
+        let mysql = ServerInfo::parse("8.0.32-0ubuntu0.22.04.2");
+        assert_eq!((mysql.major, mysql.minor, mysql.patch), (8, 0, 32));
+        assert!(!mysql.is_mariadb);
+        assert!(mysql.at_least(8, 0, 19), "8.0.32 支持行别名");
+
+        let old = ServerInfo::parse("5.7.44-log");
+        assert_eq!((old.major, old.minor, old.patch), (5, 7, 44));
+        assert!(!old.at_least(8, 0, 19), "5.7 不支持行别名");
+
+        let maria = ServerInfo::parse("10.11.6-MariaDB-1:10.11.6+maria~ubu2204");
+        assert!(maria.is_mariadb);
+        assert_eq!((maria.major, maria.minor, maria.patch), (10, 11, 6));
+
+        let pg = ServerInfo::parse("16.4 (Debian 16.4-1.pgdg120+1)");
+        assert_eq!(pg.major, 16);
+    }
+
+    #[test]
+    fn sql_features_follow_server_version_and_brand() {
+        // MySQL 8.0.19+：开别名
+        let modern = ServerInfo::parse("8.0.19");
+        assert!(
+            SqlFeatures::from_server(DatabaseKind::MySql, &modern).upsert_row_alias,
+            "8.0.19 起应使用行别名"
+        );
+
+        // MariaDB 不支持别名语法，即使版本号看着够新
+        let maria = ServerInfo::parse("10.11.6-MariaDB");
+        assert!(
+            !SqlFeatures::from_server(DatabaseKind::MySql, &maria).upsert_row_alias,
+            "MariaDB 不支持 AS 别名"
+        );
+
+        // 非 MySQL 方言不使用该开关
+        let pg = ServerInfo::parse("16.4");
+        assert!(!SqlFeatures::from_server(DatabaseKind::PostgreSql, &pg).upsert_row_alias);
+
+        // 未探测 = 保守默认（全部关闭）
+        assert!(!SqlFeatures::default().upsert_row_alias);
+    }
     /// 追加式拼接必须与原 `quote` / `placeholder` 逐字节一致（热路径零分配优化的等价性护栏）。
     #[test]
     fn push_helpers_match_string_helpers() {

@@ -17,7 +17,7 @@ use std::{
 
 use crate::cache::{EntityCache, SingleCache};
 use crate::catalog::ColumnInfo;
-use crate::dialect::DatabaseKind;
+use crate::dialect::{DatabaseKind, ServerInfo, SqlFeatures};
 use crate::error::{Error, Result};
 use crate::migration::Migration;
 use crate::model::{ColumnMeta, EntityModel, TableMeta};
@@ -197,6 +197,8 @@ pub struct Dal {
     pub(crate) count_cache: RwLock<HashMap<String, (i64, std::time::Instant)>>,
     /// 模型表名索引（小写实体名/物理表名 → 表下标；避免每次操作线性扫 176 表）
     table_index: OnceLock<HashMap<String, usize>>,
+    /// 服务端版本（启动时探测一次并缓存；`None` = 未探测 → SQL 生成用最保守写法）
+    server: OnceLock<ServerInfo>,
     /// 时间分表规格（表名 → 规格；解析期算一次，未命中即"不分表"）
     shard_specs: OnceLock<HashMap<String, Arc<crate::model::ShardSpec>>>,
     /// 会话连接池（懒创建；`Pooling=false` 时不使用）
@@ -583,6 +585,7 @@ impl Dal {
             field_caches: RwLock::new(HashMap::new()),
             count_cache: RwLock::new(HashMap::new()),
             table_index: OnceLock::new(),
+            server: OnceLock::new(),
             shard_specs: OnceLock::new(),
             pool: OnceLock::new(),
             pool_enabled,
@@ -611,6 +614,64 @@ impl Dal {
     /// 数据库类型。
     pub fn kind(&self) -> DatabaseKind {
         self.kind
+    }
+
+    /// **探测服务端版本并缓存**（幂等；启动时调用一次，后续全部读缓存）。
+    ///
+    /// 只做一次版本查询（MySQL/MariaDB `SELECT VERSION()`、PostgreSQL 系 `SELECT version()`、
+    /// SQLite/DuckDB `SELECT sqlite_version()`、SQL Server `@@VERSION`），
+    /// 结果存 [`Dal::server_info`]——**不会**在每个请求/每条 SQL 上重复探测。
+    ///
+    /// # 返回值
+    /// 探测成功或已缓存返回 `Ok`；不支持的方言直接 `Ok`（视为未知版本，走保守语法）。
+    pub fn detect_server(&self) -> Result<()> {
+        if self.server.get().is_some() {
+            return Ok(());
+        }
+
+        let sql = match self.kind {
+            DatabaseKind::MySql => "SELECT VERSION()",
+            DatabaseKind::PostgreSql
+            | DatabaseKind::KingBase
+            | DatabaseKind::HighGo
+            | DatabaseKind::VastBase => "SELECT version()",
+            DatabaseKind::Sqlite | DatabaseKind::DuckDb => "SELECT sqlite_version()",
+            DatabaseKind::SqlServer => "SELECT @@VERSION",
+            _ => return Ok(()),
+        };
+
+        let mut session = self.open_session()?;
+        let rows = session.query(sql, &[])?;
+        let raw = rows
+            .first()
+            .and_then(|row| row.get(0))
+            .map(|value| value.to_text())
+            .unwrap_or_default();
+        if raw.trim().is_empty() {
+            return Err(Error::Db(format!("探测服务端版本失败：{sql} 返回空")));
+        }
+
+        let _ = self.server.set(ServerInfo::parse(&raw));
+        Ok(())
+    }
+
+    /// 服务端版本（未探测返回 `None`）。
+    ///
+    /// # 返回值
+    /// 探测过的版本信息。
+    pub fn server_info(&self) -> Option<&ServerInfo> {
+        self.server.get()
+    }
+
+    /// 当前连接实际可用的 SQL 语法开关（未探测 = [`SqlFeatures::default`] 保守默认）。
+    ///
+    /// # 返回值
+    /// 版本相关的语法开关。
+    pub fn sql_features(&self) -> SqlFeatures {
+        self.server
+            .get()
+            .map(|info| SqlFeatures::from_server(self.kind, info))
+            .unwrap_or_default()
     }
 
     /// 连接串。
@@ -2898,21 +2959,23 @@ impl<'a> TableRef<'a> {
         });
         for chunk in rows.chunks(per_statement) {
             let sql = match (mode, update_only) {
-                (BatchWriteMode::Upsert, Some(only)) => sqlbuild::multi_write_sql_upsert_named(
+                (BatchWriteMode::Upsert, Some(only)) => sqlbuild::multi_write_sql_upsert_named_with(
                     self.dal.kind,
                     self.table,
                     self.physical_name(),
                     columns,
                     chunk.len(),
                     Some(only),
+                    &self.dal.sql_features(),
                 )?,
-                _ => sqlbuild::multi_write_sql_named(
+                _ => sqlbuild::multi_write_sql_named_with(
                     self.dal.kind,
                     self.table,
                     self.physical_name(),
                     columns,
                     chunk.len(),
                     mode,
+                    &self.dal.sql_features(),
                 )?,
             };
             let mut params = Vec::with_capacity(chunk.len() * columns.len());
@@ -3605,6 +3668,9 @@ impl<'a> TableRef<'a> {
     /// - `conflict_columns`：冲突判定列（通常是唯一索引列，如 `DeviceId`）。
     /// - `increment_columns`：冲突时**累加**而不是覆盖的列（如 `Pings`），传空 = 全部覆盖。
     /// - `rows`：每行的值，顺序与 `columns` 一致。
+    ///
+    /// **创建审计列（`CreateTime` / `CreateUser` / `CreateUserID`）永远不会被冲突更新覆盖**
+    /// ——与 `TimeInterceptor` 的更新语义一致：创建列只写一次，更新只刷新 `Update*`。
     /// - `batch_size`：单条语句的最大行数（`None` = 500）。
     ///
     /// # 返回值
@@ -3625,7 +3691,18 @@ impl<'a> TableRef<'a> {
         if conflict_columns.is_empty() {
             return Err(Error::Argument("批量 Upsert 必须指定冲突列".into()));
         }
-        let batch = batch_size.unwrap_or(500).max(1);
+        let default_batch = crate::batch::default_insert_batch_size(self.dal.kind);
+        // 与 `write_batch` 同口径：先取方言默认批大小，再按单语句参数上限收紧
+        // （列多时 500 行也可能超 SQLite 的 32766 参数上限）
+        let max_params = self.dal.kind.max_statement_params();
+        let per_statement = if max_params == 0 {
+            default_batch
+        } else {
+            (max_params / columns.len().max(1)).max(1)
+        };
+        let batch = batch_size
+            .unwrap_or_else(|| default_batch.min(per_statement))
+            .max(1);
         let mut affected = 0u64;
         for chunk in rows.chunks(batch) {
             if let Some(bad) = chunk.iter().find(|row| row.len() != columns.len()) {
@@ -3635,7 +3712,7 @@ impl<'a> TableRef<'a> {
                     columns.len()
                 )));
             }
-            let sql = sqlbuild::multi_write_sql_upsert_by_named(
+            let sql = sqlbuild::multi_write_sql_upsert_by_named_with(
                 self.dal.kind,
                 self.table,
                 self.physical_name(),
@@ -3644,6 +3721,7 @@ impl<'a> TableRef<'a> {
                 increment_columns,
                 chunk.len(),
                 None,
+                &self.dal.sql_features(),
             )?;
             let mut params: Vec<DbValue> = Vec::with_capacity(chunk.len() * columns.len());
             for row in chunk {

@@ -639,7 +639,15 @@ fn upsert_batch_is_idempotent_and_updates() {
     let again = TradeLog::query(&dal, session.as_mut(), &Query::new()).unwrap();
     assert_eq!(again.len(), 2, "Upsert 不应重复插入");
     assert!(again.iter().all(|r| r.note.ends_with("-v2")));
-    assert!(again.iter().all(|r| r.create_time == day(2026, 10, 1)));
+    // `CreateTime` 是创建审计列：只在首次插入时写，冲突更新**不覆盖**
+    //（对齐 TimeInterceptor 的更新语义：更新只刷新 `Update*`）
+    let mut times: Vec<_> = again.iter().map(|r| r.create_time).collect();
+    times.sort();
+    assert_eq!(
+        times,
+        vec![day(2026, 9, 1), day(2026, 9, 2)],
+        "CreateTime 应保持首次插入值，不被 Upsert 覆盖"
+    );
 
     // 原样再跑一遍：结果稳定（幂等）
     TradeLog::upsert_batch(&dal, session.as_mut(), &again, None).unwrap();
