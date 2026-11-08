@@ -341,7 +341,23 @@ pub struct Databases {
 
 impl Databases {
     /// 构建容器（`model` 提供时：`Dal::open_with_model` + `sync_schema`）。
+    ///
+    /// **模型级连接名优先**：C# 那边实体取连接是「`Model.xml` 的 `<Option><ConnName>` → 同名连接」，
+    /// 不是一律用约定文件的 `Default`。这里对齐：模型 `ConnName` 在约定文件里有同名连接时，
+    /// 它就成为默认连接；没有同名连接则保持 `Default`（部署文件是权威，模型与它不一致时不让启动失败，
+    /// `PEK_PROXY_DB` 这类"只给一个连接"的覆盖场景也不会因为找不到 ConnName 而报错）。
     pub fn new(base: &Path, file: DatabaseFile, model: Option<EntityModel>) -> Self {
+        let mut file = file;
+        if let Some(wanted) = model
+            .as_ref()
+            .and_then(|m| m.options.conn_name())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if file.connections.contains_key(wanted) {
+                file.default = wanted.to_string();
+            }
+        }
         Self {
             base: base.to_path_buf(),
             file,
@@ -663,6 +679,40 @@ Note = "主库 \"引号\" 与\n换行"
             "简写应写成表形态：{rendered}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_conn_name_wins_over_default_when_connection_exists() {
+        // C# 口径：实体取连接是「Model.xml 的 <Option><ConnName> → 同名连接」，
+        // 不是一律用 Database.toml 的 Default。
+        let model = EntityModel::parse(
+            r#"<EntityModel><Option><ConnName>DH</ConnName></Option><Tables></Tables></EntityModel>"#,
+        )
+        .expect("模型应可解析");
+
+        let mut file = DatabaseFile::default();
+        file.connections.insert(
+            "main".to_string(),
+            ConnectionEntry::Simple("Data Source=Data/main.db;Provider=SQLite".to_string()),
+        );
+        file.connections.insert(
+            "DH".to_string(),
+            ConnectionEntry::Simple("Data Source=Data/dh.db;Provider=SQLite".to_string()),
+        );
+        file.default = "main".to_string();
+
+        let dbs = Databases::new(Path::new("."), file.clone(), Some(model.clone()));
+        assert_eq!(dbs.default_name(), "DH", "模型 ConnName 应优先于 Default");
+
+        // 约定文件里没有同名连接 → 保持 Default（部署文件权威，不让启动因模型不一致而失败）
+        let mut only_main = DatabaseFile::default();
+        only_main.connections.insert(
+            "main".to_string(),
+            ConnectionEntry::Simple("Data Source=Data/main.db;Provider=SQLite".to_string()),
+        );
+        only_main.default = "main".to_string();
+        let dbs = Databases::new(Path::new("."), only_main, Some(model));
+        assert_eq!(dbs.default_name(), "main");
     }
 
     #[test]
