@@ -154,6 +154,37 @@ impl DatabaseFile {
         Ok(Some(file))
     }
 
+    /// 渲染为 TOML 文本（与 [`DatabaseFile::load`] 同口径，可被自身解析回来）。
+    ///
+    /// 供面板/部署脚本回写 `Config/Database.toml`；`ConnectionEntry::Simple`（字符串简写）
+    /// 一律按表形态 `[Connections.<名>]` 写出——语义等价，且便于运维逐项加备注。
+    /// 键名/取值转义复用 [`dhrust::config::toml`]，含引号、换行、控制字符也能写出合法 TOML。
+    pub fn render(&self) -> String {
+        let mut out = String::from("# 数据库约定文件（与生态其它项目一致；改完需重启生效）\n");
+        out.push_str(&format!(
+            "Default = \"{}\"\n\n",
+            toml_escape(self.default_name())
+        ));
+
+        for (name, entry) in &self.connections {
+            out.push_str(&format!("[Connections.{}]\n", toml_quote_key(name)));
+            out.push_str(&format!(
+                "ConnectionString = \"{}\"\n",
+                toml_escape(entry.connection_string())
+            ));
+            out.push_str(&format!("Note = \"{}\"\n\n", toml_escape(entry.note())));
+        }
+
+        if let Some(store) = &self.driver_store {
+            out.push_str("[DriverStore]\n");
+            out.push_str(&format!("Url = \"{}\"\n", toml_escape(&store.url)));
+            out.push_str(&format!("PubKey = \"{}\"\n", toml_escape(&store.pub_key)));
+            out.push_str(&format!("CaFile = \"{}\"\n", toml_escape(&store.ca_file)));
+        }
+
+        out
+    }
+
     /// 归一化：修剪键/值空白、丢弃空名连接。
     pub fn normalize(&mut self) {
         self.default = self.default.trim().to_string();
@@ -209,6 +240,16 @@ impl DatabaseFile {
 /// 约定文件完整路径（`{base}/Config/Database.toml`）。
 pub fn file_path(base: &Path) -> PathBuf {
     base.join("Config").join(FILE_NAME)
+}
+
+/// TOML 基本字符串转义（含引号/换行/控制字符）
+fn toml_escape(value: &str) -> String {
+    dhrust::config::toml::escape_basic(value)
+}
+
+/// TOML 裸键不安全时加引号
+fn toml_quote_key(value: &str) -> String {
+    dhrust::config::toml::quote_key(value)
 }
 
 /// 连接串摘要标签（如 `Provider=MySql`；面板/日志展示用，避免泄露口令）。
@@ -569,6 +610,59 @@ ConnectionString = "Server=x;Provider=MySql"
             connection_label("Server=x;Provider=MySQL"),
             "Provider=MySQL"
         );
+    }
+
+    #[test]
+    fn render_round_trips_through_load() {
+        let dir = temp_dir("render");
+        write_file(
+            &dir,
+            r#"
+Default = "main"
+Connections.simple = "Server=y;Provider=MySql"
+
+[DriverStore]
+Url = "http://127.0.0.1:5502"
+PubKey = "abc"
+CaFile = "/etc/ca.pem"
+
+[Connections.main]
+ConnectionString = "Data Source=Data/a.db;Provider=SQLite"
+Note = "主库 \"引号\" 与\n换行"
+"#,
+        );
+        let loaded = DatabaseFile::load(&dir).unwrap().expect("应可解析");
+        let rendered = loaded.render();
+
+        // 回写后必须能被自己解析回来（面板改配置不会把文件写坏）
+        write_file(&dir, &rendered);
+        let again = DatabaseFile::load(&dir).unwrap().expect("render 结果应可解析");
+
+        assert_eq!(again.default_name(), "main");
+        assert_eq!(again.names(), loaded.names());
+        for name in loaded.names() {
+            assert_eq!(
+                again.connections[name].connection_string(),
+                loaded.connections[name].connection_string(),
+                "连接串在往返后必须一致：{name}"
+            );
+            assert_eq!(
+                again.connections[name].note(),
+                loaded.connections[name].note(),
+                "备注在往返后必须一致：{name}"
+            );
+        }
+        let store = again.driver_store.expect("DriverStore 不应丢");
+        assert_eq!(store.url, "http://127.0.0.1:5502");
+        assert_eq!(store.pub_key, "abc");
+        assert_eq!(store.ca_file, "/etc/ca.pem");
+
+        // 简写形态回写为表形态（语义等价、便于运维逐项加备注）
+        assert!(
+            rendered.contains("[Connections.simple]"),
+            "简写应写成表形态：{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
