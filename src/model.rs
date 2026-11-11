@@ -520,6 +520,52 @@ impl EntityModel {
         })
     }
 
+    /// 模型级连接名（`<Option><ConnName>`，缺省/空白返回 `None`）。
+    pub fn model_conn(&self) -> Option<&str> {
+        self.options
+            .conn_name()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// 某张表**实际归属**的连接名：表级 `ConnName` 优先，否则取模型级 `ConnName`。
+    ///
+    /// 这就是 C# `DH.NCode` 的「`TableItem.ConnName` 缺省用 `EntityModel.ConnName`」，
+    /// 建表/迁移（[`crate::Dal::sync_schema_for`]）与面板「表在哪个库」都必须是**同一条规则**，
+    /// 所以只在这里实现一次，消费方不要再各写一份。
+    ///
+    /// 两级都没配时返回 `None`（= 由调用方用自己的默认连接），与「模型级 `ConnName` 未配置」的历史行为一致。
+    pub fn table_conn<'a>(&'a self, table: &'a TableMeta) -> Option<&'a str> {
+        table
+            .conn_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .or_else(|| self.model_conn())
+    }
+
+    /// 表是否归属指定连接（`conn` 忽略大小写）。
+    ///
+    /// 「两级都没配」的表视为**归属当前连接**（`conn` 传什么就属于什么）——
+    /// 与 [`crate::Databases::store`] 里「模型级连接没配置时由本连接代管」的判定保持一致。
+    pub fn table_belongs_to_conn(&self, table: &TableMeta, conn: &str) -> bool {
+        match self.table_conn(table) {
+            Some(name) => name.eq_ignore_ascii_case(conn.trim()),
+            None => true,
+        }
+    }
+
+    /// 归属指定连接的全部表（表级 `ConnName` 优先，否则模型级；两级都没配的视为归属本连接）。
+    ///
+    /// 面板「按连接看表 / 按物理表名反查实体」、迁移「只处理本库的表」都用它，
+    /// 判定口径与建表（[`crate::Dal::sync_schema_for`]）完全一致。
+    pub fn tables_of_conn(&self, conn: &str) -> Vec<&TableMeta> {
+        self.tables
+            .iter()
+            .filter(|table| self.table_belongs_to_conn(table, conn))
+            .collect()
+    }
+
     /// 仅包含指定表的新模型（用于切片生成/局部迁移）。
     pub fn subset(&self, tables: &[&str]) -> EntityModel {
         let mut cloned = self.clone();
@@ -1198,6 +1244,64 @@ mod tests {
         let sub = model.subset(&["JiLiYu", "DH_VerifyCode"]);
         assert_eq!(sub.tables.len(), 2); // 实体名与表名均可作为筛选条件
         assert_eq!(sub.tables[0].name, "JiLiYu");
+    }
+
+    /// 「表在哪个连接」只有一条规则：表级 `ConnName` 优先，否则模型级；两级都没配 = 归调用方的连接。
+    ///
+    /// 建表（`sync_schema_for`）、面板按连接看表、迁移「只处理本库的表」都必须同一口径，
+    /// 所以这里守住三种情形，防止消费方再各自复制一份。
+    #[test]
+    fn table_conn_prefers_table_level_then_model_level() {
+        let xml = r#"<EntityModel>
+  <Option><ConnName>Proxy</ConnName></Option>
+  <Tables>
+    <Table Name="Usage" TableName="DH_Usage">
+      <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+    </Table>
+    <Table Name="UserEx" TableName="DH_UserEx" ConnName="DH">
+      <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+    </Table>
+  </Tables>
+</EntityModel>"#;
+        let model = EntityModel::parse(xml).unwrap();
+        assert_eq!(model.model_conn(), Some("Proxy"));
+
+        let usage = model.table("Usage").unwrap();
+        let user_ex = model.table("DH_UserEx").unwrap();
+
+        // 表级优先：UserEx 归 DH，尽管模型级是 Proxy
+        assert_eq!(model.table_conn(user_ex), Some("DH"));
+        assert_eq!(model.table_conn(usage), Some("Proxy"));
+
+        // 归属判定与「按连接取表」一致（连接名忽略大小写）
+        assert!(model.table_belongs_to_conn(usage, "proxy"));
+        assert!(!model.table_belongs_to_conn(usage, "DH"));
+        assert!(model.table_belongs_to_conn(user_ex, "dh"));
+        assert!(!model.table_belongs_to_conn(user_ex, "Proxy"));
+
+        let of_proxy: Vec<_> = model
+            .tables_of_conn("Proxy")
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(of_proxy, vec!["Usage"]);
+        let of_dh: Vec<_> = model
+            .tables_of_conn("DH")
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(of_dh, vec!["UserEx"]);
+
+        // 两级都没配：由调用方的默认连接代管（不丢表）
+        let plain = EntityModel::parse(
+            r#"<EntityModel><Tables><Table Name="Only">
+              <Columns><Column Name="Id" DataType="Int32" /></Columns></Table></Tables></EntityModel>"#,
+        )
+        .unwrap();
+        assert_eq!(plain.model_conn(), None);
+        assert_eq!(plain.table_conn(&plain.tables[0]), None);
+        assert!(plain.table_belongs_to_conn(&plain.tables[0], "Whatever"));
+        assert_eq!(plain.tables_of_conn("Whatever").len(), 1);
     }
 
     #[test]
