@@ -104,6 +104,7 @@ pub mod database;
 pub mod db_admin;
 pub mod db_service;
 pub mod dbtable;
+pub mod db_relocate;
 pub mod dialect;
 pub mod dirty;
 #[cfg(feature = "driver-pack")]
