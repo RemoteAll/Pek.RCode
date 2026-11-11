@@ -349,15 +349,28 @@ pub fn lookup_scoped(base: &Path, scope: &str) -> Option<Arc<SharedStore>> {
 
 /// 移除注册（测试用：Windows 下不释放连接无法删除临时目录；生产代码勿用）。
 pub fn drop_for_test(base: &Path) {
-    drop_for_test_scoped(base, "")
+    drop_scoped(base, "");
 }
 
-/// 移除注册（带作用域名；测试用）。
+/// 移除注册（带作用域名）；测试用，等价于 [`drop_scoped`]。
 pub fn drop_for_test_scoped(base: &Path, scope: &str) {
+    drop_scoped(base, scope);
+}
+
+/// 按作用域名移除注册（**生产可用**：配置热重载后必须把旧连接池失效）。
+///
+/// 为什么要它：注册表的 key 是 `(数据目录, 作用域名)`，而 `Databases::store` 用的作用域名是
+/// **最终连接名**（如 `Pek`）。只改 `Config/Database.toml` 里 `Pek` 的连接串而不移除注册，
+/// 重新 `Databases::new` 会拿回**旧连接池**——热重载看起来“没生效”。
+/// 已持有的 `Arc<SharedStore>` 不受影响（正在处理的请求继续用旧连接，结束后自然释放）。
+///
+/// 返回是否真的移除了一个已注册项。
+pub fn drop_scoped(base: &Path, scope: &str) -> bool {
     REGISTRY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(&(key_of(base), scope.to_string()));
+        .remove(&(key_of(base), scope.to_string()))
+        .is_some()
 }
 
 #[cfg(test)]

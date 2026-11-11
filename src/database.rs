@@ -170,12 +170,20 @@ impl DatabaseFile {
         }
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("读取 {FILE_NAME} 失败：{e}"))?;
-        let doc = dhrust::config::toml::parse_document(&text)?;
+        Self::parse(&text).map(Some)
+    }
+
+    /// 从 TOML 文本解析（与 [`DatabaseFile::load`] 同口径）。
+    ///
+    /// 供**热重载**使用：`dhrust::config::ConfigWatcher` 的 parse 闭包要直接吃文件文本，
+    /// 不必为了解析再读一次盘（也不会有「两次读到不同内容」的窗口）。
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let doc = dhrust::config::toml::parse_document(text)?;
         let json = dhrust::config::toml::document_to_json(&doc)?;
         let mut file: DatabaseFile =
             serde_json::from_value(json).map_err(|e| format!("{FILE_NAME} 解析失败：{e}"))?;
         file.normalize();
-        Ok(Some(file))
+        Ok(file)
     }
 
     /// 渲染为 TOML 文本（与 [`DatabaseFile::load`] 同口径，可被自身解析回来）。
