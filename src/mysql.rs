@@ -60,33 +60,7 @@ impl MysqlSession {
     /// 根据 XCode 风格连接串打开连接。
     pub fn open(conn_str: &ConnectionString) -> Result<Self> {
         let settings = parse_settings(conn_str)?;
-
-        let result = match settings.ssl_mode {
-            None => connect_once(&settings, false),
-            // Preferred：先尝试 TLS；服务器不支持 SSL 时回退明文（对齐 MySqlConnector 语义）
-            Some(MysqlSslMode::Preferred) => match connect_once(&settings, true) {
-                Err(mysql::Error::DriverError(mysql::DriverError::TlsNotSupported)) => {
-                    connect_once(&settings, false)
-                }
-                other => other,
-            },
-            Some(_) => connect_once(&settings, true),
-        };
-
-        let conn = result.map_err(|e| {
-            // 认证类失败（1045 Access denied）最容易被误判成「程序 bug」，其实是**口令或来源 IP** 的问题。
-            // 这里把「实际送去认证的那份参数」摘要出来（口令只给长度，不落明文），
-            // 便于和 .NET 侧逐项对比：长度对不上 = 连接串里的口令被截断（`;` / 引号 / 首尾空格）；
-            // 完全一致却仍 1045 = 账号来源 IP 未在 RDS 白名单，或认证插件/SSL 要求不满足。
-            Error::Db(format!(
-                "连接 MySQL 失败（{}:{}，user={}，db={}，口令长度={}）：{e}",
-                settings.host,
-                settings.port,
-                settings.user,
-                settings.database.as_deref().unwrap_or("<未指定>"),
-                settings.password.chars().count()
-            ))
-        })?;
+        let (conn, _used_tls) = connect_with_fallback(&settings)?;
 
         Ok(Self {
             conn,
@@ -155,6 +129,92 @@ impl MysqlSession {
 /// 单次建连（按是否启用 TLS 组装选项）。
 fn connect_once(settings: &MysqlSettings, tls: bool) -> std::result::Result<Conn, mysql::Error> {
     Conn::new(build_opts(settings, tls))
+}
+
+/// 本程序是否编译了 TLS 后端（`tls-native` / `tls-rustls` 任一）。
+fn tls_available() -> bool {
+    cfg!(any(feature = "tls-native", feature = "tls-rustls"))
+}
+
+/// 是否为认证类失败（1045 账号口令被拒 / 1130 主机不在允许列表）。
+fn is_auth_error(err: &mysql::Error) -> bool {
+    matches!(err, mysql::Error::MySqlError(e) if e.code == 1045 || e.code == 1130)
+}
+
+/// 按 `SslMode` 建连，并在**明文认证失败时用 TLS 再试一次**。
+///
+/// 为什么要有这次回退（实测踩到的现场）：同一台服务器、同一份连接串（`SslMode=None`），
+/// C# / 面板走组件驱动的连接都正常，唯独内置驱动报 `ERROR 1045 ... (using password: YES)`。
+/// 云数据库（阿里云 RDS 等）在 `caching_sha2_password` 下**非加密通道**要求走 RSA 全量认证，
+/// 各家客户端实现差异很大；而多数 .NET 客户端默认会先协商 TLS，所以「别的客户端能连」。
+///
+/// 这里只在**首次失败且是认证类错误**时补救：成功则记一条告警日志（说明用了 TLS），
+/// 失败则把两次错误一起给出，便于判断到底是口令、白名单还是 TLS 要求。
+fn connect_with_fallback(settings: &MysqlSettings) -> Result<(Conn, bool)> {
+    if settings.ssl_mode.is_some() && !tls_available() {
+        dhrust::warn!(
+            "[mysql] 连接串要求 SslMode={:?}，但本程序未编译 TLS 后端（tls-rustls / tls-native），\
+             实际仍按明文连接；需要加密请重新编译并启用 TLS 特性",
+            settings.ssl_mode
+        );
+    }
+
+    let first = match settings.ssl_mode {
+        None => connect_once(settings, false).map(|c| (c, false)),
+        // Preferred：先尝试 TLS；服务器不支持 SSL 时回退明文（对齐 MySqlConnector 语义）
+        Some(MysqlSslMode::Preferred) => match connect_once(settings, true) {
+            Err(mysql::Error::DriverError(mysql::DriverError::TlsNotSupported)) => {
+                connect_once(settings, false).map(|c| (c, false))
+            }
+            other => other.map(|c| (c, true)),
+        },
+        Some(_) => connect_once(settings, true).map(|c| (c, true)),
+    };
+
+    match first {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            // 只在「显式要求明文（SslMode=None）」且认证被拒时，才自动改走 TLS 再试
+            if settings.ssl_mode.is_none() && tls_available() && is_auth_error(&err) {
+                match connect_once(settings, true) {
+                    Ok(conn) => {
+                        dhrust::warn!(
+                            "[mysql] {}:{} 明文认证被拒（{err}），已自动改用 TLS 连接成功；\
+                             建议把连接串写成 SslMode=Preferred 固定该行为",
+                            settings.host,
+                            settings.port
+                        );
+                        return Ok((conn, true));
+                    }
+                    Err(tls_err) => return Err(wrap_error(settings, &err, Some(&tls_err))),
+                }
+            }
+            Err(wrap_error(settings, &err, None))
+        }
+    }
+}
+
+/// 统一的连接失败文案：带上**实际送去认证的参数摘要**（口令只给长度，不落明文）。
+///
+/// 便于和 .NET / 组件驱动侧逐项对比：口令长度对不上 = 连接串里的口令被截断；
+/// 完全一致仍 1045 = 账号来源 IP 未在白名单，或认证插件、SSL 要求不满足。
+fn wrap_error(
+    settings: &MysqlSettings,
+    first: &mysql::Error,
+    tls: Option<&mysql::Error>,
+) -> Error {
+    let base = format!(
+        "连接 MySQL 失败（{}:{}，user={}，db={}，口令长度={}）：{first}",
+        settings.host,
+        settings.port,
+        settings.user,
+        settings.database.as_deref().unwrap_or("<未指定>"),
+        settings.password.chars().count()
+    );
+    match tls {
+        Some(err) => Error::Db(format!("{base}；已自动改用 TLS 重试，仍失败：{err}")),
+        None => Error::Db(base),
+    }
 }
 
 /// MySQL 的 TLS 模式（对齐 MySqlConnector 的 SslMode 语义）。
