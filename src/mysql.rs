@@ -74,9 +74,17 @@ impl MysqlSession {
         };
 
         let conn = result.map_err(|e| {
+            // 认证类失败（1045 Access denied）最容易被误判成「程序 bug」，其实是**口令或来源 IP** 的问题。
+            // 这里把「实际送去认证的那份参数」摘要出来（口令只给长度，不落明文），
+            // 便于和 .NET 侧逐项对比：长度对不上 = 连接串里的口令被截断（`;` / 引号 / 首尾空格）；
+            // 完全一致却仍 1045 = 账号来源 IP 未在 RDS 白名单，或认证插件/SSL 要求不满足。
             Error::Db(format!(
-                "连接 MySQL 失败（{}:{}）：{e}",
-                settings.host, settings.port
+                "连接 MySQL 失败（{}:{}，user={}，db={}，口令长度={}）：{e}",
+                settings.host,
+                settings.port,
+                settings.user,
+                settings.database.as_deref().unwrap_or("<未指定>"),
+                settings.password.chars().count()
             ))
         })?;
 

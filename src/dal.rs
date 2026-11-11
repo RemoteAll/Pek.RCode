@@ -39,11 +39,82 @@ pub struct ConnectionString {
     items: BTreeMap<String, (String, String)>,
 }
 
+/// 按 `;` 拆分连接串的分段，**引号内的 `;` 不拆分**。
+///
+/// 只有 `"` 与 `'` 两种引号；引号内连续两个同种引号表示一个字面引号（`""` → `"`）。
+/// 引号不配对时按普通字符处理（不报错，保持宽松）。
+fn split_parts(raw: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) if ch == q => {
+                current.push(ch);
+                if chars.peek() == Some(&q) {
+                    // 连续两个同种引号 = 一个字面引号，留在原文里交给 `unquote_value` 处理
+                    current.push(q);
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+            Some(_) => current.push(ch),
+            None => match ch {
+                '"' | '\'' => {
+                    quote = Some(ch);
+                    current.push(ch);
+                }
+                ';' => {
+                    parts.push(std::mem::take(&mut current));
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+    parts.push(current);
+    parts
+}
+
+/// 去掉值的包裹引号并把 `""`/`''` 还原成单个引号（无引号时只做首尾空白裁剪）。
+fn unquote_value(raw: &str) -> String {
+    let text = raw.trim();
+    let Some(quote) = text.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        return text.to_string();
+    };
+    if text.len() < 2 || !text.ends_with(quote) {
+        return text.to_string();
+    }
+    let inner = &text[quote.len_utf8()..text.len() - quote.len_utf8()];
+    inner.replace(&format!("{quote}{quote}"), &quote.to_string())
+}
+
+/// 需要引号包裹时加引号（`;` / `"` / 首尾空格会让裸值解析出歧义）。
+fn quote_value(value: &str) -> String {
+    let need = value.contains(';')
+        || value.contains('"')
+        || value.starts_with(' ')
+        || value.ends_with(' ');
+    if need {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 impl ConnectionString {
     /// 解析连接串。
+    ///
+    /// **支持引号包裹的值**（与 `MySql.Data` / `Npgsql` 等 .NET 驱动的连接串写法一致）：
+    /// `Pwd="a;b"` 里的 `;` 不算分隔符，`""` 表示一个字面双引号。
+    ///
+    /// 为什么要有这一条：口令里带 `;`（或首尾空格）时，裸写会被切成两段、后面那段被当成新键丢弃，
+    /// 于是「同一份连接串 C# 连得上、这边连不上（`ERROR 1045 Access denied`）」。
+    /// 加引号是 .NET 侧既有的写法，本库必须按同一规则解析，否则两边行为对不上。
     pub fn parse(raw: &str) -> Self {
         let mut items = BTreeMap::new();
-        for part in raw.split(';') {
+        for part in split_parts(raw) {
             let part = part.trim();
             if part.is_empty() {
                 continue;
@@ -54,7 +125,7 @@ impl ConnectionString {
                 let key = key.trim();
                 items.insert(
                     key.to_ascii_lowercase(),
-                    (key.to_string(), value.trim().to_string()),
+                    (key.to_string(), unquote_value(value)),
                 );
             }
         }
@@ -108,11 +179,13 @@ impl ConnectionString {
     }
 
     /// 重新组装连接串（小写键排序、保留键的原始大小写；对齐 `ConnectionString` 属性）。
-    /// <returns>连接串文本</returns>
+    ///
+    /// 值含 `;`、`"` 或首尾空格时**自动加引号**（引号内 `""` 表示字面双引号），
+    /// 保证 [`ConnectionString::parse`] 能原样读回，不会把口令截断。
     pub fn to_connection_string(&self) -> String {
         self.items
             .values()
-            .map(|(key, value)| format!("{key}={value}"))
+            .map(|(key, value)| format!("{key}={}", quote_value(value)))
             .collect::<Vec<_>>()
             .join(";")
     }
@@ -4317,12 +4390,51 @@ mod tests {
         dir
     }
 
+    /// 连接串里的引号值：口令带 `;` / `"` / 首尾空格时必须原样读回。
+    ///
+    /// 这一条对应急救场景：同一份连接串 C#（`MySql.Data` 支持引号值）连得上，
+    /// 而这边把 `Pwd="a;b"` 硬切成 `Pwd="a` + `b"` → 口令错 → `ERROR 1045`。
+    #[test]
+    fn connection_string_quoted_values_roundtrip() {
+        // 口令含分号：必须靠引号才能保住
+        let cs = ConnectionString::parse(
+            "Server=h;Port=3306;Database=d;Uid=u;Pwd=\"a;b\";Provider=MySQL",
+        );
+        assert_eq!(cs.get("pwd"), Some("a;b"));
+        assert_eq!(cs.get("database"), Some("d"));
+        assert_eq!(cs.kind().unwrap(), DatabaseKind::MySql);
+
+        // 字面双引号：`""` → `"`
+        let cs = ConnectionString::parse("Server=h;Pwd=\"a\"\"b\";Provider=MySQL");
+        assert_eq!(cs.get("pwd"), Some("a\"b"));
+
+        // 单引号同样生效；首尾空格保留
+        let cs = ConnectionString::parse("Server=h;Pwd=' pa ss ';Provider=MySQL");
+        assert_eq!(cs.get("pwd"), Some(" pa ss "));
+
+        // 值里含 `=`：只在第一个 `=` 处切分
+        let cs = ConnectionString::parse("Server=h;Pwd=a=b=c;Provider=MySQL");
+        assert_eq!(cs.get("pwd"), Some("a=b=c"));
+
+        // 组装时自动加引号，再解析必须等价
+        let mut cs = ConnectionString::parse("Server=h;Port=3306;Provider=MySQL");
+        cs.set("Pwd", "a;b\"c d");
+        let text = cs.to_connection_string();
+        assert!(text.contains("Pwd="), "键名保持原样：{text}");
+        let back = ConnectionString::parse(&text);
+        assert_eq!(back.get("pwd"), Some("a;b\"c d"));
+
+        // 普通值不受影响（不加多余引号）
+        let plain = ConnectionString::parse("Server=h;Pwd=123456;Provider=MySQL");
+        assert_eq!(plain.get("pwd"), Some("123456"));
+        assert!(plain.to_connection_string().contains("Pwd=123456"));
+    }
+
     #[test]
     fn connection_string_parsing() {
         let cs = ConnectionString::parse(
             "Data Source=..\\..\\Data\\DG.db;ShowSql=false;Provider=SQLite",
-        );
-        assert_eq!(cs.kind().unwrap(), DatabaseKind::Sqlite);
+        );        assert_eq!(cs.kind().unwrap(), DatabaseKind::Sqlite);
         assert_eq!(cs.data_source(), Some("..\\..\\Data\\DG.db"));
         assert!(!cs.show_sql());
         assert_eq!(cs.get("PROVIDER"), Some("SQLite"));
