@@ -336,6 +336,29 @@ impl DbRow {
     pub fn i64(&self, name: &str) -> i64 {
         self.get_by_name(name).and_then(|v| v.as_i64()).unwrap_or(0)
     }
+
+    /// 读布尔列：**只有明确写入真值才算 `true`**；`NULL` / 缺列 / 空串 / 脏值一律 `false`。
+    ///
+    /// 各库布尔列的存储形态不同（SQLite `INTEGER 0/1`、MySQL `TINYINT(1)` / `BIT(1)`、
+    /// SQL Server `BIT`、PostgreSQL `BOOLEAN`），驱动分别给出 `Int` / `Bool` / 文本；
+    /// [`DbValue::as_bool`] 已统一识别（`0`/`1`、`true`/`false`/`yes`/`no`，大小写与空白不敏感）。
+    /// 这里只补「取不到值就按 `false`」这一层，免得每个项目各抄一遍
+    /// `get_by_name("X").and_then(|v| v.as_bool()).unwrap_or(false)`。
+    ///
+    /// **注意**：模型的 `DefaultValue`（如 `AllowPro` 的 `True`）是「新建实体时的属性默认值」，
+    /// 不是读库兜底 —— 库里存的是 `NULL` 时就该按 `false` 算，要区分这两种情况请用
+    /// [`DbRow::boolean_opt`]。
+    pub fn boolean(&self, name: &str) -> bool {
+        self.boolean_opt(name).unwrap_or(false)
+    }
+
+    /// 读布尔列，**保留「没有值」这一态**（`None` = `NULL` / 缺列 / 空串 / 无法解析）。
+    ///
+    /// 用于需要区分「库里明确写了 `false`」与「库里根本没值」的场景
+    /// （面板把后者显示成「未设置」比显示成「仅 Flash」更便于运维定位）。
+    pub fn boolean_opt(&self, name: &str) -> Option<bool> {
+        self.get_by_name(name)?.as_bool()
+    }
 }
 
 /// 数据库会话：执行 SQL、管理事务。
@@ -500,5 +523,60 @@ mod tests {
         assert_eq!(row.text("Count"), "");
         assert_eq!(row.i64("Count"), 3);
         assert_eq!(row.i64("Missing"), 0);
+    }
+
+    /// boolean：各库布尔形态都要认（SQLite 0/1、MySQL BIT/TINYINT、PostgreSQL true/false）
+    #[test]
+    fn boolean_reads_common_storage_shapes() {
+        let row = row_of(&[
+            ("Int1", DbValue::Int(1)),
+            ("Int0", DbValue::Int(0)),
+            ("BoolTrue", DbValue::Bool(true)),
+            ("BoolFalse", DbValue::Bool(false)),
+            ("TextTrue", DbValue::Text("true".into())),
+            ("TextYes", DbValue::Text(" Yes ".into())),
+            ("TextOne", DbValue::Text("1".into())),
+            ("TextZero", DbValue::Text("0".into())),
+            ("TextFalse", DbValue::Text("FALSE".into())),
+        ]);
+        assert!(row.boolean("Int1"));
+        assert!(!row.boolean("Int0"));
+        assert!(row.boolean("BoolTrue"));
+        assert!(!row.boolean("BoolFalse"));
+        assert!(row.boolean("TextTrue"));
+        assert!(row.boolean("TextYes"));
+        assert!(row.boolean("TextOne"));
+        assert!(!row.boolean("TextZero"));
+        assert!(!row.boolean("TextFalse"));
+        // 列名大小写不敏感（各家驱动返回的列名大小写不一致）
+        assert!(row.boolean("int1"));
+    }
+
+    /// boolean：`NULL` / 缺列 / 空串 / 脏值 一律 false（用户 2026-11-11 定：NULL/缺失为 false）
+    #[test]
+    fn boolean_null_missing_and_dirty_mean_false() {
+        let row = row_of(&[("Nil", DbValue::Null), ("Blank", DbValue::Text("  ".into()))]);
+        assert!(!row.boolean("Nil"));
+        assert!(!row.boolean("Missing"));
+        assert!(!row.boolean("Blank"));
+        assert!(!row.boolean("Dirty"));
+        let dirty = row_of(&[("Dirty", DbValue::Text("abc".into()))]);
+        assert!(!dirty.boolean("Dirty"));
+    }
+
+    /// boolean_opt：保留「没有值」这一态，供面板区分「写了 false」与「根本没值」
+    #[test]
+    fn boolean_opt_keeps_unset_state() {
+        let row = row_of(&[
+            ("Yes", DbValue::Int(1)),
+            ("No", DbValue::Int(0)),
+            ("Nil", DbValue::Null),
+            ("Blank", DbValue::Text(String::new())),
+        ]);
+        assert_eq!(row.boolean_opt("Yes"), Some(true));
+        assert_eq!(row.boolean_opt("No"), Some(false));
+        assert_eq!(row.boolean_opt("Nil"), None);
+        assert_eq!(row.boolean_opt("Blank"), None);
+        assert_eq!(row.boolean_opt("Missing"), None);
     }
 }
