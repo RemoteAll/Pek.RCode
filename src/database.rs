@@ -270,18 +270,24 @@ impl DatabaseFile {
 
     /// 跟随 C# 的 `MapTo=<连接名>` 别名，返回 `(最终连接名, 真实连接串)`。
     ///
-    /// C# DH.NCode 的多库配置大量使用别名，例如线上：
-    /// ```toml
-    /// [Connections.Pek]
-    /// ConnectionString = "Server=...;provider=mysql"
-    /// [Connections.Membership]
-    /// ConnectionString = "MapTo=Pek"
-    /// [Connections.DH]
-    /// ConnectionString = "MapTo=Pek"
-    /// ```
-    /// 别名与目标指向**同一个库**，所以返回最终连接名供调用方共享同一个连接池。
-    /// 最多跟随 8 跳；目标不存在或出现循环时给出包含了链路的明确错误（不静默降级）。
+    /// 实现见 [`DatabaseFile::map_to_chain`]（本函数只取链尾）。
     pub fn follow_map_to(&self, name: &str) -> Result<(String, String), String> {
+        let chain = self.map_to_chain(name)?;
+        let last = chain.last().cloned().unwrap_or_default();
+        let (key, entry) = self
+            .lookup(&last)
+            .ok_or_else(|| format!("连接 {last} 不存在（可用：{}）", self.names().join(", ")))?;
+        Ok((key.to_string(), entry.connection_string().trim().to_string()))
+    }
+
+    /// 返回 `MapTo=` 别名链上的**全部连接名**（起点 → 终点；不是别名时只有起点本身）。
+    ///
+    /// 例：`DH = "MapTo=Pek"` → `["DH", "Pek"]`。
+    ///
+    /// 用途：别名与目标指向**同一个物理库**，所以「按连接名过滤」的场景（如建表）
+    /// 必须同时认链上所有名字 —— 只认终点会把 `DH` 的表漏掉（真实缺陷：
+    /// `Data/Pek.db` 里没有 `DH_UserEx`，因为模型里该表的 `ConnName` 写的是 `DH`）。
+    pub fn map_to_chain(&self, name: &str) -> Result<Vec<String>, String> {
         let start = name.trim();
         let mut current = start.to_string();
         let mut seen: Vec<String> = Vec::new();
@@ -307,7 +313,10 @@ impl DatabaseFile {
                     current = target;
                 }
                 Some(_) => return Err(format!("连接 {current} 的 MapTo 目标为空")),
-                None => return Ok((key, raw.to_string())),
+                None => {
+                    seen.push(key);
+                    return Ok(seen);
+                }
             }
         }
     }
@@ -466,10 +475,9 @@ impl Databases {
             .and_then(|m| m.options.conn_name())
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .filter(|s| file.connections.contains_key(*s))
         {
-            if file.connections.contains_key(wanted) {
-                file.default = wanted.to_string();
-            }
+            file.default = wanted.to_string();
         }
         Self {
             base: base.to_path_buf(),
@@ -562,6 +570,10 @@ impl Databases {
     pub fn store(&self, name: &str) -> Result<Arc<SharedStore>, String> {
         // `MapTo=` 别名与目标指向同一个库 → 用**最终连接名**做缓存 key，共享同一个连接池
         let (target, raw) = self.file.follow_map_to(name)?;
+        // 建表按**整条别名链**过滤：`DH = MapTo=Pek` 时 `DH_UserEx`（表级 ConnName=DH）
+        // 必须也能建到 `Pek` 的库里，否则新部署的 `Pek.db` 会缺这些表。
+        let chain = self.file.map_to_chain(name)?;
+        let chain_refs: Vec<&str> = chain.iter().map(String::as_str).collect();
         let raw = resolve_connection(&self.base, &raw)?;
         let (store, _) = store::get_or_open_scoped(&self.base, &target, || {
             let conn = self.prepare_conn(&raw)?;
@@ -574,7 +586,9 @@ impl Databases {
                     // 「无表级 ConnName」的表只在本连接就是模型级连接（或模型级连接没配置、本连接代它）时建。
                     let own_model_tables = match model.options.conn_name() {
                         Some(model_conn) => {
-                            model_conn.trim().eq_ignore_ascii_case(&target)
+                            chain
+                                .iter()
+                                .any(|c| c.eq_ignore_ascii_case(model_conn.trim()))
                                 || !self
                                     .file
                                     .connections
@@ -583,13 +597,13 @@ impl Databases {
                         }
                         None => true,
                     };
-                    dal.sync_schema_for(Some(&target), own_model_tables, false)
+                    dal.sync_schema_for_any(&chain_refs, own_model_tables, false)
                         .map_err(|e| format!("同步表结构失败：{e}"))?;
                     // 自有远端库：network 连接默认空实现（对齐 C#），显式启用时补做结构同步
                     if self.remote_schema_sync
                         && crate::network::is_network(&ConnectionString::parse(&conn))
                     {
-                        dal.sync_schema_for(Some(&target), own_model_tables, true)
+                        dal.sync_schema_for_any(&chain_refs, own_model_tables, true)
                             .map_err(|e| format!("同步远端表结构失败：{e}"))?;
                     }
                     dal
@@ -865,6 +879,34 @@ ConnectionString = "mapto=pek"
         let err = orphan.follow_map_to("X").unwrap_err();
         assert!(err.contains("Missing"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn map_to_chain_lists_every_alias_name() {
+        // 建表要按**整条链**过滤（别名与目标同库）：`DH = MapTo=Pek` → ["DH", "Pek"]，
+        // 否则模型里表级 `ConnName=DH` 的表不会建到 `Pek` 的库里。
+        let mut file = DatabaseFile::default();
+        file.connections.insert(
+            "Pek".to_string(),
+            ConnectionEntry::Simple("Data Source=Data/Pek.db;Provider=SQLite".to_string()),
+        );
+        file.connections.insert(
+            "DH".to_string(),
+            ConnectionEntry::Simple("MapTo=Pek".to_string()),
+        );
+        file.connections.insert(
+            "Membership".to_string(),
+            ConnectionEntry::Simple("MapTo=DH".to_string()),
+        );
+
+        assert_eq!(file.map_to_chain("DH").unwrap(), vec!["DH", "Pek"]);
+        // 多跳：起点与终点都要在链上，顺序为「起点 → 终点」
+        assert_eq!(
+            file.map_to_chain("Membership").unwrap(),
+            vec!["Membership", "DH", "Pek"]
+        );
+        // 直接连接：链上只有自己（不产生额外行为变化）
+        assert_eq!(file.map_to_chain("Pek").unwrap(), vec!["Pek"]);
     }
 
     #[test]

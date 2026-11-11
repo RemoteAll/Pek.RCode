@@ -1297,8 +1297,29 @@ impl Dal {
         include_model_level: bool,
         include_network: bool,
     ) -> Result<SchemaReport> {
-        let _ = include_model_level;
-        self.sync_schema_inner(conn_name, include_model_level, include_network)
+        match conn_name {
+            Some(c) => self.sync_schema_inner(Some(&[c]), include_model_level, include_network),
+            None => self.sync_schema_inner(None, include_model_level, include_network),
+        }
+    }
+
+    /// 同 [`Dal::sync_schema_for`]，但本 `Dal` 代表**同一物理库上的多个连接名**。
+    ///
+    /// 专为 C# 的 `MapTo=` 别名而设：`DH = "MapTo=Pek"` 时两者指向同一个库，
+    /// 而模型里 `DH_UserEx` 等表的表级 `ConnName` 写的是 `DH` —— 只传最终名 `Pek`
+    /// 会把它们全部跳过（真实缺陷：`Pek.db` 里没有 `DH_UserEx`）。
+    ///
+    /// `conn_names`：别名链上的全部连接名（`DatabaseFile::map_to_chain` 的结果）；
+    /// 表级 `ConnName` 命中**任一个**即视为本连接的表（大小写不敏感）。空列表 = 不按连接过滤。
+    /// `include_model_level`：是否处理「表级 `ConnName` 为空」的表（它们归属模型级 `ConnName`）。
+    /// `include_network`：是否处理 network 连接。
+    pub fn sync_schema_for_any(
+        &self,
+        conn_names: &[&str],
+        include_model_level: bool,
+        include_network: bool,
+    ) -> Result<SchemaReport> {
+        self.sync_schema_inner(Some(conn_names), include_model_level, include_network)
     }
 
     /// 同 [`Dal::sync_schema_including_network`]，但只处理属于指定连接的表。
@@ -1308,7 +1329,10 @@ impl Dal {
         &self,
         conn_name: Option<&str>,
     ) -> Result<SchemaReport> {
-        self.sync_schema_inner(conn_name, true, true)
+        match conn_name {
+            Some(c) => self.sync_schema_inner(Some(&[c]), true, true),
+            None => self.sync_schema_inner(None, true, true),
+        }
     }
 
     /// 同 [`Dal::sync_schema`]，但**对 network 连接也执行**结构同步（建表 / 补列 / 补索引）。
@@ -1499,7 +1523,7 @@ impl Dal {
     /// 结构同步实现：`include_network = false` 时保持 C# 对齐的网络空实现。
     fn sync_schema_inner(
         &self,
-        conn_name: Option<&str>,
+        conn_names: Option<&[&str]>,
         include_model_level: bool,
         include_network: bool,
     ) -> Result<SchemaReport> {
@@ -1534,17 +1558,25 @@ impl Dal {
         // 多库模型：只建「属于本连接」的表（表级 `ConnName` 优先，没有则归模型级 `ConnName`）。
         // 不区分就会把别的连接的表也建到本库，而目标连接的库里反而一张表都没有
         // （`connname_routing` 用例过去只能靠调用方手动 `target.sync_schema()` 绕过）。
-        let mine = conn_name.map(str::trim).filter(|s| !s.is_empty());
+        // 别名（`DH = MapTo=Pek`）传的是**整条链**：`DH` 的表也要建到这个库里。
+        let mine: Vec<&str> = conn_names
+            .map(|list| {
+                list.iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         for table in &model.tables {
-            if let Some(mine) = mine {
+            if !mine.is_empty() {
                 let table_conn = table
                     .conn_name
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
                 let belongs = match table_conn {
-                    Some(conn) => conn.eq_ignore_ascii_case(mine),
+                    Some(conn) => mine.iter().any(|m| conn.eq_ignore_ascii_case(m)),
                     // 表级未配 → 归模型级连接；是否在本连接建，由调用方判定
                     None => include_model_level,
                 };
