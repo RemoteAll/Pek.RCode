@@ -353,8 +353,12 @@ fn toml_quote_key(value: &str) -> String {
     dhrust::config::toml::quote_key(value)
 }
 
-/// 连接串摘要标签（如 `Provider=MySql`；面板/日志展示用，避免泄露口令）。
+/// 连接串摘要标签（如 `Provider=MySql` / `MapTo=Pek`；面板/日志展示用，避免泄露口令）。
 pub fn connection_label(conn: &str) -> String {
+    // 别名连接（`MapTo=Pek`）没有 Provider，直接显示映射目标，别显示成「Provider=未知」
+    if let Some(target) = map_to_of(conn) {
+        return format!("MapTo={target}");
+    }
     let cs = ConnectionString::parse(conn);
     cs.provider()
         .map(|p| format!("Provider={p}"))
@@ -533,12 +537,23 @@ impl Databases {
             .unwrap_or_default()
     }
 
-    /// 连接串摘要（避免泄露口令；`MapTo=` 别名跟随到目标后取 Provider）。
+    /// 连接串摘要（避免泄露口令）。
+    ///
+    /// - 本条是别名（`MapTo=Pek`）→ 显示 `MapTo=Pek（Provider=MySql）`：
+    ///   既让人看出「它指向哪条」，也知道实际用的是哪种库；
+    /// - 否则显示自己的 `Provider=xxx`。
     pub fn connection_label(&self, name: &str) -> String {
-        match self.file.follow_map_to(name) {
-            Ok((_, raw)) => connection_label(&raw),
-            Err(_) => "未知连接".to_string(),
+        let Some((_, entry)) = self.file.lookup(name) else {
+            return "未知连接".to_string();
+        };
+        let raw = entry.connection_string().trim();
+        if let Some(target) = map_to_of(raw) {
+            return match self.file.follow_map_to(name) {
+                Ok((_, resolved)) => format!("MapTo={target}（{}）", connection_label(&resolved)),
+                Err(_) => format!("MapTo={target}"),
+            };
         }
+        connection_label(raw)
     }
 
     /// 打开（或复用）指定连接的共享存储。
