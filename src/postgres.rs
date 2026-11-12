@@ -351,8 +351,9 @@ fn build_tls_connector(settings: &PostgresSettings) -> Result<native_tls::TlsCon
 /// - 根证书缺失时使用 `webpki-roots`（Mozilla 根证书集）。
 #[cfg(feature = "tls-rustls")]
 fn build_rustls_config(settings: &PostgresSettings) -> Result<rustls::ClientConfig> {
-    // 显式指定 aws-lc-rs 提供者：依赖图中可能同时存在 ring（多提供者时 rustls 无法自动选择）
-    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    // 显式指定提供者：依赖图中可能同时存在其它 TLS 后端，rustls 不会自动选择
+    // （统一用 ring：与 dhrust net-tls 同一提供者，避免 CryptoProvider 歧义 panic）
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Db(format!("初始化 rustls 协议版本失败：{e}")))?;
@@ -435,10 +436,10 @@ mod rustls_tls {
     }
 
     impl NoVerification {
-        /// 使用 rustls 默认加密提供者（aws-lc-rs）。
+        /// 使用 rustls 默认加密提供者（ring）。
         pub fn new() -> Self {
             Self {
-                provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+                provider: Arc::new(rustls::crypto::ring::default_provider()),
             }
         }
     }

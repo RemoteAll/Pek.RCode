@@ -21,7 +21,16 @@ postgres = { version = "0.19.14", features = ["with-chrono-0_4"], optional = tru
 # PostgreSQL：TLS 经 native-tls（postgres-native-tls 适配；由 tls-native 特性携带启用）
 postgres-native-tls = { version = "0.5", optional = true }
 # TLS 后端之二：rustls（PEM 根证书/客户端证书；PG 走 tokio-postgres-rustls，MySQL 启用 mysql/rustls）
-rustls = { version = "0.23", optional = true }
+# TLS 后端之二：rustls（PEM 根证书/客户端证书；PG 走 tokio-postgres-rustls，MySQL 启用 mysql/rustls）
+# **必须固定单一提供者**：默认特性带 `aws-lc-rs`，而 dhrust 的 net-tls 用 `ring`；
+# 两者同时启用时 rustls 无法自动选定进程级 CryptoProvider，
+# 会在 WS/TLS 调用处 panic（2026-11-12 RAgent 升级后全部离线的根因）。
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "ring",
+    "std",
+    "logging",
+    "tls12",
+] }
 rustls-pemfile = { version = "2.2", optional = true }
 postgres-rustls = { version = "0.14", package = "tokio-postgres-rustls", optional = true }
 webpki-roots = { version = "1", optional = true }
