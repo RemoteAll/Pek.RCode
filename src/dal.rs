@@ -210,6 +210,28 @@ impl ConnectionString {
             .find_map(|k| self.get(k))
     }
 
+    /// 服务器地址（`Server` / `Host` / `Address` / `Data Source`；**不含端口**）。
+    ///
+    /// 对齐 .NET 各驱动的常见写法；SQLite 下返回的是文件路径，调用方需先判 `provider`。
+    /// SQL Server 的 `Server=tcp:host,1433` 会原样返回（含协议前缀与逗号端口）。
+    pub fn server(&self) -> Option<&str> {
+        ["server", "host", "address", "addr", "data source", "datasource"]
+            .iter()
+            .find_map(|k| self.get(k))
+    }
+
+    /// 端口（`Port=`；SQL Server 常写在 `Server=host,port` 里，那种写法下本方法返回 `None`）。
+    pub fn port(&self) -> Option<&str> {
+        self.get("port")
+    }
+
+    /// 库名（`Database` / `Initial Catalog` / `Catalog`）。
+    pub fn database(&self) -> Option<&str> {
+        ["database", "initial catalog", "catalog"]
+            .iter()
+            .find_map(|k| self.get(k))
+    }
+
     /// 是否开启 SQL 输出（`ShowSql=true`，与 XCode 行为一致）。
     pub fn show_sql(&self) -> bool {
         self.get("showsql")
