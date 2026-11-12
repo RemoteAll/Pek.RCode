@@ -133,6 +133,12 @@ pub struct DatabaseFile {
     pub default: String,
     /// 连接表：名字 → 连接
     pub connections: BTreeMap<String, ConnectionEntry>,
+    /// 只读连接名清单（写通道一律拒绝；生产核心库这类「只许看」的连接填这里）
+    ///
+    /// 用**根级名单**而不是每条连接加字段：`FullConnection` 已被多个仓库按结构体字面量构造，
+    /// 加字段会让它们编译失败（跨仓库破坏）。
+    #[serde(default)]
+    pub read_only_connections: Vec<String>,
     /// 驱动组件源（可选）
     pub driver_store: Option<DriverStore>,
     /// 外部数据域绑定（可选）：本项目自身数据之外的、属于主站（C#）的库
@@ -207,6 +213,15 @@ impl DatabaseFile {
             out.push_str(&format!("Note = \"{}\"\n\n", toml_escape(entry.note())));
         }
 
+        if !self.read_only_connections.is_empty() {
+            let list: Vec<String> = self
+                .read_only_connections
+                .iter()
+                .map(|n| format!("\"{}\"", toml_escape(n)))
+                .collect();
+            out.push_str(&format!("ReadOnlyConnections = [{}]\n\n", list.join(", ")));
+        }
+
         if let Some(store) = &self.driver_store {
             out.push_str("[DriverStore]\n");
             out.push_str(&format!("Url = \"{}\"\n", toml_escape(&store.url)));
@@ -231,6 +246,12 @@ impl DatabaseFile {
     /// 归一化：修剪键/值空白、丢弃空名连接。
     pub fn normalize(&mut self) {
         self.default = self.default.trim().to_string();
+        self.read_only_connections = self
+            .read_only_connections
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         let mut rebuilt = BTreeMap::new();
         for (name, mut entry) in std::mem::take(&mut self.connections) {
             let name = name.trim().to_string();
@@ -265,6 +286,14 @@ impl DatabaseFile {
     /// 连接名清单（字典序）。
     pub fn names(&self) -> Vec<&str> {
         self.connections.keys().map(String::as_str).collect()
+    }
+
+    /// 连接是否在 `ReadOnlyConnections` 名单里（名字大小写不敏感；未知连接返回 `false`）。
+    pub fn read_only(&self, name: &str) -> bool {
+        let name = name.trim();
+        self.read_only_connections
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name))
     }
 
     /// 解析指定连接名（SQLite 相对路径按 `base` 绝对化）。

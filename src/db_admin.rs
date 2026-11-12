@@ -212,31 +212,8 @@ impl DbAdmin {
 
     /// 只读执行 SQL（安全前置 [`validate_readonly_sql`]；结果最多 [`MAX_QUERY_ROWS`] 行）。
     pub fn query_readonly(&self, sql: &str) -> Result<Json, String> {
-        validate_readonly_sql(sql)?;
-        let started = std::time::Instant::now();
         let mut session = self.store.dal().open_session().map_err(|e| e.to_string())?;
-        let set = session.query(sql, &[]).map_err(|e| e.to_string())?;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let truncated = set.rows.len() > MAX_QUERY_ROWS;
-        let rows: Vec<Json> = set
-            .rows
-            .iter()
-            .take(MAX_QUERY_ROWS)
-            .map(|row| {
-                Json::Array(
-                    (0..set.columns.len())
-                        .map(|i| row.get(i).map(db_value_json).unwrap_or(Json::Null))
-                        .collect(),
-                )
-            })
-            .collect();
-        Ok(json!({
-            "columns": set.columns.as_ref(),
-            "rows": rows,
-            "rowCount": rows.len(),
-            "truncated": truncated,
-            "elapsedMs": elapsed_ms,
-        }))
+        query_readonly_on(session.as_mut(), sql)
     }
 
     // ————— 备份与还原 —————
@@ -417,6 +394,250 @@ pub fn tables_from_model(model: &EntityModel) -> Vec<String> {
     model.tables.iter().map(|t| t.name.clone()).collect()
 }
 
+/// 在任意会话上执行只读查询：安全闸门 + [`MAX_QUERY_ROWS`] 行上限。
+///
+/// 供「外部连接 / 非默认库」这类不经过 [`DbAdmin`] 的场景复用（无实体模型、不建表）：
+/// 行映射、截断标记与耗时口径与管理端完全一致，避免各项目再复制一份。
+pub fn query_readonly_on(
+    session: &mut dyn crate::session::SqlSession,
+    sql: &str,
+) -> Result<Json, String> {
+    validate_readonly_sql(sql)?;
+    let started = std::time::Instant::now();
+    let set = session.query(sql, &[]).map_err(|e| e.to_string())?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let truncated = set.rows.len() > MAX_QUERY_ROWS;
+    let rows: Vec<Json> = set
+        .rows
+        .iter()
+        .take(MAX_QUERY_ROWS)
+        .map(|row| {
+            Json::Array(
+                (0..set.columns.len())
+                    .map(|i| row.get(i).map(db_value_json).unwrap_or(Json::Null))
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok(json!({
+        "columns": set.columns.as_ref(),
+        "rows": rows,
+        "rowCount": rows.len(),
+        "truncated": truncated,
+        "elapsedMs": elapsed_ms,
+    }))
+}
+
+/// SQL 摘要（审计/日志用）：单引号字符串字面量内容替换为 `***`，并截断到 `max` 字符。
+///
+/// 写语句常含敏感值（口令、证件号、手机号），日志/审计只需看出「改了哪张表/哪些字段」。
+pub fn redact_sql(sql: &str, max: usize) -> String {
+    let mut out = String::with_capacity(sql.len().min(max.saturating_mul(4)).max(16));
+    let mut in_quote = false;
+    let mut masked = false;
+    for ch in sql.chars() {
+        if ch == '\'' {
+            in_quote = !in_quote;
+            out.push(ch);
+            masked = false;
+        } else if in_quote {
+            if !masked {
+                out.push_str("***");
+                masked = true;
+            }
+        } else {
+            out.push(ch);
+        }
+        if out.len() >= max.saturating_mul(4) {
+            break;
+        }
+    }
+    if out.chars().count() > max {
+        let mut s: String = out.chars().take(max).collect();
+        s.push('…');
+        s
+    } else {
+        out
+    }
+}
+
+/// 在任意会话上执行**写语句**（写数据 / 删数据 / 结构变更）：安全闸门见 [`validate_sql`]。
+///
+/// 返回影响行数、耗时与语句级别（`op` / `opLabel`），调用方据此做审计与界面提示。
+///
+/// 供「按连接名管理数据库」的写通道复用（节点代连客户库时同样走这里）。
+pub fn exec_write_on(
+    session: &mut dyn crate::session::SqlSession,
+    sql: &str,
+) -> Result<Json, String> {
+    let op = validate_sql(sql)?;
+    if op == SqlOp::Read {
+        return Err("该通道不执行查询：SELECT 请走查询接口".into());
+    }
+    let started = std::time::Instant::now();
+    let affected = session.execute(sql, &[]).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "op": op.key(),
+        "opLabel": op.label(),
+        "affected": affected,
+        "elapsedMs": started.elapsed().as_millis() as u64,
+    }))
+}
+
+/// SQL 语句级别（决定需要哪一级权限）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlOp {
+    /// 查询（`SELECT`）
+    Read,
+    /// 写数据（`INSERT` / `UPDATE` / `REPLACE` / `MERGE`）
+    Write,
+    /// 删数据（`DELETE`）
+    Delete,
+    /// 结构变更 / 破坏性（`CREATE` / `ALTER` / `DROP` / `TRUNCATE` / `RENAME` / `COMMENT` / `ANALYZE`）
+    Ddl,
+}
+
+impl SqlOp {
+    /// 权限键后缀：`view` / `write` / `delete` / `ddl`。
+    pub fn key(self) -> &'static str {
+        match self {
+            SqlOp::Read => "view",
+            SqlOp::Write => "write",
+            SqlOp::Delete => "delete",
+            SqlOp::Ddl => "ddl",
+        }
+    }
+
+    /// 中文名（审计 / 界面提示）。
+    pub fn label(self) -> &'static str {
+        match self {
+            SqlOp::Read => "查询",
+            SqlOp::Write => "写入数据",
+            SqlOp::Delete => "删除数据",
+            SqlOp::Ddl => "结构变更",
+        }
+    }
+
+    /// 是否只读。
+    pub fn is_read(self) -> bool {
+        matches!(self, SqlOp::Read)
+    }
+}
+
+/// 语句校验与分级：单条、首关键字白名单、禁「服务端级 / 账号级」语句。
+///
+/// 规则：
+/// - 非空、长度 ≤ 64KB、不允许 `;`（阻断多语句注入；字符串内的分号一并拒绝）；
+/// - 首关键字决定级别（见 [`SqlOp`]），其余关键字（如 `WITH` / `EXPLAIN` / `USE` / `SET`）一律拒绝；
+/// - **表级全量操作放行**（含 `DROP TABLE` / `TRUNCATE` / `ALTER ... DROP COLUMN` / `CREATE`），
+///   由调用方按 [`SqlOp`] 要求 `ddl` 级权限并做二次确认；
+/// - **永远拒绝**：账号/权限（`GRANT` / `REVOKE` / `* USER` / `* ROLE`）、库级破坏
+///   （`DROP DATABASE` / `CREATE DATABASE` / `ALTER DATABASE`）、服务进程
+///   （`SHUTDOWN` / `KILL`）、挂载（`ATTACH` / `DETACH`）、文件导入导出
+///   （`LOAD DATA` / `INTO OUTFILE` / `INTO DUMPFILE`）、`VACUUM` / `PRAGMA`、
+///   存储过程（`EXEC` / `EXECUTE` / `CALL`）。
+///
+/// 说明：这些能力属于 DBA 作业（账号、实例、文件），平台只开放「库表」范围内的操作；
+/// 确有需要请在节点上用数据库客户端执行。
+pub fn validate_sql(sql: &str) -> Result<SqlOp, String> {
+    let s = sql.trim();
+    if s.is_empty() {
+        return Err("SQL 不能为空".into());
+    }
+    if s.len() > 64 * 1024 {
+        return Err("SQL 过长（上限 64KB）".into());
+    }
+    if s.contains(';') {
+        return Err("仅支持单条语句：SQL 中不允许出现分号（字符串内的分号也会被拒绝）".into());
+    }
+    let head = s
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let op = match head.as_str() {
+        "SELECT" => SqlOp::Read,
+        "INSERT" | "UPDATE" | "REPLACE" | "MERGE" => SqlOp::Write,
+        "DELETE" => SqlOp::Delete,
+        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" | "COMMENT" | "ANALYZE" => SqlOp::Ddl,
+        _ => {
+            return Err(format!(
+                "不支持的语句类型「{head}」：仅允许 SELECT / INSERT / UPDATE / DELETE / REPLACE / MERGE / CREATE / ALTER / DROP / TRUNCATE / RENAME"
+            ));
+        }
+    };
+    // 空白折叠后大写，便于匹配多词片段（`DROP   DATABASE` 与 `DROP DATABASE` 同口径）
+    let flat = s
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    const FORBIDDEN: [(&str, &str); 33] = [
+        ("GRANT", "授权"),
+        ("REVOKE", "回收授权"),
+        ("CREATE USER", "创建账号"),
+        ("ALTER USER", "修改账号"),
+        ("DROP USER", "删除账号"),
+        ("CREATE ROLE", "创建角色"),
+        ("ALTER ROLE", "修改角色"),
+        ("DROP ROLE", "删除角色"),
+        ("DROP DATABASE", "删除数据库"),
+        ("CREATE DATABASE", "创建数据库"),
+        ("ALTER DATABASE", "修改数据库"),
+        // 可编程对象/扩展：能绕过「库表操作」直接在数据库服务器上执行代码或读写文件
+        ("CREATE FUNCTION", "创建函数（可执行代码）"),
+        ("ALTER FUNCTION", "修改函数（可执行代码）"),
+        ("CREATE PROCEDURE", "创建存储过程（可执行代码）"),
+        ("ALTER PROCEDURE", "修改存储过程（可执行代码）"),
+        ("CREATE TRIGGER", "创建触发器（隐式执行代码）"),
+        ("CREATE EXTENSION", "安装数据库扩展"),
+        ("CREATE EVENT", "创建定时事件"),
+        ("CREATE AGGREGATE", "创建聚合函数（可执行代码）"),
+        ("CREATE RULE", "创建规则"),
+        ("CREATE OPERATOR", "创建操作符"),
+        ("CREATE SERVER", "创建外部服务器"),
+        ("CREATE FOREIGN", "创建外部表映射"),
+        ("CREATE TABLESPACE", "创建表空间"),
+        ("ALTER SYSTEM", "修改实例级参数"),
+        ("SHUTDOWN", "关闭数据库实例"),
+        ("KILL", "终止数据库会话"),
+        ("ATTACH", "挂载数据库"),
+        ("DETACH", "卸载数据库"),
+        ("LOAD DATA", "导入数据文件"),
+        ("INTO OUTFILE", "导出文件"),
+        ("INTO DUMPFILE", "导出文件"),
+        ("VACUUM", "压缩/重建数据库"),
+    ];
+    for (token, what) in FORBIDDEN {
+        if flat.contains(token) {
+            return Err(format!(
+                "语句包含被禁止的片段 `{token}`（{what}）：平台只开放库表范围内的操作，请在节点上用数据库客户端执行"
+            ));
+        }
+    }
+    if flat.contains("PRAGMA") || flat.starts_with("PRAGMA") {
+        return Err("PRAGMA（修改数据库参数）不在平台开放范围".into());
+    }
+    for token in ["EXEC ", "EXECUTE ", "CALL "] {
+        if flat.starts_with(token) || flat.contains(&format!(" {token}")) {
+            return Err(format!(
+                "语句包含被禁止的片段 `{}`（调用存储过程/动态 SQL）",
+                token.trim()
+            ));
+        }
+    }
+    Ok(op)
+}
+
+/// 写语句校验（兼容包装）：要求 [`validate_sql`] 的结果不是只读。
+pub fn validate_write_sql(sql: &str) -> Result<(), String> {
+    let op = validate_sql(sql)?;
+    if op == SqlOp::Read {
+        return Err("仅允许写语句（INSERT/UPDATE/DELETE/DDL）；SELECT 请走查询通道".into());
+    }
+    Ok(())
+}
+
 /// 只读查询校验（安全闸门）：仅放行单条 `SELECT` 文本。
 ///
 /// 规则（宁可误杀不可放过）：
@@ -538,6 +759,65 @@ mod tests {
         assert!(validate_readonly_sql("INSERT INTO t VALUES (1)").is_err());
         assert!(validate_readonly_sql("WITH x AS (SELECT 1) SELECT * FROM x").is_err());
         assert!(validate_readonly_sql(&format!("SELECT '{}'", "a".repeat(4000))).is_err());
+    }
+
+    #[test]
+    fn write_sql_rules() {
+        // 分级：查询 / 写数据 / 删数据 / 结构变更
+        assert_eq!(validate_sql("SELECT 1").unwrap(), SqlOp::Read);
+        assert_eq!(validate_sql("insert into t(a) values(1)").unwrap(), SqlOp::Write);
+        assert_eq!(validate_sql("UPDATE t SET a=1").unwrap(), SqlOp::Write);
+        assert_eq!(validate_sql("DELETE FROM t").unwrap(), SqlOp::Delete);
+        assert_eq!(validate_sql("DROP TABLE t").unwrap(), SqlOp::Ddl);
+        assert_eq!(validate_sql("TRUNCATE TABLE t").unwrap(), SqlOp::Ddl);
+        assert_eq!(validate_sql("CREATE TABLE t2 (Id INTEGER PRIMARY KEY)").unwrap(), SqlOp::Ddl);
+        assert_eq!(validate_sql("ALTER TABLE t ADD COLUMN c TEXT").unwrap(), SqlOp::Ddl);
+        // 表级全量操作放行（含 DROP COLUMN），权限在调用方按 op 分级
+        assert_eq!(validate_sql("ALTER TABLE t DROP COLUMN c").unwrap(), SqlOp::Ddl);
+        // 永远拒绝：多语句、账号/权限、库级破坏、服务级、文件导出、存储过程
+        for bad in [
+            "",
+            "UPDATE t SET a=1; DELETE FROM t",
+            "GRANT ALL ON t TO x",
+            "REVOKE ALL ON t FROM x",
+            "CREATE USER u IDENTIFIED BY 'x'",
+            "DROP DATABASE dh",
+            "ALTER DATABASE dh",
+            "SHUTDOWN",
+            "KILL 12",
+            "LOAD DATA INFILE 'a' INTO TABLE t",
+            "SELECT * INTO OUTFILE '/tmp/a' FROM t",
+            "VACUUM",
+            "PRAGMA journal_mode=WAL",
+            "EXEC sp_who",
+            "CALL p_clean()",
+            "USE otherdb",
+            "EXPLAIN SELECT 1",
+            // 可编程对象/扩展（能绕过库表操作在数据库服务器上执行代码）
+            "CREATE FUNCTION f() RETURNS int AS 'x' LANGUAGE sql",
+            "CREATE TRIGGER tr AFTER INSERT ON t EXECUTE FUNCTION f()",
+            "CREATE EXTENSION file_fdw",
+            "ALTER SYSTEM SET log_statement='all'",
+        ] {
+            assert!(validate_sql(bad).is_err(), "{bad} 应被拒绝");
+        }
+        // 兼容包装：只读句不能走写通道
+        assert!(validate_write_sql("SELECT 1").is_err());
+        assert!(validate_write_sql("DELETE FROM t").is_ok());
+    }
+
+    #[test]
+    fn redacts_string_literals() {
+        let red = redact_sql("UPDATE t SET pwd='SECRET' WHERE id=1 AND name='张三'", 200);
+        assert!(!red.contains("SECRET"), "{red}");
+        assert!(!red.contains("张三"), "{red}");
+        assert!(red.contains("'***'"), "{red}");
+        assert!(red.contains("WHERE id=1"), "{red}");
+        // 超长截断（且不把未闭合引号内容泄露出去）
+        let long = format!("UPDATE t SET a='{}'", "x".repeat(400));
+        let red = redact_sql(&long, 40);
+        assert!(!red.contains("xxxx"), "{red}");
+        assert!(red.chars().count() <= 41, "{red}");
     }
 
     #[test]
