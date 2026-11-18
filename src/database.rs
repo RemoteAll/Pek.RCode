@@ -411,10 +411,6 @@ pub fn connection_label(conn: &str) -> String {
         .unwrap_or_else(|| "Provider=未知".to_string())
 }
 
-/// SQLite 连接的 `Data Source` 相对路径按 `base` 解析为绝对路径（并创建父目录）。
-///
-/// 其他 Provider 原样返回（非 SQLite 不做路径处理）；以解决“配置写 `Data/xxx.db`、
-/// 运行目录不确定”的常见部署问题（各项目统一行为）。
 /// 按连接名生成默认 SQLite 连接串（**未配置连接串时的回退**）。
 ///
 /// 对齐 C# `DH.NCode/DataAccessLayer/DAL.cs:108-129` 的既有行为：
@@ -455,6 +451,10 @@ pub fn default_sqlite_conn_str(conn_name: &str, data_dir: &str) -> Result<String
     ))
 }
 
+/// SQLite 连接的 `Data Source` 相对路径按 `base` 解析为绝对路径（并创建父目录）。
+///
+/// 其他 Provider 原样返回（非 SQLite 不做路径处理）；以解决“配置写 `Data/xxx.db`、
+/// 运行目录不确定”的常见部署问题（各项目统一行为）。
 pub fn resolve_connection(base: &Path, conn: &str) -> Result<String, String> {
     let c = conn.trim();
     if c.is_empty() {
