@@ -415,6 +415,46 @@ pub fn connection_label(conn: &str) -> String {
 ///
 /// 其他 Provider 原样返回（非 SQLite 不做路径处理）；以解决“配置写 `Data/xxx.db`、
 /// 运行目录不确定”的常见部署问题（各项目统一行为）。
+/// 按连接名生成默认 SQLite 连接串（**未配置连接串时的回退**）。
+///
+/// 对齐 C# `DH.NCode/DataAccessLayer/DAL.cs:108-129` 的既有行为：
+///
+/// ```csharp
+/// if (!css.ContainsKey(connName)) {
+///     // 连接名只允许字母数字与 "-_."
+///     if (connName.Any(c => !Char.IsLetterOrDigit(c) && !_symbols.Contains(c)))
+///         throw new XCodeException($"非法连接名[{connName}]");
+///     var connstr = "Data Source=" + cfg.DataPath.CombinePath(connName + ".db");
+///     if (set.Migration <= Migration.On) connstr += ";Migration=On";
+///     AddConnStr(connName, connstr, null, "SQLite");
+/// }
+/// ```
+///
+/// 即：**任何连接名只要没配置连接串，就自动落到 `{data_dir}/{连接名}.db` 的 SQLite**；
+/// 只有「配了但值为空串」才算配置错误（由调用方判断）。
+///
+/// - 连接名只允许字母 / 数字 / `-` / `_` / `.`（与 C# `_symbols = "-_."` 一致）；
+/// - `data_dir` 对应 C# 的 `Setting.DataPath`（默认 `Data`）；为空则落到当前目录；
+/// - 生成串里的目录原样保留（分隔符归一由 [`resolve_connection`] 负责）。
+pub fn default_sqlite_conn_str(conn_name: &str, data_dir: &str) -> Result<String, String> {
+    let name = conn_name.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!("非法连接名[{name}]"));
+    }
+
+    let dir = data_dir.trim().trim_end_matches(['/', '\\']);
+    if dir.is_empty() {
+        return Ok(format!("Data Source={name}.db;Provider=SQLite;Migration=On"));
+    }
+    Ok(format!(
+        "Data Source={dir}/{name}.db;Provider=SQLite;Migration=On"
+    ))
+}
+
 pub fn resolve_connection(base: &Path, conn: &str) -> Result<String, String> {
     let c = conn.trim();
     if c.is_empty() {
@@ -1172,5 +1212,32 @@ ConnectionString = "Data Source=Data/b.db;Provider=SQLite"
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         store::drop_for_test_scoped(&dir, "main");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_sqlite_conn_str_matches_csharp_fallback() {
+        // ① 默认目录 Data（与 C# `Setting.DataPath` 默认值一致）
+        assert_eq!(
+            default_sqlite_conn_str("Permissions", "Data").unwrap(),
+            "Data Source=Data/Permissions.db;Provider=SQLite;Migration=On"
+        );
+        // ② 空目录 → 落到当前目录
+        assert_eq!(
+            default_sqlite_conn_str("DH", "").unwrap(),
+            "Data Source=DH.db;Provider=SQLite;Migration=On"
+        );
+        // ③ 目录末尾的分隔符被裁掉，不产生 `Data//x.db`
+        assert_eq!(
+            default_sqlite_conn_str("Log", "Data/").unwrap(),
+            "Data Source=Data/Log.db;Provider=SQLite;Migration=On"
+        );
+        // ④ 连接名允许字母数字与 - _ .
+        let ok = default_sqlite_conn_str("my_app-2.0", "Data").unwrap();
+        assert!(ok.contains("my_app-2.0.db"), "{ok}");
+
+        // ⑤ 非法连接名（与 C# `_symbols = "-_."` 口径一致）
+        assert!(default_sqlite_conn_str("a b", "Data").is_err());
+        assert!(default_sqlite_conn_str("x;y", "Data").is_err());
+        assert!(default_sqlite_conn_str("  ", "Data").is_err());
     }
 }
