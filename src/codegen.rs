@@ -29,6 +29,21 @@ pub fn generate_all(model: &EntityModel) -> Vec<(String, String)> {
         .collect()
 }
 
+/// 列是否参与必填校验。
+///
+/// 缺省为 `true`（非空字符串列必填，对齐 C# `EntityBuilder.BuildValid`）；
+/// 模型里写 `Required="False"`（字符串）或 `Required="0"` 时不再校验，
+/// 用于「类型要 `String`、但允许空串」的列（此时仍需 `Nullable="False"`）。
+fn column_required(col: &ColumnMeta) -> bool {
+    for (key, value) in &col.extra {
+        if key.eq_ignore_ascii_case("Required") {
+            let v = value.trim();
+            return !(v.eq_ignore_ascii_case("False") || v == "0");
+        }
+    }
+    true
+}
+
 /// 生成单个表的实体结构体代码。
 pub fn generate(table: &TableMeta) -> String {
     let display = if table.description.is_empty() {
@@ -361,6 +376,11 @@ pub fn generate(table: &TableMeta) -> String {
         for col in &table.columns {
             // JSON 列与字符串列同为 `String` 字段，空串同样视为缺失
             if col.nullable || !matches!(col.data_type, DataType::String | DataType::Json) {
+                continue;
+            }
+            // 模型显式 `Required="False"`：`Nullable="False"` 得到普通 `String` 字段，
+            // 但不做必填校验（对齐 C# 里 `String` 字段允许空串、由业务自行校验的写法）。
+            if !column_required(col) {
                 continue;
             }
             if col
@@ -1209,9 +1229,34 @@ mod tests {
     </Table></Tables></EntityModel>"#;
 
     #[test]
+    fn required_false_skips_validation_for_string_column() {
+        // `Nullable="False"` + `Required="False"`：字段是普通 `String`，但不做必填校验
+        let model = EntityModel::parse(
+            r#"<EntityModel><Tables><Table Name="Menu" TableName="sys_menu">
+              <Columns>
+                <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+                <Column Name="Name" DataType="String" Length="50" />
+                <Column Name="Url" DataType="String" Length="200" Required="False" Description="地址" />
+              </Columns>
+            </Table></Tables></EntityModel>"#,
+        )
+        .unwrap();
+        let code = generate(&model.tables[0]);
+        assert!(code.contains("url: String,"), "应为普通 String：{code}");
+        assert!(!code.contains("url: Option<String>"), "{code}");
+        assert!(
+            code.contains("if self.name.trim().is_empty()"),
+            "未标注的字符串列仍必填：{code}"
+        );
+        assert!(
+            !code.contains("地址 不能为空"),
+            "Required=False 不应生成必填校验：{code}"
+        );
+    }
+
+    #[test]
     fn snake_case_conversion() {
-        assert_eq!(to_snake_case("CreateUserID"), "create_user_id");
-        assert_eq!(to_snake_case("SId"), "s_id");
+        assert_eq!(to_snake_case("CreateUserID"), "create_user_id");        assert_eq!(to_snake_case("SId"), "s_id");
         assert_eq!(to_snake_case("Md5"), "md5");
         assert_eq!(to_snake_case("FileUrl"), "file_url");
         assert_eq!(to_snake_case("Ex1"), "ex1");
