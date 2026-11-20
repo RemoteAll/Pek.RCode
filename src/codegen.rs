@@ -32,16 +32,20 @@ pub fn generate_all(model: &EntityModel) -> Vec<(String, String)> {
 /// 列是否参与必填校验。
 ///
 /// 缺省为 `true`（非空字符串列必填，对齐 C# `EntityBuilder.BuildValid`）；
-/// 模型里写 `Required="False"`（字符串）或 `Required="0"` 时不再校验，
-/// 用于「类型要 `String`、但允许空串」的列（此时仍需 `Nullable="False"`）。
+/// 列是否参与必填校验（**默认否，必须显式声明**）。
+///
+/// 语义边界：`Nullable` 只表达「库列是否允许 NULL + Rust 是否 `Option<T>`」；
+/// 「值必须给」是**业务规则**，不属于表结构，所以生成器默认不生成任何必填校验，
+/// 由模型里显式写 `Required="True"`（或 `"1"`/`"yes"`）时才生成，
+/// 其余业务校验写在 `xxx_biz.rs` 或调用方。
 fn column_required(col: &ColumnMeta) -> bool {
     for (key, value) in &col.extra {
         if key.eq_ignore_ascii_case("Required") {
             let v = value.trim();
-            return !(v.eq_ignore_ascii_case("False") || v == "0");
+            return v.eq_ignore_ascii_case("True") || v == "1" || v.eq_ignore_ascii_case("yes");
         }
     }
-    true
+    false
 }
 
 /// 生成单个表的实体结构体代码。
@@ -378,8 +382,7 @@ pub fn generate(table: &TableMeta) -> String {
             if col.nullable || !matches!(col.data_type, DataType::String | DataType::Json) {
                 continue;
             }
-            // 模型显式 `Required="False"`：`Nullable="False"` 得到普通 `String` 字段，
-            // 但不做必填校验（对齐 C# 里 `String` 字段允许空串、由业务自行校验的写法）。
+            // 必填是**业务规则**，生成器默认不生成；只在模型显式 `Required="True"` 时才校验。
             if !column_required(col) {
                 continue;
             }
@@ -1229,28 +1232,27 @@ mod tests {
     </Table></Tables></EntityModel>"#;
 
     #[test]
-    fn required_false_skips_validation_for_string_column() {
-        // `Nullable="False"` + `Required="False"`：字段是普通 `String`，但不做必填校验
+    fn required_true_generates_validation() {
+        // 必填校验默认关闭（业务规则不进表结构）；模型显式 Required="True" 才生成
         let model = EntityModel::parse(
             r#"<EntityModel><Tables><Table Name="Menu" TableName="sys_menu">
               <Columns>
                 <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
-                <Column Name="Name" DataType="String" Length="50" />
-                <Column Name="Url" DataType="String" Length="200" Required="False" Description="地址" />
+                <Column Name="Name" DataType="String" Length="50" Required="True" Description="名称" />
+                <Column Name="Url" DataType="String" Length="200" Description="地址" />
               </Columns>
             </Table></Tables></EntityModel>"#,
         )
         .unwrap();
         let code = generate(&model.tables[0]);
         assert!(code.contains("url: String,"), "应为普通 String：{code}");
-        assert!(!code.contains("url: Option<String>"), "{code}");
         assert!(
             code.contains("if self.name.trim().is_empty()"),
-            "未标注的字符串列仍必填：{code}"
+            "Required=True 应生成必填校验：{code}"
         );
         assert!(
             !code.contains("地址 不能为空"),
-            "Required=False 不应生成必填校验：{code}"
+            "未标注的列默认不校验：{code}"
         );
     }
 
