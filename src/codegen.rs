@@ -39,19 +39,15 @@ pub fn generate_all(model: &EntityModel) -> Vec<(String, String)> {
 ///
 /// 语义边界：`Nullable` 只表达「库列是否允许 NULL + Rust 是否 `Option<T>`」；
 /// 「值不能是空串」是**业务规则**，不属于表结构，所以生成器默认不生成任何校验，
-/// 只在模型显式写 `NotEmpty="True"`（或旧写法 `Required="True"`）时才生成，
-/// 其余业务校验写在 `xxx_biz.rs` 或调用方。
+/// 只在模型显式写 `NotEmpty="True"` 时才生成，其余业务校验写在 `xxx_biz.rs` 或调用方。
 fn column_not_empty(col: &ColumnMeta) -> bool {
-    for key in ["NotEmpty", "Required"] {
-        for (name, value) in &col.extra {
-            if !name.eq_ignore_ascii_case(key) {
-                continue;
-            }
-            let v = value.trim();
-            return v.eq_ignore_ascii_case("True") || v == "1" || v.eq_ignore_ascii_case("yes");
+    col.extra.iter().any(|(name, value)| {
+        if !name.eq_ignore_ascii_case("NotEmpty") {
+            return false;
         }
-    }
-    false
+        let v = value.trim();
+        v.eq_ignore_ascii_case("True") || v == "1" || v.eq_ignore_ascii_case("yes")
+    })
 }
 
 /// 生成单个表的实体结构体代码。
