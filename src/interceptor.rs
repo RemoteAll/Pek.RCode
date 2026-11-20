@@ -1,8 +1,9 @@
-//! 实体拦截器（对应 DH.NCode 的 `EntityInterceptor` / `TimeModule` / `UserModule` / `TraceModule`）。
+﻿//! 实体拦截器（对应 DH.NCode 的 `EntityInterceptor` / `TimeModule` / `UserModule` / `TraceModule`）。
 //!
 //! 拦截器在**写入前**自动补全审计字段（按字段存在性自动匹配，对应 `OnInit`）：
 //! - [`TimeInterceptor`]：插入填 `CreateTime`/`UpdateTime`，更新刷新 `UpdateTime`
-//! - [`UserInterceptor`]：插入填 `CreateUser`/`CreateUserID`/`UpdateUser`/`UpdateUserID`，更新刷新 `UpdateUser*`
+//! - [`UserInterceptor`]：插入填 `CreateUser`/`CreateUserID`/`UpdateUser`/`UpdateUserID`/`CreateIP`/`UpdateIP`，
+//!   更新刷新 `UpdateUser*`/`UpdateIP`（IP 来自 [`UserProvider::current_ip`]，未实现就不写）
 //! - [`TraceInterceptor`]：填 `TraceId`（可合并多个，对应 `AllowMerge`）
 //!
 //! 使用方式：调用 [`enable_defaults`] 一键注册默认三件套，或 [`register`] 注册自定义拦截器；
@@ -409,6 +410,14 @@ pub trait UserProvider: Send + Sync {
     fn current_name(&self) -> Option<String> {
         None
     }
+
+    /// 当前请求的客户端 IP（拿不到返回 `None`）。
+    ///
+    /// 用于自动填充 `CreateIP` / `UpdateIP`；与 `current_name` 同一来源（如 HTTP 上下文），
+    /// 不实现就不会写 IP 列（对应 C# 里没有 `IP` 上下文时的行为）。
+    fn current_ip(&self) -> Option<String> {
+        None
+    }
 }
 
 /// 用户拦截器（对应 `UserInterceptor`）：自动填充创建人/更新人。
@@ -444,6 +453,18 @@ impl UserInterceptor {
     /// 设置“无当前用户时允许清空更新人”。
     pub fn set_allow_empty(&mut self, allow: bool) {
         self.allow_empty = allow;
+    }
+
+    /// 解析当前客户端 IP（无 Provider 或未实现时返回 `None`）。
+    fn resolve_ip(&self) -> Option<String> {
+        let provider = self.provider.as_ref()?;
+        let ip = provider.current_ip()?;
+        let ip = ip.trim();
+        if ip.is_empty() {
+            None
+        } else {
+            Some(ip.to_string())
+        }
     }
 
     /// 解析当前用户：`Provider` 优先，插入时用环境变量兜底（对应 C# `Environment.UserName` → `MachineName`）。
@@ -484,7 +505,9 @@ impl EntityInterceptor for UserInterceptor {
             & (audit_flags::CREATE_USER
                 | audit_flags::UPDATE_USER
                 | audit_flags::CREATE_USER_ID
-                | audit_flags::UPDATE_USER_ID)
+                | audit_flags::UPDATE_USER_ID
+                | audit_flags::CREATE_IP
+                | audit_flags::UPDATE_IP)
             != 0
     }
 
@@ -508,6 +531,19 @@ impl EntityInterceptor for UserInterceptor {
                     set_no_dirty(table, values, "UpdateUserID", DbValue::Int(0));
                     set_no_dirty(table, values, "UpdateUser", DbValue::Text(String::new()));
                 }
+            }
+        }
+        // 客户端 IP（对应 C# 的 CreateIP / UpdateIP）：仅当 Provider 提供了 IP 且表里有对应列时写入
+        if let Some(ip) = self.resolve_ip() {
+            match method {
+                DataMethod::Insert => {
+                    set_item(table, values, "CreateIP", DbValue::Text(ip.clone()));
+                    set_item(table, values, "UpdateIP", DbValue::Text(ip));
+                }
+                DataMethod::Update => {
+                    set_no_dirty(table, values, "UpdateIP", DbValue::Text(ip));
+                }
+                DataMethod::Delete => {}
             }
         }
     }
@@ -537,6 +573,19 @@ impl EntityInterceptor for UserInterceptor {
                     set_no_dirty_cow(table, values, "UpdateUserID", DbValue::Int(0));
                     set_no_dirty_cow(table, values, "UpdateUser", DbValue::Text(String::new()));
                 }
+            }
+        }
+        // IP 列（Cow 快路径同样要写，否则开启拦截器后热路径与 owned 路径行为不一致）
+        if let Some(ip) = self.resolve_ip() {
+            match method {
+                DataMethod::Insert => {
+                    set_item_cow(table, values, "CreateIP", DbValue::Text(ip.clone()));
+                    set_item_cow(table, values, "UpdateIP", DbValue::Text(ip));
+                }
+                DataMethod::Update => {
+                    set_no_dirty_cow(table, values, "UpdateIP", DbValue::Text(ip));
+                }
+                DataMethod::Delete => {}
             }
         }
     }
@@ -746,6 +795,8 @@ mod tests {
         <Column Name="UpdateUserID" DataType="Int32" />
         <Column Name="CreateTime" DataType="DateTime" />
         <Column Name="UpdateTime" DataType="DateTime" />
+        <Column Name="CreateIP" DataType="String" Length="50" />
+        <Column Name="UpdateIP" DataType="String" Length="50" />
         <Column Name="TraceId" DataType="String" Length="20" />
       </Columns>
     </Table></Tables></EntityModel>"#;
@@ -763,6 +814,10 @@ mod tests {
 
         fn current_name(&self) -> Option<String> {
             Some("tester".to_string())
+        }
+
+        fn current_ip(&self) -> Option<String> {
+            Some("10.0.0.8".to_string())
         }
     }
 
@@ -875,6 +930,27 @@ mod tests {
         assert_eq!(
             find("UpdateUser", &values),
             Some(DbValue::Text("tester".into()))
+        );
+        // IP：插入写 CreateIP/UpdateIP，更新只刷 UpdateIP
+        let mut values: Vec<(String, DbValue)> = Vec::new();
+        apply_to(&interceptors, &table, DataMethod::Insert, &mut values);
+        assert_eq!(
+            find("CreateIP", &values),
+            Some(DbValue::Text("10.0.0.8".into()))
+        );
+        assert_eq!(
+            find("UpdateIP", &values),
+            Some(DbValue::Text("10.0.0.8".into()))
+        );
+        let mut values: Vec<(String, DbValue)> = Vec::new();
+        apply_to(&interceptors, &table, DataMethod::Update, &mut values);
+        assert!(
+            find("CreateIP", &values).is_none(),
+            "更新不应改创建 IP"
+        );
+        assert_eq!(
+            find("UpdateIP", &values),
+            Some(DbValue::Text("10.0.0.8".into()))
         );
         let mut values: Vec<(String, DbValue)> =
             vec![("UpdateUser".into(), DbValue::Text("z".into()))];

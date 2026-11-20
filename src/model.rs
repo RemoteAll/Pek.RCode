@@ -127,6 +127,41 @@ pub mod audit_flags {
     pub const UPDATE_USER_ID: u16 = 1 << 5;
     /// `TraceId`（String）
     pub const TRACE_ID: u16 = 1 << 6;
+    /// `CreateIP`（String）
+    pub const CREATE_IP: u16 = 1 << 7;
+    /// `UpdateIP`（String）
+    pub const UPDATE_IP: u16 = 1 << 8;
+}
+
+/// 单个列对应的审计位（不是审计列返回 `None`）。
+///
+/// **列名 + 类型**双重判定，规则与拦截器自动填充完全一致；
+/// 生成器（必填校验排除）与拦截器（自动写值）共用本函数，避免两处各维护一份名单。
+pub fn audit_flag_of(name: &str, data_type: DataType) -> Option<u16> {
+    let is_int = matches!(data_type, DataType::Int32 | DataType::Int64);
+    let is_string = data_type == DataType::String;
+    let is_datetime = data_type == DataType::DateTime;
+    if is_datetime && name.eq_ignore_ascii_case("CreateTime") {
+        Some(audit_flags::CREATE_TIME)
+    } else if is_datetime && name.eq_ignore_ascii_case("UpdateTime") {
+        Some(audit_flags::UPDATE_TIME)
+    } else if is_string && name.eq_ignore_ascii_case("CreateUser") {
+        Some(audit_flags::CREATE_USER)
+    } else if is_string && name.eq_ignore_ascii_case("UpdateUser") {
+        Some(audit_flags::UPDATE_USER)
+    } else if is_int && name.eq_ignore_ascii_case("CreateUserID") {
+        Some(audit_flags::CREATE_USER_ID)
+    } else if is_int && name.eq_ignore_ascii_case("UpdateUserID") {
+        Some(audit_flags::UPDATE_USER_ID)
+    } else if is_string && name.eq_ignore_ascii_case("TraceId") {
+        Some(audit_flags::TRACE_ID)
+    } else if is_string && name.eq_ignore_ascii_case("CreateIP") {
+        Some(audit_flags::CREATE_IP)
+    } else if is_string && name.eq_ignore_ascii_case("UpdateIP") {
+        Some(audit_flags::UPDATE_IP)
+    } else {
+        None
+    }
 }
 
 /// 数据表定义（`<Table>`）。
@@ -260,24 +295,8 @@ impl TableMeta {
         *self.audit_columns.get_or_init(|| {
             let mut flags = 0u16;
             for column in &self.columns {
-                let is_int = matches!(column.data_type, DataType::Int32 | DataType::Int64);
-                let is_string = column.data_type == DataType::String;
-                let is_datetime = column.data_type == DataType::DateTime;
-                let name = column.name.as_str();
-                if is_datetime && name.eq_ignore_ascii_case("CreateTime") {
-                    flags |= audit_flags::CREATE_TIME;
-                } else if is_datetime && name.eq_ignore_ascii_case("UpdateTime") {
-                    flags |= audit_flags::UPDATE_TIME;
-                } else if is_string && name.eq_ignore_ascii_case("CreateUser") {
-                    flags |= audit_flags::CREATE_USER;
-                } else if is_string && name.eq_ignore_ascii_case("UpdateUser") {
-                    flags |= audit_flags::UPDATE_USER;
-                } else if is_int && name.eq_ignore_ascii_case("CreateUserID") {
-                    flags |= audit_flags::CREATE_USER_ID;
-                } else if is_int && name.eq_ignore_ascii_case("UpdateUserID") {
-                    flags |= audit_flags::UPDATE_USER_ID;
-                } else if is_string && name.eq_ignore_ascii_case("TraceId") {
-                    flags |= audit_flags::TRACE_ID;
+                if let Some(flag) = audit_flag_of(&column.name, column.data_type) {
+                    flags |= flag;
                 }
             }
             flags

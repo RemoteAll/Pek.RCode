@@ -1,4 +1,4 @@
-//! 实体代码生成：由 `Model.xml` 生成 Rust 实体结构体。
+﻿//! 实体代码生成：由 `Model.xml` 生成 Rust 实体结构体。
 //!
 //! 对应 DH.NCode 的 `xcode` 命令（XCodeTool）：C# 侧生成实体类，本模块生成 Rust 结构体，
 //! 供迁移期两边共用同一份数据模型文件。
@@ -35,12 +35,18 @@ pub fn generate_all(model: &EntityModel) -> Vec<(String, String)> {
 /// 列是否参与必填校验（**默认否，必须显式声明**）。
 ///
 /// 语义边界：`Nullable` 只表达「库列是否允许 NULL + Rust 是否 `Option<T>`」；
-/// 「值必须给」是**业务规则**，不属于表结构，所以生成器默认不生成任何必填校验，
-/// 由模型里显式写 `Required="True"`（或 `"1"`/`"yes"`）时才生成，
+/// 列是否「写入时不允许空串」（模型显式 `NotEmpty="True"`）。
+///
+/// 语义边界：`Nullable` 只表达「库列是否允许 NULL + Rust 是否 `Option<T>`」；
+/// 「值不能是空串」是**业务规则**，不属于表结构，所以生成器默认不生成任何校验，
+/// 只在模型显式写 `NotEmpty="True"`（或旧写法 `Required="True"`）时才生成，
 /// 其余业务校验写在 `xxx_biz.rs` 或调用方。
-fn column_required(col: &ColumnMeta) -> bool {
-    for (key, value) in &col.extra {
-        if key.eq_ignore_ascii_case("Required") {
+fn column_not_empty(col: &ColumnMeta) -> bool {
+    for key in ["NotEmpty", "Required"] {
+        for (name, value) in &col.extra {
+            if !name.eq_ignore_ascii_case(key) {
+                continue;
+            }
             let v = value.trim();
             return v.eq_ignore_ascii_case("True") || v == "1" || v.eq_ignore_ascii_case("yes");
         }
@@ -361,29 +367,16 @@ pub fn generate(table: &TableMeta) -> String {
     }
 
     // 数据校验（对应 C# `EntityBuilder.BuildValid`）：
-    // 非空字符串列（无默认值、非审计列）→ 必填校验；有索引列/主字段判空串，其余判 NULL。
+    // 只在列显式标注 `NotEmpty="True"` 时才生成「不允许空串」校验；审计列一律不校验。
     {
-        /// C# `_validExcludes`：审计/备注/追踪列不参与必填校验。
-        const VALID_EXCLUDES: [&str; 10] = [
-            "CreateUser",
-            "CreateUserID",
-            "CreateTime",
-            "CreateIP",
-            "UpdateUser",
-            "UpdateUserID",
-            "UpdateTime",
-            "UpdateIP",
-            "Remark",
-            "TraceId",
-        ];
         let mut checks = Vec::new();
         for col in &table.columns {
             // JSON 列与字符串列同为 `String` 字段，空串同样视为缺失
             if col.nullable || !matches!(col.data_type, DataType::String | DataType::Json) {
                 continue;
             }
-            // 必填是**业务规则**，生成器默认不生成；只在模型显式 `Required="True"` 时才校验。
-            if !column_required(col) {
+            // 是否禁止空串是**业务规则**，由模型显式声明（默认不校验）。
+            if !column_not_empty(col) {
                 continue;
             }
             if col
@@ -393,10 +386,9 @@ pub fn generate(table: &TableMeta) -> String {
             {
                 continue;
             }
-            if VALID_EXCLUDES
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(&col.name))
-            {
+            // 审计列（CreateTime/UpdateTime/CreateUser/UpdateUser[/ID]/CreateIP/UpdateIP/TraceId）
+            // 由拦截器按「列名 + 类型」自动填充，与 `TableMeta::audit_flags` 同一规则，不参与校验。
+            if crate::model::audit_flag_of(&col.name, col.data_type).is_some() {
                 continue;
             }
             let field = safe_field_name(&to_snake_case(&col.name));
@@ -1232,13 +1224,13 @@ mod tests {
     </Table></Tables></EntityModel>"#;
 
     #[test]
-    fn required_true_generates_validation() {
-        // 必填校验默认关闭（业务规则不进表结构）；模型显式 Required="True" 才生成
+    fn not_empty_true_generates_validation() {
+        // 空串校验默认关闭（业务规则不进表结构）；模型显式 NotEmpty="True" 才生成
         let model = EntityModel::parse(
             r#"<EntityModel><Tables><Table Name="Menu" TableName="sys_menu">
               <Columns>
                 <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
-                <Column Name="Name" DataType="String" Length="50" Required="True" Description="名称" />
+                <Column Name="Name" DataType="String" Length="50" NotEmpty="True" Description="名称" />
                 <Column Name="Url" DataType="String" Length="200" Description="地址" />
               </Columns>
             </Table></Tables></EntityModel>"#,
@@ -1248,7 +1240,7 @@ mod tests {
         assert!(code.contains("url: String,"), "应为普通 String：{code}");
         assert!(
             code.contains("if self.name.trim().is_empty()"),
-            "Required=True 应生成必填校验：{code}"
+            "NotEmpty=True 应生成空串校验：{code}"
         );
         assert!(
             !code.contains("地址 不能为空"),
