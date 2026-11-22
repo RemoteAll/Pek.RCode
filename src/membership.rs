@@ -925,34 +925,36 @@ pub fn merge_shared_user_tables(model: &mut EntityModel) {
 
 /// 只读探测主站用户表是否可用（不建表、不改结构）。
 ///
+/// 检查的是**模型里的全部列**：`dal.table("User").query(..)` 会把这些列全部 SELECT 出来，
+/// 只要库端缺其中一列，读取就会失败——所以探测必须同口径，不能只抽几列。
+///
 /// # 参数
 /// - `store`：已用 [`merge_shared_user_tables`] 打开（或至少包含这两张表）的存储。
 ///
 /// # 返回值
-/// 缺失项清单（如 `User.Mail`、`DH_UserDetail`）；**空 = 表与所需列齐全**。
+/// 缺失项清单（如 `User.Password`、`DH_UserDetail`）；**空 = 表与全部列齐全**。
 /// 探测失败（连接不可用等）返回 `Err`。
 pub fn probe_user_tables(store: &SharedStore) -> Result<Vec<String>, String> {
-    const REQUIRED: [(&str, &[&str]); 2] = [
-        ("User", &["ID", "Name", "DisplayName"]),
-        ("DH_UserDetail", &["Id", "TrueName"]),
-    ];
-
     store
-        .with_read_session(|_dal, session| {
+        .with_read_session(|dal, session| {
             let mut missing = Vec::new();
-            for (table, columns) in REQUIRED {
-                if session.table_exists(table)? {
-                    let existing = session.table_columns(table)?;
-                    for column in columns {
-                        if !existing
-                            .iter()
-                            .any(|item| item.eq_ignore_ascii_case(column))
-                        {
-                            missing.push(format!("{table}.{column}"));
-                        }
+            for name in ["User", "UserDetail"] {
+                let table = dal.table(name)?;
+                let meta = table.meta();
+                let physical = table.physical_name();
+                if !session.table_exists(physical)? {
+                    missing.push(physical.to_string());
+                    continue;
+                }
+                let existing = session.table_columns(physical)?;
+                for column in &meta.columns {
+                    let column_name = meta.effective_column_name(column);
+                    if !existing
+                        .iter()
+                        .any(|item| item.eq_ignore_ascii_case(column_name))
+                    {
+                        missing.push(format!("{physical}.{column_name}"));
                     }
-                } else {
-                    missing.push(table.to_string());
                 }
             }
             Ok(missing)
