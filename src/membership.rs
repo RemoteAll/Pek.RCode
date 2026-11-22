@@ -9,8 +9,13 @@
 //! 反射相关的实体行为（`EntityFactory`、`Meta.Cache` 全局缓存等）在 Rust 中省略，
 //! 由 `Dal::table(name)` 与显式传参取代，见迁移文档"机制差异"一节。
 
+use std::collections::HashMap;
+
+use crate::model::EntityModel;
 use crate::session::DbRow;
+use crate::store::SharedStore;
 use crate::value::DbValue;
+use crate::{Migration, Query, Where};
 
 /// 计算字符串的 MD5（32 位小写十六进制），对齐 NewLife 的 `MD5()` 扩展。
 ///
@@ -869,6 +874,204 @@ pub fn can_access_department_row(context: &DataScopeContext, row_department_id: 
     }
 }
 
+/// 主站账号表（`User`）与用户扩展表（`DH_UserDetail`）的**完整结构**。
+///
+/// 权威来源：
+/// - `User`：DH.NCode `Membership/用户.cs` 的 `[BindTable("User", ConnName="Membership")]` 与全部 `[BindColumn]`/`[BindIndex]`；
+/// - `UserDetail`：DH.Core `Entity/Model.xml` 的 `<Table Name="UserDetail">`。
+///
+/// 为什么写成**完整列 + 完整索引**（而不是只写要查的几列）：这两张表属于主站，**万一**有人把迁移档位
+/// 改成 `On`/`Full`，`sync_schema` 也判不出差异，不会给主站库加列、改长度或删索引。
+/// 另外 [`merge_shared_user_tables`] 会无条件把它们强制回 `Migration::Off`，从源头杜绝结构同步。
+pub const SHARED_USER_TABLES_XML: &str = include_str!("membership_shared_tables.xml");
+
+/// 主站用户身份（真实姓名 / 账号）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserIdentity {
+    /// 显示名：`DH_UserDetail.TrueName` → `User.DisplayName` → `User.Name`
+    pub name: String,
+    /// 登录账号：`User.Name`
+    pub account: String,
+}
+
+/// 把主站账号/用户扩展表并入模型。
+///
+/// 规则：
+/// - **以本库定义为准**：先移除应用模型里的同名表，再追加 [`SHARED_USER_TABLES_XML`] 里的定义 ——
+///   避免各项目各写一份、字段越写越偏；
+/// - 两表一律强制 `Migration::Off`：主站库结构归主站管，本服务只读；
+/// - 幂等：重复调用结果一致（不会重复追加）。
+///
+/// <param name="model">应用模型（就地修改）</param>
+pub fn merge_shared_user_tables(model: &mut EntityModel) {
+    let Ok(fragment) = EntityModel::parse(SHARED_USER_TABLES_XML) else {
+        // 常量不合法属于代码/测试问题；运行期保持原模型，不抛错打断启动
+        return;
+    };
+    for mut table in fragment.tables {
+        // 无条件收紧：即使外部 Model.xml（运维改过）写成 On，也在这里被改回 Off
+        table.migration = Some(Migration::Off);
+        let name = table.name.clone();
+        let table_name = table.table_name.clone();
+        model.tables.retain(|item| {
+            !item.name.eq_ignore_ascii_case(&name)
+                && !item
+                    .effective_table_name()
+                    .eq_ignore_ascii_case(&table_name)
+        });
+        model.tables.push(table);
+    }
+}
+
+/// 只读探测主站用户表是否可用（不建表、不改结构）。
+///
+/// # 参数
+/// - `store`：已用 [`merge_shared_user_tables`] 打开（或至少包含这两张表）的存储。
+///
+/// # 返回值
+/// 缺失项清单（如 `User.Mail`、`DH_UserDetail`）；**空 = 表与所需列齐全**。
+/// 探测失败（连接不可用等）返回 `Err`。
+pub fn probe_user_tables(store: &SharedStore) -> Result<Vec<String>, String> {
+    const REQUIRED: [(&str, &[&str]); 2] = [
+        ("User", &["ID", "Name", "DisplayName"]),
+        ("DH_UserDetail", &["Id", "TrueName"]),
+    ];
+
+    store
+        .with_read_session(|_dal, session| {
+            let mut missing = Vec::new();
+            for (table, columns) in REQUIRED {
+                if session.table_exists(table)? {
+                    let existing = session.table_columns(table)?;
+                    for column in columns {
+                        if !existing
+                            .iter()
+                            .any(|item| item.eq_ignore_ascii_case(column))
+                        {
+                            missing.push(format!("{table}.{column}"));
+                        }
+                    }
+                } else {
+                    missing.push(table.to_string());
+                }
+            }
+            Ok(missing)
+        })
+        .map_err(|err| format!("探测主站用户表失败：{err}"))
+}
+
+/// 按用户 Id 批量读取主站身份（**只读**）。
+///
+/// 前提：模型已并入 [`merge_shared_user_tables`]（`dal.table("User"/"UserDetail")` 能解析）。
+/// 两张表任一张查询失败时，另一张的结果仍然返回；**都拿不到数据**才返回 `Err`。
+///
+/// # 参数
+/// - `store`：主站库存储（`DH` 或 `Membership` 连接）。
+/// - `ids`：用户 Id 列表（`DH_UserEx.UId` / `User.ID`）。
+///
+/// # 返回值
+/// `Id → 姓名/账号`；没有匹配行时为空表。
+pub fn read_user_identity(
+    store: &SharedStore,
+    ids: &[i32],
+) -> Result<HashMap<i32, UserIdentity>, String> {
+    let mut result: HashMap<i32, UserIdentity> = HashMap::new();
+    if ids.is_empty() {
+        return Ok(result);
+    }
+
+    let users = store
+        .with_read_session(|dal, session| {
+            let table = dal.table("User")?;
+            table.query(
+                session,
+                &Query::new()
+                    .filter(
+                        Where::new().in_("ID", ids.iter().map(|id| DbValue::Int(i64::from(*id)))),
+                    )
+                    .take(ids.len()),
+            )
+        })
+        .map_err(|err| format!("User 表查询失败：{err}"));
+
+    let details = store
+        .with_read_session(|dal, session| {
+            let table = dal.table("UserDetail")?;
+            table.query(
+                session,
+                &Query::new()
+                    .filter(
+                        Where::new().in_("Id", ids.iter().map(|id| DbValue::Int(i64::from(*id)))),
+                    )
+                    .take(ids.len()),
+            )
+        })
+        .map_err(|err| format!("DH_UserDetail 查询失败：{err}"));
+
+    let mut errors: Vec<String> = Vec::new();
+
+    match &users {
+        Ok(rows) => {
+            for row in &rows.rows {
+                let id = row
+                    .get_by_name("ID")
+                    .and_then(|value| value.as_i32())
+                    .unwrap_or(0);
+                if id <= 0 {
+                    continue;
+                }
+                let account = row
+                    .get_by_name("Name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let display = row
+                    .get_by_name("DisplayName")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let entry = result.entry(id).or_default();
+                entry.account = account.clone();
+                entry.name = if !display.is_empty() {
+                    display
+                } else {
+                    account
+                };
+            }
+        }
+        Err(err) => errors.push(err.clone()),
+    }
+
+    match &details {
+        Ok(rows) => {
+            for row in &rows.rows {
+                let id = row
+                    .get_by_name("Id")
+                    .and_then(|value| value.as_i32())
+                    .unwrap_or(0);
+                let name = row
+                    .get_by_name("TrueName")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if id > 0 && !name.is_empty() {
+                    // 真实姓名优先于 DisplayName/Name
+                    result.entry(id).or_default().name = name;
+                }
+            }
+        }
+        Err(err) => errors.push(err.clone()),
+    }
+
+    if result.is_empty() && !errors.is_empty() {
+        return Err(errors.join("；"));
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1204,5 +1407,123 @@ mod tests {
         // 菜单数据范围 -1：不覆盖
         ctx.apply_menu_scope(-1, &roles, &[], &[]);
         assert_eq!(ctx.data_scope, DataScope::DepartmentAndBelow);
+    }
+
+    /// 主站用户表：完整结构 + 强制 `Migration=Off`。
+    ///
+    /// 这个用例同时守住「后续维护者把同步开关打开」的场景：
+    /// - 列/索引数量锁定 —— 有人删列、漏索引会直接失败；
+    /// - 档位锁定 Off —— 即使外部模型写成 On，合并后也必须回到 Off。
+    #[test]
+    fn shared_user_tables_are_complete_and_forced_off() {
+        let mut model = EntityModel::parse(
+            "<EntityModel><Option><ConnName>Proxy</ConnName></Option><Tables></Tables></EntityModel>",
+        )
+        .unwrap();
+        merge_shared_user_tables(&mut model);
+
+        let user = model.table("User").expect("应并入 User");
+        assert_eq!(user.conn_name.as_deref(), Some("Membership"));
+        assert_eq!(user.migration, Some(Migration::Off));
+        assert_eq!(user.columns.len(), 36, "User 列数应与权威模型一致");
+        assert_eq!(user.indexes.len(), 7, "User 索引应与权威模型一致");
+
+        let detail = model.table("UserDetail").expect("应并入 UserDetail");
+        assert_eq!(detail.effective_table_name(), "DH_UserDetail");
+        assert_eq!(detail.migration, Some(Migration::Off));
+        assert_eq!(detail.columns.len(), 76, "UserDetail 列数应与权威模型一致");
+        assert_eq!(detail.indexes.len(), 5, "UserDetail 索引应与权威模型一致");
+
+        // 幂等：重复合并不会出现两份
+        merge_shared_user_tables(&mut model);
+        assert_eq!(model.tables.iter().filter(|t| t.name == "User").count(), 1);
+    }
+
+    /// 应用模型里已有同名表（甚至写成 `On`）时，也必须替换成完整定义并强制 Off
+    #[test]
+    fn shared_user_tables_override_app_definition() {
+        let mut model = EntityModel::parse(
+            r#"<EntityModel><Tables>
+                <Table Name="User" TableName="User" ConnName="DH" Migration="On">
+                  <Columns><Column Name="ID" DataType="Int32" PrimaryKey="True" /></Columns>
+                </Table>
+              </Tables></EntityModel>"#,
+        )
+        .unwrap();
+        merge_shared_user_tables(&mut model);
+
+        let user = model.table("User").expect("User 应存在");
+        assert_eq!(
+            user.conn_name.as_deref(),
+            Some("Membership"),
+            "连接名应以库内定义为准"
+        );
+        assert_eq!(user.migration, Some(Migration::Off), "必须强制 Off");
+        assert_eq!(user.columns.len(), 36, "残缺的应用定义应被完整定义替换");
+        assert_eq!(model.tables.iter().filter(|t| t.name == "User").count(), 1);
+    }
+
+    /// 真实 SQLite：完整定义能建表（证明列/默认值合法），并能读出真实姓名/账号
+    #[test]
+    fn read_user_identity_reads_true_name_and_account() {
+        let dir = std::env::temp_dir().join(format!(
+            "pek-rcode-membership-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = format!(
+            "Data Source={};Provider=SQLite",
+            dir.join("membership.db").display()
+        );
+
+        let mut model = EntityModel::parse("<EntityModel><Tables></Tables></EntityModel>").unwrap();
+        merge_shared_user_tables(&mut model);
+        // 测试时临时打开迁移档位，用**库内完整定义**建表（生产永远保持 Off）
+        for table in &mut model.tables {
+            table.migration = Some(Migration::On);
+        }
+        let dal = crate::Dal::open_with_model(&conn, model).expect("打开 Dal");
+        dal.sync_schema().expect("按完整定义建表");
+        {
+            let mut session = dal.open_session().expect("会话");
+            session
+                .execute(
+                    "INSERT INTO \"User\" (ID, Name, DisplayName) VALUES (7, 'u7', '显示七'), (8, 'u8', '')",
+                    &[],
+                )
+                .expect("插入 User");
+            session
+                .execute(
+                    "INSERT INTO DH_UserDetail (Id, TrueName) VALUES (7, '张三'), (8, NULL)",
+                    &[],
+                )
+                .expect("插入 UserDetail");
+        }
+
+        let (store, _) = crate::store::get_or_open(&dir, || {
+            let mut model =
+                EntityModel::parse("<EntityModel><Tables></Tables></EntityModel>").unwrap();
+            merge_shared_user_tables(&mut model);
+            crate::Dal::open_with_model(&conn, model).map_err(|err| err.to_string())
+        })
+        .expect("打开共享存储");
+
+        let map = read_user_identity(&store, &[7, 8, 9]).expect("读取身份");
+        assert_eq!(map.get(&7).map(|item| item.name.as_str()), Some("张三"));
+        assert_eq!(map.get(&7).map(|item| item.account.as_str()), Some("u7"));
+        assert_eq!(
+            map.get(&8).map(|item| item.name.as_str()),
+            Some("u8"),
+            "TrueName 为空时回退账号"
+        );
+        assert!(!map.contains_key(&9), "不存在的用户不应凭空出现：{map:?}");
+
+        assert!(probe_user_tables(&store).expect("探测应成功").is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

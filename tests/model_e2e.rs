@@ -295,13 +295,14 @@ fn unique_index_generates_cached_find_method() {
 
 #[test]
 fn codegen_generates_validate_for_required_columns() {
-    // 对齐 C# `EntityBuilder.BuildValid`：非空字符串列（无默认值、非审计列）→ 必填校验
+    // 对齐 C# `EntityBuilder.BuildValid`：**显式 `NotEmpty="True"`** 的列才生成非空校验
+    // （`fb0f264` 起「业务校验不进表结构」，不再按「非空字符串列」自动推断）
     let xml = r#"<EntityModel xmlns="http://schemas.newlifex.com/Model202509">
   <Tables>
     <Table Name="DhOrder" TableName="DH_Order" Description="订单">
       <Columns>
         <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
-        <Column Name="Code" DataType="String" Length="50" Description="单号" />
+        <Column Name="Code" DataType="String" Length="50" NotEmpty="True" Description="单号" />
         <Column Name="Memo" DataType="String" Length="200" Nullable="True" Description="备注" />
         <Column Name="Kind" DataType="String" Length="20" DefaultValue="NORMAL" Description="类型" />
         <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />

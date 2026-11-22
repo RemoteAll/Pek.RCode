@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<EntityModel>
+  <Tables>
+    <!--主站账号表：权威来源 DH.NCode `Membership/用户.cs`（[BindTable("User", ConnName="Membership")]）。
+        只读映射，迁移档位由 merge_shared_user_tables 强制 Off；列/长度/默认值/索引与权威模型逐项对齐。-->
+    <Table Name="User" TableName="User" Description="主站账号（Membership，只读映射）" IgnoreNameCase="False" Migration="Off" ConnName="Membership">
+      <Columns>
+        <Column Name="ID" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="Name" DataType="String" Length="50" Master="True" DefaultValue="''" Description="名称。登录用户名" />
+        <Column Name="Password" DataType="String" Length="200" Nullable="True" Description="密码" />
+        <Column Name="DisplayName" DataType="String" Length="50" Nullable="True" Description="昵称" />
+        <Column Name="Sex" DataType="Int32" DefaultValue="0" Description="性别。未知、男、女" />
+        <Column Name="Mail" DataType="String" Length="50" Nullable="True" Description="邮件。支持登录" />
+        <Column Name="MailVerified" DataType="Boolean" DefaultValue="0" Description="邮箱验证" />
+        <Column Name="Mobile" DataType="String" Length="50" Nullable="True" Description="手机。支持登录" />
+        <Column Name="MobileVerified" DataType="Boolean" DefaultValue="0" Description="手机验证" />
+        <Column Name="Code" DataType="String" Length="50" Nullable="True" Description="代码。身份证、员工编码等，支持登录" />
+        <Column Name="AreaId" DataType="Int32" DefaultValue="0" Description="地区。省市区" />
+        <Column Name="Avatar" DataType="String" Length="200" Nullable="True" Description="头像" />
+        <Column Name="RoleID" DataType="Int32" DefaultValue="3" Description="角色。主要角色" />
+        <Column Name="RoleIds" DataType="String" Length="200" Nullable="True" Description="角色组。次要角色集合" />
+        <Column Name="DepartmentID" DataType="Int32" DefaultValue="0" Description="部门。组织机构" />
+        <Column Name="Online" DataType="Boolean" DefaultValue="0" Description="在线" />
+        <Column Name="Enable" DataType="Boolean" DefaultValue="0" Description="启用" />
+        <Column Name="Age" DataType="Int32" DefaultValue="0" Description="年龄。周岁" />
+        <Column Name="Birthday" DataType="DateTime" Nullable="True" Description="生日。公历年月日" />
+        <Column Name="Logins" DataType="Int32" DefaultValue="0" Description="登录次数" />
+        <Column Name="LastLogin" DataType="DateTime" Nullable="True" Description="最后登录" />
+        <Column Name="LastLoginIP" DataType="String" Length="50" Nullable="True" Description="最后登录IP" />
+        <Column Name="RegisterTime" DataType="DateTime" Nullable="True" Description="注册时间" />
+        <Column Name="RegisterIP" DataType="String" Length="50" Nullable="True" Description="注册IP" />
+        <Column Name="OnlineTime" DataType="Int32" DefaultValue="0" Description="在线时间。累计在线总时间，单位秒" />
+        <Column Name="Ex1" DataType="Int32" DefaultValue="0" Description="扩展1" />
+        <Column Name="Ex2" DataType="Int32" DefaultValue="0" Description="扩展2" />
+        <Column Name="Ex3" DataType="Double" DefaultValue="0" Description="扩展3" />
+        <Column Name="Ex4" DataType="String" Length="50" Nullable="True" Description="扩展4" />
+        <Column Name="Ex5" DataType="String" Length="50" Nullable="True" Description="扩展5" />
+        <Column Name="Ex6" DataType="String" Length="50" Nullable="True" Description="扩展6" />
+        <Column Name="UpdateUser" DataType="String" Length="50" DefaultValue="''" Description="更新者" />
+        <Column Name="UpdateUserID" DataType="Int32" DefaultValue="0" Description="更新用户" />
+        <Column Name="UpdateIP" DataType="String" Length="50" Nullable="True" Description="更新地址" />
+        <Column Name="UpdateTime" DataType="DateTime" DefaultValue="'0001-01-01'" Description="更新时间" />
+        <Column Name="Remark" DataType="String" Length="500" Nullable="True" Description="备注" />
+      </Columns>
+      <Indexes>
+        <Index Columns="Name" Unique="True" />
+        <Index Columns="Mail" />
+        <Index Columns="Mobile" />
+        <Index Columns="Code" />
+        <Index Columns="RoleID" />
+        <Index Columns="DepartmentID" />
+        <Index Columns="UpdateTime" />
+      </Indexes>
+    </Table>
+
+    <!--用户扩展表：权威来源 DH.Core `Entity/Model.xml` 的 `<Table Name="UserDetail">`。
+        只读映射，迁移档位由 merge_shared_user_tables 强制 Off。-->
+    <Table Name="UserDetail" TableName="DH_UserDetail" Description="主站用户扩展（真实姓名；只读映射）" IgnoreNameCase="False" Migration="Off" ConnName="Membership">
+      <Columns>
+        <Column Name="Id" DataType="Int32" PrimaryKey="True" Description="用户Id" />
+        <Column Name="LanguageId" DataType="Int32" DefaultValue="0" Description="前台语言Id" />
+        <Column Name="AdminLanguageId" DataType="Int32" DefaultValue="0" Description="后台语言Id" />
+        <Column Name="CurrenciesId" DataType="Int32" DefaultValue="0" Description="货币Id" />
+        <Column Name="IsSuper" DataType="Boolean" DefaultValue="0" Description="是否超级管理员" />
+        <Column Name="SId" DataType="String" Length="50" Nullable="True" Description="用户SessionId" />
+        <Column Name="TenantId" DataType="Int32" DefaultValue="0" Description="用户所属租户Id" />
+        <Column Name="UType" DataType="Int16" DefaultValue="0" Type="UserKinds" Description="用户类型。类型自定义" />
+        <Column Name="RoleExIds" DataType="String" Length="100" Nullable="True" Description="用户前台权限" />
+        <Column Name="OtherPermissions" DataType="String" Length="2048" Nullable="True" Description="用户其他权限" />
+        <Column Name="DepartmentIds" DataType="String" Length="200" Nullable="True" Description="用户所在多部门" />
+        <Column Name="PositionIds" DataType="String" Length="200" Nullable="True" Description="用户所在多岗位" />
+        <Column Name="Position" DataType="String" Length="200" Nullable="True" Description="职务" />
+        <Column Name="TrueName" DataType="String" Length="50" Nullable="True" Description="真实姓名" />
+        <Column Name="PayPwd" DataType="String" Length="50" Nullable="True" Description="支付密码" />
+        <Column Name="AuthState" DataType="Int16" DefaultValue="0" Description="个人实名认证状态（0默认1审核中2未通过3已认证）" />
+        <Column Name="IdCard" DataType="String" Length="50" Nullable="True" Description="实名认证身份证号" />
+        <Column Name="IdcardImage1" DataType="String" Length="100" Nullable="True" Description="手持身份证照" />
+        <Column Name="IdcardImage2" DataType="String" Length="100" Nullable="True" Description="身份证正面照" />
+        <Column Name="IdcardImage3" DataType="String" Length="100" Nullable="True" Description="身份证反面照" />
+        <Column Name="CompanyId" DataType="Int32" DefaultValue="0" Description="公司Id" />
+        <Column Name="CompanyName" DataType="String" Length="100" Nullable="True" Description="公司名称" />
+        <Column Name="CompnayAuthState" DataType="Int16" DefaultValue="0" Description="企业实名认证状态（0默认1审核中2未通过3已认证）" />
+        <Column Name="CorporateName" DataType="String" Length="50" Nullable="True" Description="法人姓名" />
+        <Column Name="BusinessLicenseImage" DataType="String" Length="100" Nullable="True" Description="营业执照图片" />
+        <Column Name="CorporateImage" DataType="String" Length="100" Nullable="True" Description="法人手持身份证照" />
+        <Column Name="EmailBind" DataType="Boolean" DefaultValue="0" Description="是否绑定邮箱" />
+        <Column Name="MobileBind" DataType="Boolean" DefaultValue="0" Description="是否绑定手机" />
+        <Column Name="IsSubScribe" DataType="Boolean" DefaultValue="0" Description="是否关注微信公众号" />
+        <Column Name="IsSales" DataType="Boolean" DefaultValue="0" Description="是否销售人员" />
+        <Column Name="IsEngineer" DataType="Boolean" DefaultValue="0" Description="是否为工程师" />
+        <Column Name="ReferrerId" DataType="Int32" DefaultValue="0" Description="推荐人ID" />
+        <Column Name="KeFuId" DataType="Int32" DefaultValue="0" Description="所属销售ID" />
+        <Column Name="ParentUId" DataType="Int32" DefaultValue="0" Description="所属上级会员ID" />
+        <Column Name="UIds" DataType="String" Length="50" Nullable="True" Description="会员层级集合。从开始到最后一个，以逗号分隔,最前和最后都要有逗号" />
+        <Column Name="Points" DataType="Int32" DefaultValue="0" Description="会员积分" />
+        <Column Name="ExpPoints" DataType="Int32" DefaultValue="0" Description="会员经验值" />
+        <Column Name="QQ" DataType="String" Length="50" Nullable="True" Description="QQ号码" />
+        <Column Name="WeiXin" DataType="String" Length="50" Nullable="True" Description="微信号码" />
+        <Column Name="WhatsApp" DataType="String" Length="50" Nullable="True" Description="WhatsApp号码" />
+        <Column Name="Skype" DataType="String" Length="50" Nullable="True" Description="Skype号码" />
+        <Column Name="WangWang" DataType="String" Length="50" Nullable="True" Description="阿里旺旺号码" />
+        <Column Name="ContactName" DataType="String" Length="50" Nullable="True" Description="联系人" />
+        <Column Name="Tel" DataType="String" Length="50" Nullable="True" Description="固话" />
+        <Column Name="Fax" DataType="String" Length="50" Nullable="True" Description="传真" />
+        <Column Name="CompanyInfo" DataType="String" Length="1024" Nullable="True" Description="公司介绍" />
+        <Column Name="Address" DataType="String" Length="100" Nullable="True" Description="详细地址" />
+        <Column Name="InformAllow" DataType="Boolean" DefaultValue="0" Description="是否禁止举报" />
+        <Column Name="IsBuy" DataType="Boolean" DefaultValue="0" Description="是否禁止购买" />
+        <Column Name="IsAllowTalk" DataType="Boolean" DefaultValue="0" Description="是否禁止发表言论" />
+        <Column Name="AvailablePredeposit" DataType="Decimal" DefaultValue="0" Description="预存款可用金额" />
+        <Column Name="FreezePredeposit" DataType="Decimal" DefaultValue="0" Description="预存款冻结金额" />
+        <Column Name="AvailableRcBalance" DataType="Decimal" DefaultValue="0" Description="可用充值卡余额" />
+        <Column Name="FreezeRcBalance" DataType="Decimal" DefaultValue="0" Description="冻结充值卡余额" />
+        <Column Name="CountryCode" DataType="String" Length="50" Nullable="True" Description="国家区号" />
+        <Column Name="CountryId" DataType="Int32" DefaultValue="0" Description="国家ID" />
+        <Column Name="AreaId" DataType="Int32" DefaultValue="0" Description="地区ID" />
+        <Column Name="CityId" DataType="Int32" DefaultValue="0" Description="城市ID" />
+        <Column Name="ProvinceId" DataType="Int32" DefaultValue="0" Description="省份ID" />
+        <Column Name="AreaInfo" DataType="String" Length="50" Nullable="True" Description="地区内容" />
+        <Column Name="Question1" DataType="String" Length="100" Nullable="True" Description="问题1" />
+        <Column Name="Answer1" DataType="String" Length="100" Nullable="True" Description="回答1" />
+        <Column Name="Question2" DataType="String" Length="100" Nullable="True" Description="问题2" />
+        <Column Name="Answer2" DataType="String" Length="100" Nullable="True" Description="回答2" />
+        <Column Name="Question3" DataType="String" Length="100" Nullable="True" Description="问题3" />
+        <Column Name="Answer3" DataType="String" Length="100" Nullable="True" Description="回答3" />
+        <Column Name="OnlineTime" DataType="Int32" DefaultValue="0" ItemType="TimeSpan" Description="在线时间。累计在线总时间，单位秒" Category="在线信息" />
+        <Column Name="LastUpdateTime" DataType="Int64" DefaultValue="0" Description="记录上一次在线时间写入的时间戳" Category="在线信息" />
+        <Column Name="CreateUser" DataType="String" Length="50" Nullable="True" Description="创建者" />
+        <Column Name="CreateUserID" DataType="Int32" DefaultValue="0" Description="创建者" />
+        <Column Name="CreateTime" DataType="DateTime" Nullable="True" Description="创建时间" />
+        <Column Name="CreateIP" DataType="String" Length="50" Nullable="True" Description="创建地址" />
+        <Column Name="UpdateUser" DataType="String" Length="50" Nullable="True" Description="更新者" />
+        <Column Name="UpdateUserID" DataType="Int32" DefaultValue="0" Description="更新者" />
+        <Column Name="UpdateTime" DataType="DateTime" Nullable="True" Description="更新时间" />
+        <Column Name="UpdateIP" DataType="String" Length="50" Nullable="True" Description="更新地址" />
+      </Columns>
+      <Indexes>
+        <Index Columns="ReferrerId" />
+        <Index Columns="TenantId" />
+        <Index Columns="KeFuId" />
+        <Index Columns="UType" />
+        <Index Columns="ParentUId" />
+      </Indexes>
+    </Table>
+  </Tables>
+</EntityModel>
