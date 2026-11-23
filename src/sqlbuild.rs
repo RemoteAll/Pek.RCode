@@ -533,13 +533,25 @@ fn multi_write_impl(
                         let sets: Vec<String> = update_fields
                             .iter()
                             .map(|field| {
-                                let col = kind.quote(column_name(table, field)?);
+                                let name = column_name(table, field)?;
+                                let col = kind.quote(name);
                                 let value = column_value(&col);
                                 if increment_columns
                                     .iter()
                                     .any(|c| c.eq_ignore_ascii_case(field))
                                 {
-                                    Ok(format!("{col}={col}+{value}"))
+                                    if alias {
+                                        // MySQL 8.0.19+ 的行别名下，**未限定的旧值列名会与别名同名列歧义**
+                                        // （实测 `ERROR 1052 (23000): Column 'Count' in field list is ambiguous`），
+                                        // 必须写成 `` `Count`=`MessageCount`.`Count`+`_new`.`Count` ``。
+                                        let mut old = String::new();
+                                        kind.push_quoted(&mut old, table_name);
+                                        old.push('.');
+                                        kind.push_quoted(&mut old, name);
+                                        Ok(format!("{col}={old}+{value}"))
+                                    } else {
+                                        Ok(format!("{col}={col}+{value}"))
+                                    }
                                 } else {
                                     Ok(format!("{col}={value}"))
                                 }
@@ -1409,6 +1421,73 @@ mod tests {
 
         // 未知列应尽早报错
         assert!(insert_sql(DatabaseKind::Sqlite, &t, &[("Nope", 1.into())]).is_err());
+    }
+
+    /// MySQL 8.0.19+ 行别名下，增量列必须限定目标表，否则
+    /// `ERROR 1052 (23000): Column 'Count' in field list is ambiguous`。
+    ///
+    /// 线上实测：`MessageCount` 表 `Count=Count+_new.Count` → 1052；修好后为
+    /// `` `Count`=`MessageCount`.`Count`+`_new`.`Count` ``。
+    #[test]
+    fn mysql_upsert_increment_qualifies_target_table() {
+        const M: &str = r#"<EntityModel><Tables><Table Name="MessageCount" TableName="MessageCount">
+          <Columns>
+            <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            <Column Name="IotId" DataType="String" Length="50" />
+            <Column Name="MTime" DataType="DateTime" />
+            <Column Name="Count" DataType="Int32" />
+            <Column Name="AllCount" DataType="Int32" />
+          </Columns>
+        </Table></Tables></EntityModel>"#;
+        let mut model = EntityModel::parse(M).unwrap();
+        let t = model.tables.remove(0);
+        let columns = ["IotId", "MTime", "Count", "AllCount"];
+        let conflict = ["IotId", "MTime"];
+        let inc = ["Count", "AllCount"];
+
+        // 8.0.19+（行别名）：旧值必须限定目标表
+        let alias_features = SqlFeatures {
+            upsert_row_alias: true,
+            ..SqlFeatures::default()
+        };
+        let sql = multi_write_sql_upsert_by_named_with(
+            DatabaseKind::MySql,
+            &t,
+            "MessageCount",
+            &columns,
+            &conflict,
+            &inc,
+            1,
+            None,
+            &alias_features,
+        )
+        .unwrap();
+        assert!(
+            sql.contains("`Count`=`MessageCount`.`Count`+_new.`Count`"),
+            "增量列应限定目标表：{sql}"
+        );
+        assert!(
+            sql.contains("`AllCount`=`MessageCount`.`AllCount`+_new.`AllCount`"),
+            "{sql}"
+        );
+
+        // MariaDB / 8.0.19 前（VALUES()）：保持原样
+        let sql = multi_write_sql_upsert_by_named_with(
+            DatabaseKind::MySql,
+            &t,
+            "MessageCount",
+            &columns,
+            &conflict,
+            &inc,
+            1,
+            None,
+            &SqlFeatures::default(),
+        )
+        .unwrap();
+        assert!(
+            sql.contains("`Count`=`Count`+VALUES(`Count`)"),
+            "无别名时保持 VALUES() 写法：{sql}"
+        );
     }
 
     #[test]
