@@ -1492,6 +1492,7 @@ impl Dal {
             }
             let want_name = self.kind.index_name(table, idx);
             // 模型要求唯一但库里只有同列普通索引 → 同名时先删再建
+            let mut dropped_plain: Option<String> = None;
             if idx.unique
                 && let Some(plain) = existing.iter().find(|e| {
                     !e.unique
@@ -1501,15 +1502,49 @@ impl Dal {
                 && let Some(drop_sql) = self.kind.drop_index_sql(&plain.name, Some(table_name))
             {
                 self.exec_ddl(session, mode, report, &drop_sql)?;
-                report
-                    .dropped_indexes
-                    .push((table_name.to_string(), plain.name.clone()));
+                if mode.is_readonly() {
+                    // 只读档：两条都会进 pending_sql，按"计划"如实记录
+                    report
+                        .dropped_indexes
+                        .push((table_name.to_string(), plain.name.clone()));
+                } else {
+                    // 已真实删除：先记住名字，等唯一索引**建成功**再计入报告；
+                    // 建失败会按原名恢复，净结果等于没动（报告里也不该出现“删除”）。
+                    dropped_plain = Some(plain.name.clone());
+                }
             }
             if let Some(sql) = self.kind.create_index_sql(table, idx) {
-                self.exec_ddl(session, mode, report, &sql)?;
-                report
-                    .added_indexes
-                    .push((table_name.to_string(), want_name));
+                match self.exec_ddl(session, mode, report, &sql) {
+                    Ok(()) => {
+                        report
+                            .added_indexes
+                            .push((table_name.to_string(), want_name));
+                        if let Some(old_name) = dropped_plain {
+                            report
+                                .dropped_indexes
+                                .push((table_name.to_string(), old_name));
+                        }
+                    }
+                    Err(e) => {
+                        // 唯一索引建不了（典型：历史数据有重复 → MySQL `ERROR 1062`）：
+                        // 把刚删掉的普通索引**按原名补回**，不让表比同步前更糟；
+                        // 错误照常抛给调用方（记为 notes / 启动告警，等数据清理后再升级）。
+                        if let Some(old_name) = dropped_plain {
+                            let mut plain = idx.clone();
+                            plain.unique = false;
+                            plain.name = Some(old_name.clone());
+                            if let Some(restore) = self.kind.create_index_sql(table, &plain)
+                                && self.exec_ddl(session, mode, report, &restore).is_ok()
+                            {
+                                report.notes.push(format!(
+                                    "{table_name}：唯一索引 {want_name} 建不了（数据不满足唯一约束），\
+                                     已恢复普通索引 {old_name}；清理重复值后重启会再尝试升级"
+                                ));
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
             }
         }
         // 清理多余索引：模型里没有该列组合，或同列已有唯一索引而残留普通索引（冗余）
@@ -1618,64 +1653,14 @@ impl Dal {
 
             let table_name = table.effective_table_name();
 
-            if !session.table_exists(table_name)? {
-                // MySQL 单行 65535 字节预算：建表前先做可读校验（否则会得到难懂的 ERROR 1118）
-                if self.kind == DatabaseKind::MySql
-                    && !mode.is_readonly()
-                    && let Some(issue) = table.mysql_row_size_issue()
-                {
-                    return Err(Error::Model(issue));
-                }
-                for stmt in self.kind.create_table_sql(table) {
-                    self.exec_ddl(&mut *session, mode, &mut report, &stmt)?;
-                }
-                report.created_tables.push(table_name.to_string());
-                continue;
-            }
-
-            // 已存在的表：补齐缺失的列
-            let existing = session.table_columns(table_name)?;
-            for col in &table.columns {
-                let col_name = table.effective_column_name(col);
-                if !existing.iter().any(|c| c.eq_ignore_ascii_case(col_name)) {
-                    // 给已有表加“超宽 varchar”极易把整行推过 MySQL 65535 字节（实际事故：
-                    // 16000 字符的 SiteSummary 叠加大表原有列 → ERROR 1118）。提前拒绝并给出改法。
-                    if self.kind == DatabaseKind::MySql
-                        && !mode.is_readonly()
-                        && col.is_wide_varchar()
-                    {
-                        return Err(Error::Model(format!(
-                            "新增列 {table_name}.{col_name} 的长度 {} 超过安全阈值 {} 字符：\
-                             请改用 DataType=\"Text\"（MySQL→LONGTEXT）。\
-                             MySQL 单行上限 65535 字节，utf8mb4 下 varchar(n) 占 4n 字节，\
-                             叠加已有列会报 ERROR 1118 Row size too large。",
-                            col.length,
-                            crate::model::MYSQL_SAFE_VARCHAR_CHARS
-                        )));
-                    }
-                    let sql = self.kind.add_column_sql(table, col);
-                    self.exec_ddl(&mut *session, mode, &mut report, &sql)?;
-                    report
-                        .added_columns
-                        .push((table_name.to_string(), col_name.to_string()));
-                }
-            }
-
-            // 既存表：索引对齐（补缺失 / 普通→唯一升级 / 清理多余）——与 `sync_indexes` 共用同一实现
-            if crate::catalog::supports_index_catalog(self.kind) {
-                self.sync_table_indexes(&mut *session, table, table_name, mode, &mut report)?;
-            }
-            // 序列型自增（Oracle/DB2/Firebird/DuckDB）：补齐历史表缺失的序列
-            if table.identity().is_some()
-                && matches!(
-                    self.kind,
-                    DatabaseKind::Oracle
-                        | DatabaseKind::Db2
-                        | DatabaseKind::Firebird
-                        | DatabaseKind::DuckDb
-                )
-            {
-                self.ensure_identity_sequence(&mut *session, mode, &mut report, table_name)?;
+            // 单表失败**不中断整轮**：数据类错误（唯一索引撞重复值 ERROR 1062、
+            // 超宽列 ERROR 1118 等）只影响这一张表，其余缺表/缺列仍必须建出来。
+            // 2026-11-25 现场：模型要求 `Device.Mac` 唯一，线上有重复值 → 建唯一索引报 1062,
+            // 整轮中断，后面的 `Hlk_DeviceMigration(Cfg)` 永远建不出来（C# 版能自动建表）。
+            if let Err(e) = self.sync_one_table(&mut *session, table, mode, &mut report) {
+                report.notes.push(format!(
+                    "表 {table_name} 结构未同步（已跳过该表，其余表继续）：{e}"
+                ));
             }
         }
 
@@ -1694,6 +1679,87 @@ impl Dal {
         }
 
         Ok(report)
+    }
+
+    /// 同步**单张表**的结构（建表 / 补列 / 索引 / 自增序列）。
+    ///
+    /// 由 [`Dal::sync_schema_inner`] 按表调用；**失败由调用方记入 `notes` 后继续下一张表**，
+    /// 不在这里吞错误（错误文本要能定位到具体表与 DDL）。
+    ///
+    /// # 参数
+    /// - `session`：本轮同步复用的会话。
+    /// - `table`：模型里的表定义。
+    /// - `mode`：该表生效的迁移档位（已按表级收紧）。
+    /// - `report`：同步报告（函数内追加新建/补列/补索引记录）。
+    fn sync_one_table(
+        &self,
+        session: &mut dyn SqlSession,
+        table: &TableMeta,
+        mode: Migration,
+        report: &mut SchemaReport,
+    ) -> Result<()> {
+        let table_name = table.effective_table_name();
+
+        if !session.table_exists(table_name)? {
+            // MySQL 单行 65535 字节预算：建表前先做可读校验（否则会得到难懂的 ERROR 1118）
+            if self.kind == DatabaseKind::MySql
+                && !mode.is_readonly()
+                && let Some(issue) = table.mysql_row_size_issue()
+            {
+                return Err(Error::Model(issue));
+            }
+            for stmt in self.kind.create_table_sql(table) {
+                self.exec_ddl(session, mode, report, &stmt)?;
+            }
+            report.created_tables.push(table_name.to_string());
+            return Ok(());
+        }
+
+        // 已存在的表：补齐缺失的列
+        let existing = session.table_columns(table_name)?;
+        for col in &table.columns {
+            let col_name = table.effective_column_name(col);
+            if !existing.iter().any(|c| c.eq_ignore_ascii_case(col_name)) {
+                // 给已有表加“超宽 varchar”极易把整行推过 MySQL 65535 字节（实际事故：
+                // 16000 字符的 SiteSummary 叠加大表原有列 → ERROR 1118）。提前拒绝并给出改法。
+                if self.kind == DatabaseKind::MySql
+                    && !mode.is_readonly()
+                    && col.is_wide_varchar()
+                {
+                    return Err(Error::Model(format!(
+                        "新增列 {table_name}.{col_name} 的长度 {} 超过安全阈值 {} 字符：\
+                         请改用 DataType=\"Text\"（MySQL→LONGTEXT）。\
+                         MySQL 单行上限 65535 字节，utf8mb4 下 varchar(n) 占 4n 字节，\
+                         叠加已有列会报 ERROR 1118 Row size too large。",
+                        col.length,
+                        crate::model::MYSQL_SAFE_VARCHAR_CHARS
+                    )));
+                }
+                let sql = self.kind.add_column_sql(table, col);
+                self.exec_ddl(session, mode, report, &sql)?;
+                report
+                    .added_columns
+                    .push((table_name.to_string(), col_name.to_string()));
+            }
+        }
+
+        // 既存表：索引对齐（补缺失 / 普通→唯一升级 / 清理多余）——与 `sync_indexes` 共用同一实现
+        if crate::catalog::supports_index_catalog(self.kind) {
+            self.sync_table_indexes(session, table, table_name, mode, report)?;
+        }
+        // 序列型自增（Oracle/DB2/Firebird/DuckDB）：补齐历史表缺失的序列
+        if table.identity().is_some()
+            && matches!(
+                self.kind,
+                DatabaseKind::Oracle
+                    | DatabaseKind::Db2
+                    | DatabaseKind::Firebird
+                    | DatabaseKind::DuckDb
+            )
+        {
+            self.ensure_identity_sequence(session, mode, report, table_name)?;
+        }
+        Ok(())
     }
 
     /// 执行（或只读收集）一条 DDL：统一 ShowSql 输出与档位处理。
@@ -1733,6 +1799,21 @@ impl Dal {
                         .notes
                         .push(format!("会话表定义缓存导致 3107，已换新连接重建：{sql}"));
                     fresh.execute_ddl(sql)?;
+                }
+                // MySQL 1089：`String` 列在模型里**没声明 Length**（被当 longtext → 索引带 `(191)` 前缀），
+                // 但线上表是 C# 建的短 varchar（如 `Mac varchar(50)`）→ 前缀长度超过列长。
+                // 降级：去掉 `(191)` 用整列建索引 —— 短列能成功；真是 longtext 时原 DDL 本就不会报 1089。
+                Err(e) if is_prefix_key_too_long(&e) => {
+                    let fallback = strip_mysql_index_prefix(sql);
+                    if fallback == sql {
+                        let shown: String = sql.chars().take(300).collect();
+                        return Err(Error::Db(format!("{e}；DDL：{shown}")));
+                    }
+                    report.notes.push(format!(
+                        "索引前缀超长（MySQL 1089，模型未声明长度而库里是短列），已去掉 (191) 重试：{sql}"
+                    ));
+                    self.log_sql(&fallback);
+                    session.execute_ddl(&fallback)?;
                 }
                 Err(e) => {
                     // 截断而非省略：建表语句可能上百列，整条倾倒会让日志不可读
@@ -2722,6 +2803,24 @@ fn is_idempotent_ddl_error(err: &Error) -> bool {
 /// 换一条新物理连接即可成功，因此由 [`Dal::exec_ddl`] 重试。
 fn is_generated_column_order_error(err: &Error) -> bool {
     matches!(err, Error::Db(msg) if msg.contains("ERROR 3107"))
+}
+
+/// MySQL 1089：整键前缀长度非法（典型：给 `varchar(50)` 列加了 `(191)` 前缀）。
+///
+/// 成因：模型里 `String` 列**没声明 Length** 时被当成 `longtext` → 索引 DDL 带 `(191)` 前缀；
+/// 而线上表是 C# 建的短 `varchar`（`String` 无 `[DataLength]` 时 XCode 默认短字符串），
+/// 前缀长度超过列定义长度 → `ERROR 1089 Incorrect prefix key`。
+fn is_prefix_key_too_long(err: &Error) -> bool {
+    matches!(err, Error::Db(msg) if msg.contains("ERROR 1089"))
+}
+
+/// 去掉 MySQL 索引 DDL 里的 `(191)` 前缀（1089 降级重试用）。
+///
+/// 例：`... ON \`T\` (\`Mac\`(191))` → `... ON \`T\` (\`Mac\`)`；
+/// 多列索引里的每个 `(191)` 都会被去掉。没有任何 `(191)` 时原样返回（调用方据此判断不必重试）。
+fn strip_mysql_index_prefix(sql: &str) -> String {
+    let pat = format!("({})", crate::dialect::MYSQL_INDEX_PREFIX_CHARS);
+    sql.replace(&pat, "")
 }
 
 /// 宽松比较列类型：只比较基础类型名（忽略长度/精度/大小写），并处理常见等价别名。
@@ -4572,6 +4671,141 @@ mod tests {
             vec![("DH_Order".to_string(), "Remark".to_string())]
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两表模型：`DH_Dup.Code` 要唯一索引；`DH_Extra` 用来验证「失败表不挡后面建表」。
+    const MODEL_PARTIAL: &str = r#"<EntityModel><Tables>
+      <Table Name="Dup" TableName="DH_Dup">
+        <Columns>
+          <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+          <Column Name="Code" DataType="String" Length="50" />
+        </Columns>
+        <Indexes><Index Columns="Code" Unique="True" /></Indexes>
+      </Table>
+      <Table Name="Extra" TableName="DH_Extra">
+        <Columns>
+          <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+          <Column Name="Name" DataType="String" Length="50" />
+        </Columns>
+      </Table>
+      </Tables></EntityModel>"#;
+
+    /// **单表失败不中断整轮**（2026-11-25 生产现场）：
+    /// 线上 `Device.Mac` 有重复值，模型又要求唯一索引 → `CREATE UNIQUE INDEX` 报 `ERROR 1062`；
+    /// 旧实现用 `?` 直接中断整轮，导致排在后面的 `Hlk_DeviceMigration(Cfg)` 永远建不出来
+    /// （用户口径：C# 版能自动建表，设备表数据本身也正常，只是索引不满足模型）。
+    /// 现在：失败表只记 `notes`，其余缺表照建。
+    #[test]
+    fn sync_schema_isolates_per_table_failures() {
+        let dir = temp_dir("partial");
+        let db = dir.join("test.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL_PARTIAL).unwrap()).unwrap();
+
+        // 手工建 DH_Dup（**不带**唯一索引）并写入重复 Code；DH_Extra 保持缺失。
+        {
+            let mut s = dal.open_session().unwrap();
+            s.execute(
+                "CREATE TABLE DH_Dup (Id INTEGER PRIMARY KEY AUTOINCREMENT, Code TEXT)",
+                &[],
+            )
+            .unwrap();
+            s.execute("INSERT INTO DH_Dup (Code) VALUES ('44:45:39:44:30:31')", &[])
+                .unwrap();
+            s.execute("INSERT INTO DH_Dup (Code) VALUES ('44:45:39:44:30:31')", &[])
+                .unwrap();
+        }
+
+        let report = dal
+            .sync_schema()
+            .expect("单表失败不应让整轮同步报错");
+        assert!(
+            report.notes.iter().any(|n| n.contains("DH_Dup")),
+            "notes 应指向失败的表：{:?}",
+            report.notes
+        );
+        assert!(
+            report.created_tables.iter().any(|t| t == "DH_Extra"),
+            "后面的缺表应继续建：{:?}",
+            report.created_tables
+        );
+        // 重复数据下唯一索引确实不存在（没有建成功）
+        {
+            let mut s = dal.open_session().unwrap();
+            let rs = s
+                .query(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE '%DH_Dup%'",
+                    &[],
+                )
+                .unwrap();
+            assert!(
+                rs.rows.is_empty(),
+                "重复数据下不应存在 DH_Dup 的索引：{:?}",
+                rs.rows
+            );
+        }
+
+        dal.clear_pool();
+        drop(dal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 唯一索引建不了时**恢复被删掉的普通索引**：不能让「普通→唯一」升级半途失败
+    /// 把表上的索引弄没了（性能倒退且没人知道）。
+    #[test]
+    fn sync_schema_restores_plain_index_when_unique_fails() {
+        let dir = temp_dir("restore-idx");
+        let db = dir.join("test.db");
+        let conn = format!("Data Source={};Provider=SQLite", db.display());
+        let dal = Dal::open_with_model(&conn, EntityModel::parse(MODEL_PARTIAL).unwrap()).unwrap();
+
+        {
+            let mut s = dal.open_session().unwrap();
+            s.execute(
+                "CREATE TABLE DH_Dup (Id INTEGER PRIMARY KEY AUTOINCREMENT, Code TEXT)",
+                &[],
+            )
+            .unwrap();
+            // 同名普通索引（与模型升唯一时目标名一致）
+            s.execute("CREATE INDEX ix_DH_Dup_Code ON DH_Dup (Code)", &[])
+                .unwrap();
+            s.execute("INSERT INTO DH_Dup (Code) VALUES ('dup')", &[])
+                .unwrap();
+            s.execute("INSERT INTO DH_Dup (Code) VALUES ('dup')", &[])
+                .unwrap();
+        }
+
+        let report = dal.sync_schema().expect("单表失败不应让整轮同步报错");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("已恢复普通索引")),
+            "应说明已恢复普通索引：{:?}",
+            report.notes
+        );
+        {
+            let mut s = dal.open_session().unwrap();
+            let rs = s
+                .query(
+                    "SELECT name, sql FROM sqlite_master WHERE type='index' AND name='ix_DH_Dup_Code'",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(rs.rows.len(), 1, "普通索引应被恢复：{:?}", rs.rows);
+            let sql = rs.rows[0]
+                .get_by_name("sql")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            assert!(
+                !sql.to_uppercase().contains("UNIQUE"),
+                "恢复的必须是普通索引：{sql}"
+            );
+        }
+
+        dal.clear_pool();
+        drop(dal);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
